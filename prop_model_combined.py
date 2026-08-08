@@ -2864,14 +2864,27 @@ def pitcher_quality_mu_score(pitcher_arsenal: list, lineup_hand_weights: dict,
             "hand_weights_pa": lineup_hand_weights}
 
 
-def scan_full_slate_quality_mu(days_recent: int = 30, max_games: int = None,
-                                pitcher_lines: dict = None, hitter_lines: dict = None) -> pd.DataFrame:
+def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent: int = None,
+                                hitter_season_long: bool = True, season_start: str = "2026-03-27",
+                                max_games: int = None, pitcher_lines: dict = None,
+                                hitter_lines: dict = None) -> pd.DataFrame:
     """
     The full-slate 'quality mu' scan across BOTH pitcher and hitter props.
     Only scans games with a CONFIRMED lineup already posted (same
     discipline as auto_find_best_edges — no bench-inclusive roster
     fallback), so this naturally works best run within a few hours of
     first pitch.
+
+    Pitcher and hitter data use SEPARATE, independent lookback windows —
+    matching the stated preference elsewhere in this project (pitcher
+    props on a rolling ~2-month window; hitter props on a longer/season-
+    long window since their per-pitch samples take longer to stabilize):
+      - pitcher_days_recent: days back for pitcher arsenal/game-log pulls.
+        Defaults to 68 (~since June, consistent with the rest of this file).
+      - hitter_season_long=True (default): hitters use the FULL season
+        (from season_start) regardless of hitter_days_recent.
+      - hitter_season_long=False: hitters use hitter_days_recent days back
+        instead (falls back to pitcher_days_recent's value if not given).
 
     For each confirmed starter: pitcher_quality_mu_score() (his real stuff,
     weighted by tonight's actual lineup hand composition) alongside his
@@ -2901,7 +2914,13 @@ def scan_full_slate_quality_mu(days_recent: int = 30, max_games: int = None,
     h_lines = hitter_lines or {"hits": 0.5, "total_bases": 1.5, "home_runs": 0.5}
 
     today_str = datetime.now().strftime("%Y-%m-%d")
-    recent_start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+    pitcher_start = (datetime.now() - timedelta(days=pitcher_days_recent)).strftime("%Y-%m-%d")
+
+    if hitter_season_long:
+        hitter_start = season_start
+    else:
+        hd = hitter_days_recent if hitter_days_recent is not None else pitcher_days_recent
+        hitter_start = (datetime.now() - timedelta(days=hd)).strftime("%Y-%m-%d")
 
     games = pull_todays_games()
     if games.empty:
@@ -2935,7 +2954,7 @@ def scan_full_slate_quality_mu(days_recent: int = 30, max_games: int = None,
                 seen_pitcher_ids.add(pitcher_info["player_id"])
                 pid = pitcher_info["player_id"]
 
-                pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, recent_start, today_str))
+                pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, pitcher_start, today_str))
                 if not pitcher_recent:
                     continue
 
@@ -2943,7 +2962,7 @@ def scan_full_slate_quality_mu(days_recent: int = 30, max_games: int = None,
                 hand_weights = lineup_hand_composition(opposing_lineup)
                 quality = pitcher_quality_mu_score(pitcher_recent, hand_weights)
 
-                probs = pitcher_prop_probabilities(pid, recent_start, today_str, p_lines)
+                probs = pitcher_prop_probabilities(pid, pitcher_start, today_str, p_lines)
                 if "p_over" in probs.columns:
                     for _, prow in probs.iterrows():
                         rows.append({
@@ -2963,11 +2982,11 @@ def scan_full_slate_quality_mu(days_recent: int = 30, max_games: int = None,
                         batter_hand = get_batter_hand(bid)
                         batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
 
-                        h_recent = build_hitter_profile(pull_batter_pitches(bid, recent_start, today_str))
+                        h_recent = build_hitter_profile(pull_batter_pitches(bid, hitter_start, today_str))
                         if not h_recent:
                             continue
 
-                        h_probs = hitter_prop_probabilities(bid, recent_start, today_str, h_lines)
+                        h_probs = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines)
                         crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
                         vuln = crosswalk_vulnerability_score(crosswalk)
 
