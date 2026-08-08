@@ -2866,8 +2866,11 @@ def pitcher_quality_mu_score(pitcher_arsenal: list, lineup_hand_weights: dict,
 
 def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent: int = None,
                                 hitter_season_long: bool = True, season_start: str = "2026-03-27",
-                                max_games: int = None, pitcher_lines: dict = None,
-                                hitter_lines: dict = None) -> pd.DataFrame:
+                                season: int = 2026, max_games: int = None,
+                                pitcher_lines: dict = None, hitter_lines: dict = None,
+                                include_official_props: bool = True,
+                                min_edge: float = 0.15, min_games_sampled: int = 5,
+                                min_quality_score: float = None) -> pd.DataFrame:
     """
     The full-slate 'quality mu' scan across BOTH pitcher and hitter props.
     Only scans games with a CONFIRMED lineup already posted (same
@@ -2875,43 +2878,48 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
     fallback), so this naturally works best run within a few hours of
     first pitch.
 
-    Pitcher and hitter data use SEPARATE, independent lookback windows —
-    matching the stated preference elsewhere in this project (pitcher
-    props on a rolling ~2-month window; hitter props on a longer/season-
-    long window since their per-pitch samples take longer to stabilize):
+    Pitcher and hitter data use SEPARATE, independent lookback windows:
       - pitcher_days_recent: days back for pitcher arsenal/game-log pulls.
-        Defaults to 68 (~since June, consistent with the rest of this file).
       - hitter_season_long=True (default): hitters use the FULL season
         (from season_start) regardless of hitter_days_recent.
-      - hitter_season_long=False: hitters use hitter_days_recent days back
-        instead (falls back to pitcher_days_recent's value if not given).
+      - hitter_season_long=False: hitters use hitter_days_recent days back.
 
-    For each confirmed starter: pitcher_quality_mu_score() (his real stuff,
-    weighted by tonight's actual lineup hand composition) alongside his
-    mu-based P(over) at pitcher_lines for every stat.
+    Props covered:
+      - Pitcher (pitch-level): outs, strikeouts, walks_allowed, hits_allowed.
+      - Pitcher (official, if include_official_props=True): earned_runs, fantasy.
+      - Hitter (pitch-level): hits, singles, total_bases, home_runs.
+      - Hitter (official, if include_official_props=True): hits_runs_rbi, fantasy.
+    include_official_props=True roughly DOUBLES pull count and runtime (one
+    extra official-data pull per pitcher AND per hitter) — set False for a
+    faster pitch-level-only pass.
 
-    For each hitter in that confirmed lineup: mu-based P(over) at
-    hitter_lines, alongside crosswalk_vulnerability_score() against the
-    actual starter's real arsenal.
+    FILTERING — this is what keeps the output to real signal instead of
+    hundreds of near-coinflip rows:
+      - min_edge: only keeps rows where P(over) is at least this far from
+        0.50 in EITHER direction (default 0.15, i.e. p_over >= 0.65 OR
+        <= 0.35). Lower this to see more rows, raise it to see fewer/
+        stronger ones.
+      - min_games_sampled: drops rows backed by too few games to trust
+        (default 5) — a thin sample can produce an extreme-looking
+        probability that isn't real signal.
+      - min_quality_score: optional additional filter on quality_score
+        (0-100). None (default) doesn't filter by this — min_edge already
+        does the main filtering work; use this only if you want to ALSO
+        require strong matchup-quality backing, not just probability.
 
-    Returns one flat DataFrame with a 'side' column ('pitcher'/'hitter')
-    and a 'prop_type' column — group/filter by prop_type in the UI, sorted
-    by quality_score descending within each. quality_score is 0-100 and
-    directly comparable within a side, but pitcher-side and hitter-side
-    scores are NOT on the same underlying scale as each other — one is a
-    stuff-quality grade, the other is a hitter-vulnerability read — so sort
-    within 'side' + 'prop_type', not across the whole table at once.
-
-    pitcher_lines / hitter_lines: same default line for every player
-    scanned (this is a slate-wide pass) — re-test any individual player at
-    a custom line using the per-player sections elsewhere in this app once
-    this scan points you at one worth digging into.
+    Adds a 'lean' column ('OVER'/'UNDER') and an 'edge' column
+    (abs(p_over - 0.5), how far from a coinflip) so the output reads
+    directly as "here are the real plays," sorted by edge within each
+    prop_type — not a raw dump of every prop for every player.
     """
     from datetime import datetime, timedelta
 
     p_lines = pitcher_lines or {"outs": 15.5, "strikeouts": 5.5,
                                   "walks_allowed": 1.5, "hits_allowed": 5.5}
-    h_lines = hitter_lines or {"hits": 0.5, "total_bases": 1.5, "home_runs": 0.5}
+    h_lines = hitter_lines or {"hits": 0.5, "singles": 0.5,
+                                 "total_bases": 1.5, "home_runs": 0.5}
+    p_official_lines = {"earned_runs": 2.5, "fantasy": 18.5}
+    h_official_lines = {"hits_runs_rbi": 1.5, "fantasy": 8.5}
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     pitcher_start = (datetime.now() - timedelta(days=pitcher_days_recent)).strftime("%Y-%m-%d")
@@ -2975,6 +2983,23 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             "game_pk": game_pk,
                         })
 
+                if include_official_props:
+                    try:
+                        p_official = pitcher_official_prop_probabilities(pid, season, p_official_lines)
+                        if "p_over" in p_official.columns:
+                            for _, prow in p_official.iterrows():
+                                rows.append({
+                                    "side": "pitcher", "prop_type": "pitcher_" + prow["stat"],
+                                    "player": pitcher_info.get("name", "Unknown"),
+                                    "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
+                                    "line": prow["line"], "mu": prow["recent_avg"],
+                                    "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
+                                    "quality_score": quality["score"], "quality_label": quality["label"],
+                                    "game_pk": game_pk,
+                                })
+                    except Exception:
+                        pass
+
                 pitcher_hand = get_pitcher_hand(pid)
                 for hitter in opposing_lineup:
                     try:
@@ -2990,12 +3015,13 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
                         vuln = crosswalk_vulnerability_score(crosswalk)
 
+                        # Flip vuln's sign onto a 0-100 scale: vuln score < 0 means the
+                        # PITCHER's usage leans toward this hitter's STRONG spots, i.e.
+                        # good for the hitter's over — so quality_score should be HIGH.
+                        h_quality = (None if vuln["score"] is None
+                                     else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
+
                         if "p_over" in h_probs.columns:
-                            # Flip vuln's sign onto a 0-100 scale: vuln score < 0 means the
-                            # PITCHER's usage leans toward this hitter's STRONG spots, i.e.
-                            # good for the hitter's over — so quality_score should be HIGH.
-                            h_quality = (None if vuln["score"] is None
-                                         else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
                             for _, hrow in h_probs.iterrows():
                                 rows.append({
                                     "side": "hitter", "prop_type": hrow["stat"],
@@ -3006,6 +3032,23 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                     "quality_score": h_quality, "quality_label": vuln["label"],
                                     "game_pk": game_pk,
                                 })
+
+                        if include_official_props:
+                            try:
+                                h_official = hitter_official_prop_probabilities(bid, season, h_official_lines)
+                                if "p_over" in h_official.columns:
+                                    for _, hrow in h_official.iterrows():
+                                        rows.append({
+                                            "side": "hitter", "prop_type": "hitter_" + hrow["stat"],
+                                            "player": hitter["name"], "team": game.get(opp_name_col, "?"),
+                                            "opponent": game.get(own_name_col, "?"),
+                                            "line": hrow["line"], "mu": hrow["recent_avg"],
+                                            "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
+                                            "quality_score": h_quality, "quality_label": vuln["label"],
+                                            "game_pk": game_pk,
+                                        })
+                            except Exception:
+                                pass
                     except Exception:
                         continue
             except Exception:
@@ -3015,7 +3058,91 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
         return pd.DataFrame([{"note": "No confirmed lineups yet for today — re-run closer to "
                               "game time (lineups typically post 2-4 hours before first pitch)."}])
 
-    return pd.DataFrame(rows).sort_values(["prop_type", "quality_score"], ascending=[True, False])
+    df = pd.DataFrame(rows)
+    df["edge"] = (df["p_over"] - 0.5).abs()
+    df["lean"] = df["p_over"].apply(lambda p: "OVER" if p >= 0.5 else "UNDER")
+
+    df = df[(df["edge"] >= min_edge) & (df["games_sampled"] >= min_games_sampled)]
+    if min_quality_score is not None:
+        df = df[df["quality_score"].fillna(0) >= min_quality_score]
+
+    if df.empty:
+        return pd.DataFrame([{"note": f"No props cleared the filters (min_edge={min_edge}, "
+                              f"min_games_sampled={min_games_sampled}) — try lowering min_edge "
+                              f"to see more, or the slate may genuinely be coinflip-heavy today."}])
+
+    return df.sort_values(["prop_type", "edge"], ascending=[True, False])
+
+
+def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict) -> pd.DataFrame:
+    """
+    Mu-based P(over) for hitter props that need OFFICIAL box-score data —
+    H+R+RBI combined and Hitter Fantasy Points — using
+    pull_official_hitter_game_log() directly (already has hits/runs/rbi/
+    singles/doubles/triples/HR/walks/hbp/SB per game, no merge needed).
+
+    lines: subset of {'hits_runs_rbi': float, 'fantasy': float}.
+    """
+    if _poisson is None:
+        raise ImportError("pip install scipy --break-system-packages")
+    import math
+
+    log = pull_official_hitter_game_log(person_id, season)
+    if log.empty:
+        return pd.DataFrame([{"note": "No official game log data found."}])
+
+    log = log.copy()
+    log["hits_runs_rbi"] = log["hits"] + log["runs"] + log["rbi"]
+    log["fantasy"] = log.apply(lambda r: hitter_fantasy_score({
+        "single": r["singles"], "double": r["doubles"], "triple": r["triples"],
+        "home_run": r["home_runs"], "run": r["runs"], "rbi": r["rbi"],
+        "walk": r["walks"], "hbp": r["hbp"], "stolen_base": r["stolen_bases"],
+    }), axis=1)
+
+    rows = []
+    for stat, line in lines.items():
+        if stat not in log.columns:
+            continue
+        mean = log[stat].mean()
+        p_over = 1 - _poisson.cdf(math.floor(line), mean)
+        rows.append({"stat": stat, "line": line, "recent_avg": round(mean, 2),
+                     "games_sampled": len(log), "p_over": round(p_over, 3),
+                     "p_under": round(1 - p_over, 3)})
+    return pd.DataFrame(rows)
+
+
+def pitcher_official_prop_probabilities(person_id: int, season: int, lines: dict) -> pd.DataFrame:
+    """
+    Mu-based P(over) for pitcher props that need OFFICIAL data — Earned
+    Runs Allowed and Pitcher Fantasy Points — using
+    pull_official_pitcher_game_log() directly.
+
+    lines: subset of {'earned_runs': float, 'fantasy': float}.
+    """
+    if _poisson is None:
+        raise ImportError("pip install scipy --break-system-packages")
+    import math
+
+    log = pull_official_pitcher_game_log(person_id, season)
+    if log.empty:
+        return pd.DataFrame([{"note": "No official game log data found."}])
+
+    log = log.copy()
+    log["fantasy"] = log.apply(lambda r: pitcher_fantasy_score({
+        "out": r["outs"], "strikeout": r["strikeouts"], "earned_run": r["earned_runs"],
+        "win": r["win"], "quality_start": r["quality_start"],
+    }), axis=1)
+
+    rows = []
+    for stat, line in lines.items():
+        if stat not in log.columns:
+            continue
+        mean = log[stat].mean()
+        p_over = 1 - _poisson.cdf(math.floor(line), mean)
+        rows.append({"stat": stat, "line": line, "recent_avg": round(mean, 2),
+                     "games_sampled": len(log), "p_over": round(p_over, 3),
+                     "p_under": round(1 - p_over, 3)})
+    return pd.DataFrame(rows)
 
 
 def rescore_quality_mu_row(mu: float, new_line: float) -> dict:
