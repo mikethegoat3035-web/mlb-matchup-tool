@@ -1129,7 +1129,14 @@ def run_side_model(pitcher_last: str, pitcher_first: str, days_recent: int = 68,
                     bid = b["player_id"]
                     h_recent = build_hitter_profile(pull_batter_pitches(bid, start, today))
                     grades = crucial_hitter_metrics(h_recent, pitcher_hand)
-                    hitter_results.append({"hitter": b["name"], "grades": grades})
+
+                    batter_hand = b.get("bats") or get_batter_hand(bid)
+                    batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
+                    crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
+                    vulnerability = crosswalk_vulnerability_score(crosswalk)
+
+                    hitter_results.append({"hitter": b["name"], "grades": grades,
+                                            "crosswalk": crosswalk, "vulnerability": vulnerability})
                 except Exception:
                     continue
 
@@ -1813,6 +1820,149 @@ def hitter_metric_dict(profile: list[HitterPitchProfile], pitcher_hand: str,
         for p in profile
         if p.vs_pitcher_hand == pitcher_hand and pd.notna(getattr(p, metric))
     }
+
+
+# ---------------------------------------------------------------------------
+# Pitch-level crosswalk — pitcher tendency x hitter vulnerability, one table
+# ---------------------------------------------------------------------------
+# Answers the actual question a matchup table should answer: not just "is
+# this pitcher good vs this hand" and separately "is this hitter good vs
+# that pitch type" — but the two joined on the SAME pitch types, so you can
+# see e.g. "he throws his slider 34% of the time to get RHH to chase, and
+# THIS hitter chases 41% of the time on sliders with a .410 xwOBA against
+# them" in one row. This is the piece the flat per-hand tier grades (side
+# model) and the arsenal-only table (main model) were both missing — see
+# module notes / conversation history for the "Gerrit Cole screenshot" ask
+# this was built to answer.
+
+LEAGUE_AVG_XWOBA_PITCH = 0.320  # same default weighted_matchup_score() uses
+
+
+def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
+                           batter_hand: str, pitcher_hand: str,
+                           usage_threshold: float = 15.0,
+                           low_sample_threshold: int = 20) -> pd.DataFrame:
+    """
+    One row per pitch the pitcher throws at usage_threshold%+ vs batter_hand,
+    joined with THIS SPECIFIC hitter's whiff/chase/xwOBA against that exact
+    pitch type from pitcher_hand. Sorted by pitcher usage% (highest first —
+    the pitches he actually leans on matter most, not just any pitch he
+    happens to throw).
+
+    pitcher_arsenal: build_arsenal_profile() output for tonight's pitcher.
+    hitter_profile: build_hitter_profile() output for this hitter.
+    batter_hand: hitter's bats side ('L'/'R') — filters the pitcher's arsenal.
+    pitcher_hand: pitcher's throwing hand ('L'/'R') — filters the hitter's data.
+
+    'read' column is plain language, driven directly by whether the
+    hitter's xwOBA and chase/whiff numbers on THIS pitch beat or trail
+    league average — not a new blended score, just a direct translation of
+    the two numbers already in the row (same discipline as
+    hitter_matchup_verdict() elsewhere in this file).
+    """
+    pitcher_pitches = [p for p in pitcher_arsenal if p.vs_hand == batter_hand]
+    sig_pitcher_pitches = [p for p in pitcher_pitches if p.usage_pct >= usage_threshold]
+
+    if not sig_pitcher_pitches:
+        return pd.DataFrame([{"note": f"No pitch at {usage_threshold}%+ usage vs {batter_hand}HH."}])
+
+    hitter_by_type = {h.pitch_type: h for h in hitter_profile if h.vs_pitcher_hand == pitcher_hand}
+
+    rows = []
+    for p in sig_pitcher_pitches:
+        h = hitter_by_type.get(p.pitch_type)
+        row = {
+            "pitch_type": p.pitch_type,
+            "pitcher_usage_pct": p.usage_pct,
+            "pitcher_zone_pct": p.zone_pct,
+            "pitcher_chase_whiff_pct": p.chase_whiff_pct,
+            "pitcher_whiff_pct": p.whiff_pct,
+            "hitter_n_pitches": h.n_pitches if h else 0,
+            "hitter_whiff_pct": h.whiff_pct if h else None,
+            "hitter_chase_pct": h.chase_pct if h else None,
+            "hitter_xwoba": h.xwoba if h else None,
+            "hitter_hardhit_pct": h.hardhit_pct if h else None,
+        }
+
+        if h is None:
+            row["read"] = "No hitter data vs this pitch type/hand — no read possible."
+        elif h.n_pitches < low_sample_threshold:
+            row["read"] = f"Thin sample ({h.n_pitches} pitches) — directional only, don't lean on this row."
+        else:
+            signals = []
+            if pd.notna(h.xwoba):
+                if h.xwoba >= LEAGUE_AVG_XWOBA_PITCH + 0.03:
+                    signals.append("crushes this pitch (xwOBA)")
+                elif h.xwoba <= LEAGUE_AVG_XWOBA_PITCH - 0.03:
+                    signals.append("struggles vs this pitch (xwOBA)")
+            if pd.notna(h.chase_pct):
+                if h.chase_pct >= LEAGUE_AVG_CHASE + 5:
+                    signals.append("chases it well above average")
+                elif h.chase_pct <= LEAGUE_AVG_CHASE - 5:
+                    signals.append("rarely chases it")
+            if pd.notna(h.whiff_pct):
+                if h.whiff_pct >= LEAGUE_AVG_HITTER_WHIFF + 4:
+                    signals.append("whiffs on it well above average")
+                elif h.whiff_pct <= LEAGUE_AVG_HITTER_WHIFF - 4:
+                    signals.append("rarely whiffs on it")
+
+            row["read"] = ("Hitter " + "; ".join(signals) + "." if signals
+                            else "Roughly average vs this pitch — no strong lean.")
+
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("pitcher_usage_pct", ascending=False)
+
+
+def crosswalk_vulnerability_score(crosswalk_df: pd.DataFrame,
+                                   low_sample_threshold: int = 20) -> dict:
+    """
+    Usage-weighted read across the WHOLE crosswalk table: how much of the
+    pitcher's actual pitch mix vs this hand lines up with a hitter weakness
+    vs a hitter strength. Only rows with real hitter sample size count
+    toward the weighting (thin/no-data rows are excluded, not treated as
+    neutral — an excluded row shouldn't quietly drag the score toward zero).
+
+    Returns {'score': float, 'label': str, 'weighted_usage_counted': float}.
+    score > 0 = the pitcher's real usage leans toward pitches this hitter
+    struggles with (favorable for the PITCHER's prop / unfavorable for the
+    HITTER's prop); score < 0 is the reverse. Read the sign against whichever
+    side's prop you're actually looking at.
+    """
+    if crosswalk_df is None or crosswalk_df.empty or "note" in crosswalk_df.columns:
+        return {"score": None, "label": "Not enough data to score.", "weighted_usage_counted": 0.0}
+
+    usable = crosswalk_df[crosswalk_df["hitter_n_pitches"] >= low_sample_threshold]
+    if usable.empty:
+        return {"score": None, "label": "All pitches too thin-sampled on the hitter side to score.",
+                "weighted_usage_counted": 0.0}
+
+    total_usage = usable["pitcher_usage_pct"].sum()
+    weighted_score = 0.0
+    for _, row in usable.iterrows():
+        w = row["pitcher_usage_pct"] / total_usage
+        per_pitch = 0.0
+        if pd.notna(row["hitter_xwoba"]):
+            per_pitch += (LEAGUE_AVG_XWOBA_PITCH - row["hitter_xwoba"]) / 0.03  # + = pitcher-favorable
+        if pd.notna(row["hitter_chase_pct"]):
+            per_pitch += (row["hitter_chase_pct"] - LEAGUE_AVG_CHASE) / 5.0
+        if pd.notna(row["hitter_whiff_pct"]):
+            per_pitch += (row["hitter_whiff_pct"] - LEAGUE_AVG_HITTER_WHIFF) / 4.0
+        weighted_score += w * per_pitch
+
+    if weighted_score >= 1.5:
+        label = "🟢 Pitcher's real usage leans HEAVILY toward this hitter's weak spots."
+    elif weighted_score >= 0.5:
+        label = "🟡 Pitcher's usage leans somewhat toward this hitter's weak spots."
+    elif weighted_score > -0.5:
+        label = "⬜ Roughly neutral — usage doesn't lean either way."
+    elif weighted_score > -1.5:
+        label = "🟡 Pitcher's usage leans somewhat toward this hitter's strong spots."
+    else:
+        label = "🔴 Pitcher's real usage leans HEAVILY toward this hitter's strong spots — caution."
+
+    return {"score": round(weighted_score, 2), "label": label,
+            "weighted_usage_counted": round(total_usage, 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -2594,6 +2744,274 @@ def auto_find_best_edges(slate_df: pd.DataFrame, top_n_pitchers: int = 3,
                               f"more lineups are confirmed."}])
 
     return pd.DataFrame(edges).sort_values("score", key=abs, ascending=False)
+
+
+# ---------------------------------------------------------------------------
+# THIRD MODEL — "quality mu" full-slate scanner (pitcher + hitter props)
+# ---------------------------------------------------------------------------
+# Deliberately simpler on the OUTPUT side (one flat, sortable table across
+# every prop type instead of separate deep-dive sections), but the scoring
+# behind it reuses the SAME real signals as everywhere else in this file —
+# pitch tendency (zone%/chase-whiff%/whiff% on significant pitches),
+# per-hand splits, and the pitch-crosswalk hitter-vulnerability score — not
+# a new blended formula invented from scratch.
+#
+# The "top of order" weighting uses each lineup slot's real expected-PA
+# value (EXPECTED_PA_BY_ORDER_SLOT, already defined above for the lineup
+# section) as the weight — leadoff hitters get ~4.6 PA/game vs ~3.6 for the
+# 9-hole, so a lineup stacked with one hand at the top naturally outweighs
+# the same hand scattered at the bottom, without a separate weighting
+# scheme to maintain.
+#
+# SCOPE, stated honestly: hitter props here are limited to the pitch-level-
+# computable set (hits, total_bases, home_runs — same set hitter_prop_
+# probabilities() and the crosswalk already cover). Runs/RBI/Fantasy need a
+# SEPARATE official-box-score pull per hitter (see runs_rbi_probabilities/
+# fantasy_score_probability) — adding those here would multiply the pull
+# count across every hitter in every confirmed lineup, which is exactly the
+# "500+ pulls, not a real-time operation" problem scan_todays_pitchers()
+# was scoped to avoid. Use those two functions directly for a specific
+# hitter once this scan points you at one worth digging into.
+
+def lineup_hand_composition(lineup: list) -> dict:
+    """
+    lineup: list of dicts from pull_confirmed_lineup() (player_id, name,
+    order_slot, expected_pa). Returns {'L': weight, 'R': weight} — how much
+    of tonight's expected plate-appearance volume comes from each hand,
+    using each hitter's real bats-hand and their own order slot's expected
+    PA as the weight (top-of-order hitters get more weight because they
+    genuinely see more plate appearances per game, not an arbitrary boost).
+    """
+    weights = {"L": 0.0, "R": 0.0}
+    for hitter in lineup:
+        try:
+            hand = get_batter_hand(hitter["player_id"])
+        except Exception:
+            hand = "R"
+        hand = hand if hand in ("L", "R") else "R"  # switch-hitters counted on the R side for this weighting
+        weights[hand] += hitter.get("expected_pa", 4.0)
+    return weights
+
+
+def pitcher_quality_mu_score(pitcher_arsenal: list, lineup_hand_weights: dict,
+                              usage_threshold: float = 15.0) -> dict:
+    """
+    The pitcher-side 'quality mu' composite: how good is this pitcher's
+    actual stuff (zone%, chase-whiff%, whiff% on his 15%+-usage pitches),
+    weighted toward whichever hand tonight's REAL lineup will throw at him
+    more, via lineup_hand_composition()'s expected-PA weighting. This
+    scores the pitcher's underlying stuff, separate from and complementary
+    to his real-game-log Poisson probability elsewhere in this file — the
+    scanner reports both side by side rather than blending them into one
+    number (same discipline as hitter_matchup_verdict()'s separate
+    contact/power/discipline scores).
+
+    Returns {'score': float 0-100 or None, 'label': str, 'hand_breakdown': dict}.
+    """
+    total_pa = sum(lineup_hand_weights.values()) or 1.0
+    hand_shares = {h: w / total_pa for h, w in lineup_hand_weights.items()}
+
+    per_hand_scores = {}
+    for hand in ("L", "R"):
+        relevant = [p for p in pitcher_arsenal if p.vs_hand == hand]
+        sig = [p for p in relevant if p.usage_pct >= usage_threshold]
+        if not sig:
+            per_hand_scores[hand] = None
+            continue
+
+        def wavg(field, plist=sig):
+            vals = [(getattr(p, field), p.usage_pct) for p in plist if pd.notna(getattr(p, field))]
+            return sum(v * w for v, w in vals) / sum(w for _, w in vals) if vals else None
+
+        def normalize(value, key):
+            if value is None:
+                return 50.0  # neutral if this signal is missing, doesn't drag the score to 0
+            b = TIER_BENCHMARKS[key]
+            lo, hi = (b["poor"], b["elite"]) if b["direction"] == "high" else (b["elite"], b["poor"])
+            pct = (value - lo) / (hi - lo) * 100
+            return max(0.0, min(100.0, pct))
+
+        zone_n = normalize(wavg("zone_pct"), "zone_pct")
+        chase_whiff_n = normalize(wavg("chase_whiff_pct"), "chase_whiff_pct")
+        whiff_n = normalize(wavg("whiff_pct"), "whiff_pct")
+        per_hand_scores[hand] = round((zone_n + chase_whiff_n + whiff_n) / 3, 1)
+
+    weighted_total, weight_used = 0.0, 0.0
+    for hand in ("L", "R"):
+        s = per_hand_scores.get(hand)
+        share = hand_shares.get(hand, 0.0)
+        if s is not None and share > 0:
+            weighted_total += s * share
+            weight_used += share
+
+    if weight_used == 0:
+        return {"score": None, "label": "Not enough arsenal/lineup data to score.",
+                "hand_breakdown": per_hand_scores}
+
+    final_score = round(weighted_total / weight_used, 1)
+    if final_score >= 70:
+        label = "🟢 Elite stuff vs tonight's lineup composition"
+    elif final_score >= 55:
+        label = "🟡 Above-average stuff vs tonight's lineup"
+    elif final_score >= 45:
+        label = "⬜ Roughly average"
+    elif final_score >= 30:
+        label = "🟠 Below-average stuff vs tonight's lineup"
+    else:
+        label = "🔴 Weak stuff vs tonight's lineup composition"
+
+    return {"score": final_score, "label": label, "hand_breakdown": per_hand_scores,
+            "hand_weights_pa": lineup_hand_weights}
+
+
+def scan_full_slate_quality_mu(days_recent: int = 30, max_games: int = None,
+                                pitcher_lines: dict = None, hitter_lines: dict = None) -> pd.DataFrame:
+    """
+    The full-slate 'quality mu' scan across BOTH pitcher and hitter props.
+    Only scans games with a CONFIRMED lineup already posted (same
+    discipline as auto_find_best_edges — no bench-inclusive roster
+    fallback), so this naturally works best run within a few hours of
+    first pitch.
+
+    For each confirmed starter: pitcher_quality_mu_score() (his real stuff,
+    weighted by tonight's actual lineup hand composition) alongside his
+    mu-based P(over) at pitcher_lines for every stat.
+
+    For each hitter in that confirmed lineup: mu-based P(over) at
+    hitter_lines, alongside crosswalk_vulnerability_score() against the
+    actual starter's real arsenal.
+
+    Returns one flat DataFrame with a 'side' column ('pitcher'/'hitter')
+    and a 'prop_type' column — group/filter by prop_type in the UI, sorted
+    by quality_score descending within each. quality_score is 0-100 and
+    directly comparable within a side, but pitcher-side and hitter-side
+    scores are NOT on the same underlying scale as each other — one is a
+    stuff-quality grade, the other is a hitter-vulnerability read — so sort
+    within 'side' + 'prop_type', not across the whole table at once.
+
+    pitcher_lines / hitter_lines: same default line for every player
+    scanned (this is a slate-wide pass) — re-test any individual player at
+    a custom line using the per-player sections elsewhere in this app once
+    this scan points you at one worth digging into.
+    """
+    from datetime import datetime, timedelta
+
+    p_lines = pitcher_lines or {"outs": 15.5, "strikeouts": 5.5,
+                                  "walks_allowed": 1.5, "hits_allowed": 5.5}
+    h_lines = hitter_lines or {"hits": 0.5, "total_bases": 1.5, "home_runs": 0.5}
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    recent_start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+
+    games = pull_todays_games()
+    if games.empty:
+        return pd.DataFrame([{"note": "No games found for today."}])
+    if max_games:
+        games = games.head(max_games)
+
+    rows = []
+    seen_pitcher_ids = set()
+
+    for _, game in games.iterrows():
+        game_pk = game.get("game_id")
+        if game_pk is None:
+            continue
+
+        try:
+            lineup_check = pull_confirmed_lineup(game_pk)
+        except Exception:
+            continue
+        if lineup_check.get("lineup_status") != "confirmed":
+            continue  # skip entirely — no partial/guessed scans on this pass
+
+        for side, opp_name_col, own_name_col, batting_side in [
+            ("home", "away_name", "home_name", "away"),
+            ("away", "home_name", "away_name", "home"),
+        ]:
+            try:
+                pitcher_info = get_probable_pitcher(game_pk, side)
+                if not pitcher_info or pitcher_info["player_id"] in seen_pitcher_ids:
+                    continue
+                seen_pitcher_ids.add(pitcher_info["player_id"])
+                pid = pitcher_info["player_id"]
+
+                pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, recent_start, today_str))
+                if not pitcher_recent:
+                    continue
+
+                opposing_lineup = lineup_check.get(batting_side, [])
+                hand_weights = lineup_hand_composition(opposing_lineup)
+                quality = pitcher_quality_mu_score(pitcher_recent, hand_weights)
+
+                probs = pitcher_prop_probabilities(pid, recent_start, today_str, p_lines)
+                if "p_over" in probs.columns:
+                    for _, prow in probs.iterrows():
+                        rows.append({
+                            "side": "pitcher", "prop_type": prow["stat"],
+                            "player": pitcher_info.get("name", "Unknown"),
+                            "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
+                            "line": prow["line"], "mu": prow["recent_avg"],
+                            "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
+                            "quality_score": quality["score"], "quality_label": quality["label"],
+                            "game_pk": game_pk,
+                        })
+
+                pitcher_hand = get_pitcher_hand(pid)
+                for hitter in opposing_lineup:
+                    try:
+                        bid = hitter["player_id"]
+                        batter_hand = get_batter_hand(bid)
+                        batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
+
+                        h_recent = build_hitter_profile(pull_batter_pitches(bid, recent_start, today_str))
+                        if not h_recent:
+                            continue
+
+                        h_probs = hitter_prop_probabilities(bid, recent_start, today_str, h_lines)
+                        crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
+                        vuln = crosswalk_vulnerability_score(crosswalk)
+
+                        if "p_over" in h_probs.columns:
+                            # Flip vuln's sign onto a 0-100 scale: vuln score < 0 means the
+                            # PITCHER's usage leans toward this hitter's STRONG spots, i.e.
+                            # good for the hitter's over — so quality_score should be HIGH.
+                            h_quality = (None if vuln["score"] is None
+                                         else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
+                            for _, hrow in h_probs.iterrows():
+                                rows.append({
+                                    "side": "hitter", "prop_type": hrow["stat"],
+                                    "player": hitter["name"], "team": game.get(opp_name_col, "?"),
+                                    "opponent": game.get(own_name_col, "?"),
+                                    "line": hrow["line"], "mu": hrow["recent_avg"],
+                                    "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
+                                    "quality_score": h_quality, "quality_label": vuln["label"],
+                                    "game_pk": game_pk,
+                                })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    if not rows:
+        return pd.DataFrame([{"note": "No confirmed lineups yet for today — re-run closer to "
+                              "game time (lineups typically post 2-4 hours before first pitch)."}])
+
+    return pd.DataFrame(rows).sort_values(["prop_type", "quality_score"], ascending=[True, False])
+
+
+def rescore_quality_mu_row(mu: float, new_line: float) -> dict:
+    """
+    Re-fit P(over)/P(under) for a single scan_full_slate_quality_mu() row
+    at a custom line, WITHOUT re-pulling any data — mu (the row's
+    recent_avg) is already stored, so this just re-runs the same Poisson
+    CDF at the new line. This is what powers 'adjust the line and see if
+    it still agrees' in the UI without a full re-scan.
+    """
+    if _poisson is None:
+        raise ImportError("pip install scipy --break-system-packages")
+    import math
+    p_over = 1 - _poisson.cdf(math.floor(new_line), mu)
+    return {"line": new_line, "mu": mu, "p_over": round(p_over, 3), "p_under": round(1 - p_over, 3)}
 
 
 def pull_hitter_game_log(batter_id: int, start_dt: str, end_dt: str) -> pd.DataFrame:
@@ -3662,6 +4080,186 @@ def run_lineup_matchup_report(game_pk: int, pitching_side: str,
             results.append(ranked)
 
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
+
+# =============================================================================
+# SECTION 6 — LIVE BOARD LINES (PrizePicks / Underdog)
+# =============================================================================
+# CAUTION, stated plainly: these hit UNOFFICIAL, reverse-engineered JSON
+# endpoints, not published/supported APIs — the same category of risk as
+# pull_savant_pitch_arsenal_leaderboard() above. They can change shape or
+# start blocking requests without notice; if either pull below starts
+# failing, that's almost certainly the endpoint changing, not a bug here.
+# Could not verify live in this build environment (no network access) — the
+# first time you run these, print the raw response and adjust the parsing
+# below to match what you actually get back.
+#
+# Needs one more package this project doesn't currently install:
+#     pip install requests --break-system-packages
+# (added to requirements.txt)
+
+import re
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+def pull_prizepicks_mlb_lines() -> pd.DataFrame:
+    """
+    Pulls PrizePicks' current MLB board via their public projections
+    endpoint. Returns columns: player_name, stat_type, line, source.
+    league_id=2 is PrizePicks' MLB league — if this comes back empty,
+    print the raw JSON and check whether that id has changed.
+    """
+    if requests is None:
+        raise ImportError("pip install requests --break-system-packages")
+
+    url = "https://api.prizepicks.com/projections?league_id=2&per_page=500"
+    headers = {"User-Agent": "Mozilla/5.0"}  # PrizePicks blocks requests with no UA header
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Player names live in the 'included' array keyed by id; each
+    # projection (line) in 'data' references that id via relationships.
+    players_by_id = {
+        item["id"]: item.get("attributes", {}).get("name")
+        for item in data.get("included", [])
+        if item.get("type") == "new_player"
+    }
+
+    rows = []
+    for proj in data.get("data", []):
+        attrs = proj.get("attributes", {})
+        player_id = proj.get("relationships", {}).get("new_player", {}).get("data", {}).get("id")
+        rows.append({
+            "player_name": players_by_id.get(player_id, "Unknown"),
+            "stat_type": attrs.get("stat_type"),
+            "line": attrs.get("line_score"),
+            "source": "PrizePicks",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def pull_underdog_mlb_lines() -> pd.DataFrame:
+    """
+    Pulls Underdog's current board via their public over/under lines
+    endpoint (this covers all sports currently live — filter stat_type/
+    player names for MLB-relevant rows downstream, since the endpoint
+    doesn't take a sport filter param as far as could be verified here).
+    Returns columns: player_name, stat_type, line, source.
+    """
+    if requests is None:
+        raise ImportError("pip install requests --break-system-packages")
+
+    url = "https://api.underdogfantasy.com/beta/v6/over_under_lines"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    players_by_id = {p["id"]: f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+                      for p in data.get("players", [])}
+
+    rows = []
+    for line in data.get("over_under_lines", []):
+        ou = line.get("over_under", {})
+        appearance_stat = ou.get("appearance_stat", {})
+        player_id = appearance_stat.get("player_id") or ou.get("player_id")
+        stat_type = ou.get("title") or appearance_stat.get("display_stat")
+        rows.append({
+            "player_name": players_by_id.get(player_id, "Unknown"),
+            "stat_type": stat_type,
+            "line": line.get("stat_value"),
+            "source": "Underdog",
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Name matching — book names -> this tool's player names
+# ---------------------------------------------------------------------------
+# PrizePicks/Underdog names don't always match cleanly (suffixes, accents,
+# nicknames). Matches by NORMALIZED STRING against a candidate list you
+# already have (e.g. the 'player' column from scan_full_slate_quality_mu())
+# rather than hitting playerid_lookup(fuzzy=True) per board line — that's
+# slow and unnecessary when you already have tonight's real player list.
+
+def _normalize_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    import unicodedata
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")  # 'í' -> 'i', etc.
+    name = name.lower()
+    name = re.sub(r"\b(jr|sr|ii|iii|iv)\b\.?", "", name)  # strip suffixes
+    name = re.sub(r"[^a-z\s]", "", name)  # strip remaining punctuation
+    return " ".join(name.split())
+
+
+def match_book_line_to_player(book_name: str, candidate_names: list) -> Optional[str]:
+    """
+    Best-effort match of a PrizePicks/Underdog player_name to one of your
+    own candidate_names. Exact normalized match first, then a loose
+    contains-match fallback. Returns None on no match — never guesses
+    silently, since a wrong player match is worse than a missing one.
+    """
+    target = _normalize_name(book_name)
+    if not target:
+        return None
+
+    normalized = {c: _normalize_name(c) for c in candidate_names}
+    for cand, norm in normalized.items():
+        if norm == target:
+            return cand
+    for cand, norm in normalized.items():
+        if norm and (norm in target or target in norm):
+            return cand
+    return None
+
+
+def merge_book_lines_into_slate(slate_df: pd.DataFrame, book_lines: pd.DataFrame,
+                                 stat_map: dict) -> pd.DataFrame:
+    """
+    slate_df: output of scan_full_slate_quality_mu() (needs 'player' and
+        'prop_type' columns).
+    book_lines: output of pull_prizepicks_mlb_lines() / pull_underdog_mlb_lines().
+    stat_map: {book_stat_type_string: your_prop_type_string}, e.g.
+        {'Strikeouts': 'strikeouts', 'Hits Allowed': 'hits_allowed',
+         'Hits': 'hits', 'Total Bases': 'total_bases', 'Home Runs': 'home_runs'}.
+        REQUIRED — the book's stat_type strings won't match this tool's
+        internal prop_type names automatically. Check
+        book_lines['stat_type'].unique() the first time you run this and
+        build the map from what you actually see back.
+
+    Adds a 'book_line' column to slate_df wherever a match is found by
+    normalized player name + mapped stat type. Unmatched rows keep
+    book_line as NA rather than being silently dropped, so you can see
+    exactly what didn't match and fix the stat_map or name if needed.
+    """
+    slate_df = slate_df.copy()
+    slate_df["book_line"] = pd.NA
+    if book_lines is None or book_lines.empty or "player" not in slate_df.columns:
+        return slate_df
+
+    candidate_names = slate_df["player"].unique().tolist()
+    book_lines = book_lines.copy()
+    book_lines["matched_player"] = book_lines["player_name"].apply(
+        lambda n: match_book_line_to_player(n, candidate_names))
+    book_lines["mapped_prop_type"] = book_lines["stat_type"].map(stat_map)
+
+    lookup = {}
+    for _, row in book_lines.dropna(subset=["matched_player", "mapped_prop_type"]).iterrows():
+        lookup[(row["matched_player"], row["mapped_prop_type"])] = row["line"]
+
+    slate_df["book_line"] = slate_df.apply(
+        lambda r: lookup.get((r["player"], r["prop_type"]), pd.NA), axis=1)
+    return slate_df
 
 
 if __name__ == "__main__":
