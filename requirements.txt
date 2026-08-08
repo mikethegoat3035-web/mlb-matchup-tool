@@ -3,3 +3,4 @@ pybaseball
 pandas
 scipy
 MLB-StatsAPI
+requests
