@@ -88,7 +88,7 @@ def color_quality(val):
 def style_probability_table(df):
     if "quality" not in df.columns:
         return df
-    return df.style.applymap(color_quality, subset=["quality"])
+    return df.style.map(color_quality, subset=["quality"])
 
 
 def style_edges_table(df):
@@ -812,7 +812,7 @@ def style_tier_table(df):
                   "Poor": "background-color: #5c1e1e; color: #f8d7da",
                   "N/A": "background-color: #3a3a3a; color: #cccccc"}
         return colors.get(val, "")
-    return df.style.applymap(color_tier, subset=["tier"])
+    return df.style.map(color_tier, subset=["tier"])
 
 
 st.header("🔬 Side model (simple tiers) — separate methodology")
