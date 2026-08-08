@@ -223,12 +223,14 @@ if "last_slate_scan" in st.session_state:
 st.divider()
 st.header("🎯 Quality Mu Slate Scanner — every prop, one table")
 st.caption("The simple version: scans every CONFIRMED game today, both pitcher and hitter "
-           "props, and grades each by quality_score — pitcher rows use real pitch tendency "
-           "(zone%/chase-whiff%/whiff%) weighted toward whichever hand tonight's actual "
-           "lineup stacks at the top of the order; hitter rows use the pitch-crosswalk "
-           "vulnerability score against the actual starter. Adjust any single row's line "
-           "below without re-scanning. Needs confirmed lineups — best run within a few "
-           "hours of first pitch.")
+           "props — including official-data props (Earned Runs, H+R+RBI, both Fantasy scores) "
+           "when enabled below — and grades each by quality_score. Pitcher rows use real pitch "
+           "tendency (zone%/chase-whiff%/whiff%) weighted toward whichever hand tonight's "
+           "actual lineup stacks at the top of the order; hitter rows use the pitch-crosswalk "
+           "vulnerability score against the actual starter. Only rows with a REAL edge (not "
+           "near-coinflip) and a real sample size make it through — adjust the filters below "
+           "to loosen/tighten that. Adjust any single row's line without re-scanning. Needs "
+           "confirmed lineups — best run within a few hours of first pitch.")
 
 qm_col1, qm_col2, qm_col3 = st.columns(3)
 qm_pitcher_days = qm_col1.number_input("Days back for pitcher data", value=68, step=5, key="qm_pitcher_days")
@@ -242,6 +244,19 @@ else:
     qm_hitter_days = None
     st.caption(f"Hitters will use the full season (from {SEASON_START}).")
 
+qm_include_official = st.checkbox(
+    "Include Earned Runs, H+R+RBI, and both Fantasy props (official box-score data — "
+    "roughly doubles scan time)", value=True, key="qm_include_official")
+
+st.write("**Filters — this is what keeps the results to real plays, not every prop for every player:**")
+qf1, qf2, qf3 = st.columns(3)
+qm_min_edge = qf1.slider("Minimum edge from a coinflip", min_value=0.0, max_value=0.45,
+                         value=0.15, step=0.05, key="qm_min_edge",
+                         help="0.15 = only show props at 65%+ or 35%-under probability. Raise for fewer, stronger plays.")
+qm_min_games = qf2.number_input("Minimum games sampled", value=5, step=1, key="qm_min_games")
+qm_min_quality = qf3.number_input("Minimum quality_score (0 = don't filter on this)",
+                                  value=0, step=5, key="qm_min_quality")
+
 if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
     with st.spinner("Scanning every confirmed game today — this can take a while on a full slate..."):
         try:
@@ -251,13 +266,16 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 hitter_days_recent=int(qm_hitter_days) if qm_hitter_days is not None else None,
                 hitter_season_long=qm_hitter_season_long,
                 season_start=SEASON_START,
+                include_official_props=qm_include_official,
+                min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
+                min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
                 max_games=max_g)
             if "note" in qm_slate.columns:
                 st.warning(qm_slate.iloc[0]["note"])
                 st.session_state.pop("qm_slate", None)
             else:
                 st.session_state.qm_slate = qm_slate
-                st.success(f"Scanned {len(qm_slate)} props across "
+                st.success(f"Found {len(qm_slate)} props with a real edge, across "
                           f"{qm_slate['player'].nunique()} players.")
         except Exception as e:
             st.error(f"Quality Mu scan failed: {e}")
