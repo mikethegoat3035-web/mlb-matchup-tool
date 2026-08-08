@@ -248,11 +248,22 @@ qm_include_official = st.checkbox(
     "Include Earned Runs, H+R+RBI, and both Fantasy props (official box-score data — "
     "roughly doubles scan time)", value=True, key="qm_include_official")
 
+qlc1, qlc2 = st.columns(2)
+qm_use_live_lines = qlc1.checkbox(
+    "Use real PrizePicks/Underdog lines where available (falls back to defaults otherwise)",
+    value=True, key="qm_use_live_lines",
+    help="Pulls the live board once, swaps in each player's REAL line wherever a match is "
+         "found. Unofficial endpoint — if it fails, the scan automatically falls back to the "
+         "flat default lines below, nothing breaks.")
+qm_live_source = qlc2.radio("Live line source", ["underdog", "prizepicks"],
+                            horizontal=True, key="qm_live_source",
+                            disabled=not qm_use_live_lines)
+
 st.write("**Filters — this is what keeps the results to real plays, not every prop for every player:**")
 qf1, qf2, qf3 = st.columns(3)
 qm_min_edge = qf1.slider("Minimum edge from a coinflip", min_value=0.0, max_value=0.45,
-                         value=0.15, step=0.05, key="qm_min_edge",
-                         help="0.15 = only show props at 65%+ or 35%-under probability. Raise for fewer, stronger plays.")
+                         value=0.25, step=0.05, key="qm_min_edge",
+                         help="0.25 = only show props at 75%+ or 25%-under probability. Raise for fewer, stronger plays.")
 qm_min_games = qf2.number_input("Minimum games sampled", value=5, step=1, key="qm_min_games")
 qm_min_quality = qf3.number_input("Minimum quality_score (0 = don't filter on this)",
                                   value=0, step=5, key="qm_min_quality")
@@ -267,6 +278,7 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 hitter_season_long=qm_hitter_season_long,
                 season_start=SEASON_START,
                 include_official_props=qm_include_official,
+                use_live_lines=qm_use_live_lines, live_line_source=qm_live_source,
                 min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
                 min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
                 max_games=max_g)
@@ -275,8 +287,10 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 st.session_state.pop("qm_slate", None)
             else:
                 st.session_state.qm_slate = qm_slate
+                n_live = (qm_slate["line_source"] == "live").sum() if "line_source" in qm_slate.columns else 0
                 st.success(f"Found {len(qm_slate)} props with a real edge, across "
-                          f"{qm_slate['player'].nunique()} players.")
+                          f"{qm_slate['player'].nunique()} players — {n_live} used a real "
+                          f"live line, the rest used flat defaults.")
         except Exception as e:
             st.error(f"Quality Mu scan failed: {e}")
 
