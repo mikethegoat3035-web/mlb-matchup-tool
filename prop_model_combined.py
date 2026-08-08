@@ -2864,12 +2864,88 @@ def pitcher_quality_mu_score(pitcher_arsenal: list, lineup_hand_weights: dict,
             "hand_weights_pa": lineup_hand_weights}
 
 
+DEFAULT_BOOK_STAT_MAP = {
+    # Book stat_type string -> this file's internal prop_type. NAMES ARE
+    # BEST-EFFORT — never confirmed against a live pull (see module notes on
+    # pull_prizepicks_mlb_lines/pull_underdog_mlb_lines). The first time you
+    # run this for real, print book_lines['stat_type'].unique() and fix any
+    # entries that don't match what you actually see back.
+    "Strikeouts": "strikeouts", "Pitcher Strikeouts": "strikeouts",
+    "Pitching Outs": "outs", "Outs": "outs", "Outs Recorded": "outs",
+    "Walks Allowed": "walks_allowed", "Pitching Walks": "walks_allowed",
+    "Hits Allowed": "hits_allowed", "Pitching Hits Allowed": "hits_allowed",
+    "Earned Runs Allowed": "pitcher_earned_runs", "Earned Runs": "pitcher_earned_runs",
+    "Pitcher Fantasy Score": "pitcher_fantasy", "Pitcher Fantasy Points": "pitcher_fantasy",
+    "Hits": "hits", "Singles": "singles", "Total Bases": "total_bases",
+    "Home Runs": "home_runs",
+    "Hits + Runs + RBIs": "hitter_hits_runs_rbi", "Hits+Runs+RBIs": "hitter_hits_runs_rbi",
+    "Fantasy Score": "hitter_fantasy", "Hitter Fantasy Score": "hitter_fantasy",
+    "Hitter Fantasy Points": "hitter_fantasy",
+}
+
+
+def _build_live_line_lookup(source: str = "underdog") -> dict:
+    """
+    Pulls the live board ONCE and returns {normalized_player_name:
+    {book_stat_type_raw: line}}. Returns {} on ANY failure — a bad/changed
+    endpoint should never crash the whole slate scan, it should just mean
+    the scan falls back to flat default lines for everyone, same as before
+    this feature existed.
+    """
+    try:
+        book_df = (pull_underdog_mlb_lines() if source == "underdog"
+                   else pull_prizepicks_mlb_lines())
+    except Exception:
+        return {}
+    if book_df is None or book_df.empty:
+        return {}
+
+    lookup = {}
+    for _, row in book_df.iterrows():
+        name = _normalize_name(row.get("player_name", ""))
+        stat_type = row.get("stat_type")
+        line = row.get("line")
+        if not name or stat_type is None or pd.isna(line):
+            continue
+        lookup.setdefault(name, {})[stat_type] = line
+    return lookup
+
+
+def _player_lines_with_live(player_name: str, default_lines: dict, live_lookup: dict,
+                             stat_map: dict) -> tuple:
+    """
+    Returns (lines_dict, matched_props_set). lines_dict starts as a copy of
+    default_lines, then overwrites any entry a live line was found for.
+    matched_props_set tells the caller which specific prop_types got a real
+    line vs which are still using the flat default — used to tag each
+    output row's 'line_source' column.
+    """
+    norm_name = _normalize_name(player_name)
+    book_lines_for_player = live_lookup.get(norm_name, {})
+    if not book_lines_for_player:
+        return dict(default_lines), set()
+
+    reverse_map = {}
+    for book_stat, internal_stat in stat_map.items():
+        if book_stat in book_lines_for_player and internal_stat in default_lines:
+            reverse_map[internal_stat] = book_lines_for_player[book_stat]
+
+    result = dict(default_lines)
+    matched = set()
+    for stat, live_line in reverse_map.items():
+        result[stat] = live_line
+        matched.add(stat)
+    return result, matched
+
+
 def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent: int = None,
                                 hitter_season_long: bool = True, season_start: str = "2026-03-27",
                                 season: int = 2026, max_games: int = None,
                                 pitcher_lines: dict = None, hitter_lines: dict = None,
                                 include_official_props: bool = True,
-                                min_edge: float = 0.15, min_games_sampled: int = 5,
+                                use_live_lines: bool = True, live_line_source: str = "underdog",
+                                book_stat_map: dict = None,
+                                min_edge: float = 0.25, min_games_sampled: int = 5,
                                 min_quality_score: float = None) -> pd.DataFrame:
     """
     The full-slate 'quality mu' scan across BOTH pitcher and hitter props.
@@ -2893,12 +2969,26 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
     extra official-data pull per pitcher AND per hitter) — set False for a
     faster pitch-level-only pass.
 
+    LIVE LINES — use_live_lines=True (default) pulls the real PrizePicks/
+    Underdog board ONCE at the start of the scan and uses each player's
+    REAL line wherever a match is found (by normalized name + book_stat_map),
+    instead of a flat guessed default. Every output row gets a
+    'line_source' column: 'live' or 'default', so you always know which
+    number you're actually looking at — no more guessing whether a row's
+    edge is real or an artifact of a wrong assumed line. If the live pull
+    fails entirely (unofficial endpoint, see pull_underdog_mlb_lines() /
+    pull_prizepicks_mlb_lines() notes) or a specific player/prop isn't
+    found on the board, that row silently falls back to the flat default —
+    the scan never breaks because of this. live_line_source: 'underdog' or
+    'prizepicks'. book_stat_map: override DEFAULT_BOOK_STAT_MAP if the
+    book's real stat_type strings differ from what's assumed there.
+
     FILTERING — this is what keeps the output to real signal instead of
     hundreds of near-coinflip rows:
       - min_edge: only keeps rows where P(over) is at least this far from
-        0.50 in EITHER direction (default 0.15, i.e. p_over >= 0.65 OR
-        <= 0.35). Lower this to see more rows, raise it to see fewer/
-        stronger ones.
+        0.50 in EITHER direction (default 0.25, i.e. p_over >= 0.75 OR
+        <= 0.25 — deliberately strict). Lower this to see more rows, raise
+        it to see fewer/stronger ones.
       - min_games_sampled: drops rows backed by too few games to trust
         (default 5) — a thin sample can produce an extreme-looking
         probability that isn't real signal.
@@ -2914,12 +3004,15 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
     """
     from datetime import datetime, timedelta
 
-    p_lines = pitcher_lines or {"outs": 15.5, "strikeouts": 5.5,
-                                  "walks_allowed": 1.5, "hits_allowed": 5.5}
-    h_lines = hitter_lines or {"hits": 0.5, "singles": 0.5,
-                                 "total_bases": 1.5, "home_runs": 0.5}
-    p_official_lines = {"earned_runs": 2.5, "fantasy": 18.5}
-    h_official_lines = {"hits_runs_rbi": 1.5, "fantasy": 8.5}
+    p_lines_default = pitcher_lines or {"outs": 15.5, "strikeouts": 5.5,
+                                          "walks_allowed": 1.5, "hits_allowed": 5.5}
+    h_lines_default = hitter_lines or {"hits": 0.5, "singles": 0.5,
+                                         "total_bases": 1.5, "home_runs": 0.5}
+    p_official_lines_default = {"pitcher_earned_runs": 2.5, "pitcher_fantasy": 18.5}
+    h_official_lines_default = {"hitter_hits_runs_rbi": 1.5, "hitter_fantasy": 8.5}
+    stat_map = book_stat_map or DEFAULT_BOOK_STAT_MAP
+
+    live_lookup = _build_live_line_lookup(live_line_source) if use_live_lines else {}
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     pitcher_start = (datetime.now() - timedelta(days=pitcher_days_recent)).strftime("%Y-%m-%d")
@@ -2961,6 +3054,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                     continue
                 seen_pitcher_ids.add(pitcher_info["player_id"])
                 pid = pitcher_info["player_id"]
+                pitcher_name = pitcher_info.get("name", "Unknown")
 
                 pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, pitcher_start, today_str))
                 if not pitcher_recent:
@@ -2970,31 +3064,42 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 hand_weights = lineup_hand_composition(opposing_lineup)
                 quality = pitcher_quality_mu_score(pitcher_recent, hand_weights)
 
+                p_lines, p_matched = _player_lines_with_live(
+                    pitcher_name, p_lines_default, live_lookup, stat_map)
                 probs = pitcher_prop_probabilities(pid, pitcher_start, today_str, p_lines)
                 if "p_over" in probs.columns:
                     for _, prow in probs.iterrows():
                         rows.append({
                             "side": "pitcher", "prop_type": prow["stat"],
-                            "player": pitcher_info.get("name", "Unknown"),
+                            "player": pitcher_name,
                             "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                             "line": prow["line"], "mu": prow["recent_avg"],
                             "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
                             "quality_score": quality["score"], "quality_label": quality["label"],
+                            "line_source": "live" if prow["stat"] in p_matched else "default",
                             "game_pk": game_pk,
                         })
 
                 if include_official_props:
                     try:
-                        p_official = pitcher_official_prop_probabilities(pid, season, p_official_lines)
+                        p_official_lines, p_official_matched = _player_lines_with_live(
+                            pitcher_name, p_official_lines_default, live_lookup, stat_map)
+                        # pitcher_official_prop_probabilities expects short keys ('earned_runs','fantasy'),
+                        # not the prefixed ones used for live-line matching — translate back.
+                        short_official_lines = {k.replace("pitcher_", "", 1): v
+                                                 for k, v in p_official_lines.items()}
+                        p_official = pitcher_official_prop_probabilities(pid, season, short_official_lines)
                         if "p_over" in p_official.columns:
                             for _, prow in p_official.iterrows():
+                                full_stat = "pitcher_" + prow["stat"]
                                 rows.append({
-                                    "side": "pitcher", "prop_type": "pitcher_" + prow["stat"],
-                                    "player": pitcher_info.get("name", "Unknown"),
+                                    "side": "pitcher", "prop_type": full_stat,
+                                    "player": pitcher_name,
                                     "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                                     "line": prow["line"], "mu": prow["recent_avg"],
                                     "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
                                     "quality_score": quality["score"], "quality_label": quality["label"],
+                                    "line_source": "live" if full_stat in p_official_matched else "default",
                                     "game_pk": game_pk,
                                 })
                     except Exception:
@@ -3004,6 +3109,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 for hitter in opposing_lineup:
                     try:
                         bid = hitter["player_id"]
+                        hitter_name = hitter["name"]
                         batter_hand = get_batter_hand(bid)
                         batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
 
@@ -3011,6 +3117,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         if not h_recent:
                             continue
 
+                        h_lines, h_matched = _player_lines_with_live(
+                            hitter_name, h_lines_default, live_lookup, stat_map)
                         h_probs = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines)
                         crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
                         vuln = crosswalk_vulnerability_score(crosswalk)
@@ -3025,26 +3133,33 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             for _, hrow in h_probs.iterrows():
                                 rows.append({
                                     "side": "hitter", "prop_type": hrow["stat"],
-                                    "player": hitter["name"], "team": game.get(opp_name_col, "?"),
+                                    "player": hitter_name, "team": game.get(opp_name_col, "?"),
                                     "opponent": game.get(own_name_col, "?"),
                                     "line": hrow["line"], "mu": hrow["recent_avg"],
                                     "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
                                     "quality_score": h_quality, "quality_label": vuln["label"],
+                                    "line_source": "live" if hrow["stat"] in h_matched else "default",
                                     "game_pk": game_pk,
                                 })
 
                         if include_official_props:
                             try:
-                                h_official = hitter_official_prop_probabilities(bid, season, h_official_lines)
+                                h_official_lines, h_official_matched = _player_lines_with_live(
+                                    hitter_name, h_official_lines_default, live_lookup, stat_map)
+                                short_h_official_lines = {k.replace("hitter_", "", 1): v
+                                                          for k, v in h_official_lines.items()}
+                                h_official = hitter_official_prop_probabilities(bid, season, short_h_official_lines)
                                 if "p_over" in h_official.columns:
                                     for _, hrow in h_official.iterrows():
+                                        full_stat = "hitter_" + hrow["stat"]
                                         rows.append({
-                                            "side": "hitter", "prop_type": "hitter_" + hrow["stat"],
-                                            "player": hitter["name"], "team": game.get(opp_name_col, "?"),
+                                            "side": "hitter", "prop_type": full_stat,
+                                            "player": hitter_name, "team": game.get(opp_name_col, "?"),
                                             "opponent": game.get(own_name_col, "?"),
                                             "line": hrow["line"], "mu": hrow["recent_avg"],
                                             "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
                                             "quality_score": h_quality, "quality_label": vuln["label"],
+                                            "line_source": "live" if full_stat in h_official_matched else "default",
                                             "game_pk": game_pk,
                                         })
                             except Exception:
