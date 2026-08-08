@@ -32,7 +32,9 @@ from prop_model_combined import (
     similar_lineup_history, hitter_overall_grade, pitcher_overall_grade,
     earned_runs_probability, similar_arsenal_summary, similar_lineup_summary,
     scan_todays_pitchers, get_player_id_from_full_name, auto_find_best_edges,
-    run_side_model,
+    run_side_model, build_pitch_crosswalk, crosswalk_vulnerability_score,
+    scan_full_slate_quality_mu, rescore_quality_mu_row,
+    pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -213,6 +215,99 @@ if "last_slate_scan" in st.session_state:
                                        mime="text/csv", key="dl_edges")
             except Exception as e:
                 st.error(f"Edge-finding failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# THIRD MODEL — Quality Mu full-slate scanner (pitcher + hitter, one table)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("🎯 Quality Mu Slate Scanner — every prop, one table")
+st.caption("The simple version: scans every CONFIRMED game today, both pitcher and hitter "
+           "props, and grades each by quality_score — pitcher rows use real pitch tendency "
+           "(zone%/chase-whiff%/whiff%) weighted toward whichever hand tonight's actual "
+           "lineup stacks at the top of the order; hitter rows use the pitch-crosswalk "
+           "vulnerability score against the actual starter. Adjust any single row's line "
+           "below without re-scanning. Needs confirmed lineups — best run within a few "
+           "hours of first pitch.")
+
+qm_col1, qm_col2 = st.columns(2)
+qm_days = qm_col1.number_input("Days back for player data", value=30, step=5, key="qm_days")
+qm_max_games = qm_col2.number_input("Limit to N games (0 = scan everything)", value=0, step=1, key="qm_max_games")
+
+if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
+    with st.spinner("Scanning every confirmed game today — this can take a while on a full slate..."):
+        try:
+            max_g = int(qm_max_games) if qm_max_games > 0 else None
+            qm_slate = scan_full_slate_quality_mu(days_recent=int(qm_days), max_games=max_g)
+            if "note" in qm_slate.columns:
+                st.warning(qm_slate.iloc[0]["note"])
+                st.session_state.pop("qm_slate", None)
+            else:
+                st.session_state.qm_slate = qm_slate
+                st.success(f"Scanned {len(qm_slate)} props across "
+                          f"{qm_slate['player'].nunique()} players.")
+        except Exception as e:
+            st.error(f"Quality Mu scan failed: {e}")
+
+if "qm_slate" in st.session_state:
+    qm_slate = st.session_state.qm_slate
+    prop_types = sorted(qm_slate["prop_type"].unique().tolist())
+    qm_side_filter = st.radio("Side", ["Both", "Pitcher props", "Hitter props"],
+                               horizontal=True, key="qm_side_filter")
+    qm_prop_filter = st.selectbox("Prop type", ["All"] + prop_types, key="qm_prop_filter")
+
+    view = qm_slate.copy()
+    if qm_side_filter == "Pitcher props":
+        view = view[view["side"] == "pitcher"]
+    elif qm_side_filter == "Hitter props":
+        view = view[view["side"] == "hitter"]
+    if qm_prop_filter != "All":
+        view = view[view["prop_type"] == qm_prop_filter]
+    view = view.sort_values("quality_score", ascending=False)
+
+    st.dataframe(view.drop(columns=["game_pk"], errors="ignore"), use_container_width=True)
+    csv = view.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download this view as CSV", csv,
+                       file_name=f"quality_mu_scan_{datetime.now().strftime('%Y%m%d')}.csv",
+                       mime="text/csv", key="dl_qm_slate")
+
+    with st.expander("🎚️ Adjust the line on one row (no re-scan needed)"):
+        row_labels = [f"{r['player']} — {r['prop_type']} (mu={r['mu']})"
+                     for _, r in view.iterrows()]
+        if row_labels:
+            sel = st.selectbox("Pick a row", row_labels, key="qm_row_select")
+            sel_idx = row_labels.index(sel)
+            sel_row = view.iloc[sel_idx]
+            new_line = st.number_input("New line", value=float(sel_row["line"]), step=0.5, key="qm_new_line")
+            if st.button("Recalculate", key="qm_recalc_btn"):
+                result = rescore_quality_mu_row(mu=float(sel_row["mu"]), new_line=new_line)
+                st.json(result)
+
+    st.subheader("📡 Pull live lines (PrizePicks / Underdog)")
+    st.caption("⚠️ Unofficial endpoints — see prop_model_combined.py notes. Stat-name mapping "
+               "below is a starting point; check the raw stat_type values the first time you "
+               "run this and adjust if the book's naming differs.")
+    default_stat_map = {
+        "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
+        "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
+        "Home Runs": "home_runs",
+    }
+    book_choice = st.radio("Source", ["PrizePicks", "Underdog"], horizontal=True, key="qm_book_choice")
+    if st.button("Pull live lines and merge", key="qm_pull_lines_btn"):
+        with st.spinner("Pulling live board..."):
+            try:
+                book_df = (pull_prizepicks_mlb_lines() if book_choice == "PrizePicks"
+                          else pull_underdog_mlb_lines())
+                if book_df.empty:
+                    st.warning("No lines came back — endpoint may have changed shape, see caption above.")
+                else:
+                    st.caption(f"Raw stat_type values seen: {sorted(book_df['stat_type'].dropna().unique().tolist())}")
+                    merged = merge_book_lines_into_slate(qm_slate, book_df, default_stat_map)
+                    n_matched = merged["book_line"].notna().sum()
+                    st.success(f"Matched {n_matched} of {len(merged)} rows to a live {book_choice} line.")
+                    st.dataframe(merged.drop(columns=["game_pk"], errors="ignore"), use_container_width=True)
+            except Exception as e:
+                st.error(f"Couldn't pull/merge live lines: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +701,11 @@ if st.session_state.pitcher_recent:
                                     if "power_breakdown" in verdict:
                                         st.caption("Power score breakdown (with real sample size per pitch):")
                                         st.dataframe(verdict["power_breakdown"], use_container_width=True)
+                                    st.divider()
+                                    crosswalk = build_pitch_crosswalk(st.session_state.pitcher_recent,
+                                                                       c.hitter_recent, hand, p_throws)
+                                    vulnerability = crosswalk_vulnerability_score(crosswalk)
+                                    show_crosswalk_table(crosswalk, vulnerability, row["hitter"])
                 except Exception as e:
                     st.error(f"Roster screening failed: {e}")
 
@@ -766,6 +866,12 @@ if st.session_state.pitcher_recent:
 
                         h_recent, _, h_season_raw, bid_for_summary = hitter_profiles_by_name[c.name]
 
+                        crosswalk = build_pitch_crosswalk(st.session_state.pitcher_recent, h_recent,
+                                                           hand, p_throws)
+                        vulnerability = crosswalk_vulnerability_score(crosswalk)
+                        show_crosswalk_table(crosswalk, vulnerability, c.name)
+                        st.divider()
+
                         st.write("**How he's done vs similarly-armed pitchers this season:**")
                         summary = similar_arsenal_summary(
                             h_season_raw, st.session_state.pitcher_recent, hand,
@@ -815,6 +921,43 @@ def style_tier_table(df):
     return df.style.map(color_tier, subset=["tier"])
 
 
+def style_crosswalk_table(df):
+    """Color gradient on the hitter-vulnerability columns — brighter green = more exploitable by the pitcher."""
+    try:
+        return (df.style
+                .background_gradient(subset=["hitter_xwoba"], cmap="RdYlGn_r")
+                .background_gradient(subset=["hitter_chase_pct", "hitter_whiff_pct"], cmap="RdYlGn"))
+    except Exception:
+        return df
+
+
+def show_crosswalk_table(crosswalk_df, vulnerability=None, hitter_name=""):
+    """Pitcher tendency x hitter vulnerability, joined on pitch type — the actual matchup table."""
+    if crosswalk_df is None or ("note" in crosswalk_df.columns and len(crosswalk_df) == 1 and "pitch_type" not in crosswalk_df.columns):
+        note = crosswalk_df.iloc[0]["note"] if crosswalk_df is not None and "note" in crosswalk_df.columns else "No crosswalk data."
+        st.caption(note)
+        return
+    st.write(f"**Pitch-by-pitch: pitcher tendency vs {hitter_name or 'this hitter'}'s vulnerability**" if hitter_name
+              else "**Pitch-by-pitch: pitcher tendency vs hitter vulnerability**")
+    if vulnerability and vulnerability.get("label"):
+        st.info(vulnerability["label"])
+    display_df = crosswalk_df.rename(columns={
+        "pitch_type": "Pitch", "pitcher_usage_pct": "Pitcher Usage%",
+        "pitcher_zone_pct": "Pitcher Zone%", "pitcher_chase_whiff_pct": "Pitcher ChaseWhiff%",
+        "pitcher_whiff_pct": "Pitcher Whiff%", "hitter_n_pitches": "Hitter N",
+        "hitter_whiff_pct": "Hitter Whiff%", "hitter_chase_pct": "Hitter Chase%",
+        "hitter_xwoba": "Hitter xwOBA", "hitter_hardhit_pct": "Hitter HardHit%",
+        "read": "Read",
+    })
+    try:
+        st.dataframe(style_crosswalk_table(display_df), use_container_width=True)
+    except Exception:
+        st.dataframe(display_df, use_container_width=True)
+    st.caption("🟩 darker green on Hitter Whiff%/Chase% = more exploitable; darker green on xwOBA "
+               "(reversed scale) = weaker vs that specific pitch. Rows sorted by the pitcher's real "
+               "usage — the pitch he throws most matters most, regardless of how the hitter grades on it.")
+
+
 st.header("🔬 Side model (simple tiers) — separate methodology")
 st.caption("A genuinely different approach for comparison: flat elite/average/poor cutoffs on a "
            "focused set of metrics, instead of the main model's weighted shrinkage-scoring above. "
@@ -856,6 +999,8 @@ if st.button("Run side model", key="run_side_model_btn"):
                             st.caption(note)
                             if df is not None:
                                 st.dataframe(style_tier_table(df), use_container_width=True)
+                            st.divider()
+                            show_crosswalk_table(h.get("crosswalk"), h.get("vulnerability"), h["hitter"])
                 else:
                     st.info(result["lineup_status"])
         except Exception as e:
