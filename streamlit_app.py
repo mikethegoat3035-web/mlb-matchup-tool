@@ -32,6 +32,7 @@ from prop_model_combined import (
     similar_lineup_history, hitter_overall_grade, pitcher_overall_grade,
     earned_runs_probability, similar_arsenal_summary, similar_lineup_summary,
     scan_todays_pitchers, get_player_id_from_full_name, auto_find_best_edges,
+    run_side_model,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -792,6 +793,74 @@ if st.session_state.pitcher_recent:
                                 "wOBA": p.woba, "xwOBA": p.xwoba, "HardHit%": p.hardhit_pct,
                             } for p in sorted(h_recent, key=lambda x: -x.n_pitches)]
                             st.dataframe(pd.DataFrame(detail_rows), use_container_width=True)
+
+st.divider()
+
+def side_model_grades_to_df(grades_dict):
+    if "note" in grades_dict:
+        return None, grades_dict["note"]
+    rows = [{"metric": m.replace("_", " ").title(), "value": info["value"], "tier": info["tier"]}
+            for m, info in grades_dict["metrics"].items()]
+    sig = ", ".join(grades_dict["significant_pitches"])
+    return pd.DataFrame(rows), f"Significant pitches (15%+ usage): {sig}"
+
+
+def style_tier_table(df):
+    def color_tier(val):
+        colors = {"Elite": "background-color: #1e5c2e; color: #d4f4dd",
+                  "Average": "background-color: #6b5b1a; color: #fff3cd",
+                  "Poor": "background-color: #5c1e1e; color: #f8d7da",
+                  "N/A": "background-color: #3a3a3a; color: #cccccc"}
+        return colors.get(val, "")
+    return df.style.applymap(color_tier, subset=["tier"])
+
+
+st.header("🔬 Side model (simple tiers) — separate methodology")
+st.caption("A genuinely different approach for comparison: flat elite/average/poor cutoffs on a "
+           "focused set of metrics, instead of the main model's weighted shrinkage-scoring above. "
+           "Same underlying data source, different grading logic. Barrel% and bat speed are "
+           "excluded — not reliably computable/confirmed from this data source. Hitters are only "
+           "graded once the opponent's lineup is CONFIRMED — no whole-roster fallback.")
+
+smc1, smc2 = st.columns(2)
+sm_last = smc1.text_input("Pitcher last name", key="sm_last")
+sm_first = smc2.text_input("Pitcher first name", key="sm_first")
+sm_days = st.number_input("Days back", value=68, step=1, key="sm_days")
+sm_opponent = st.text_input(
+    "Opponent team (optional — only grades hitters once lineup is confirmed)",
+    key="sm_opponent")
+
+if st.button("Run side model", key="run_side_model_btn"):
+    with st.spinner("Pulling data..."):
+        try:
+            result = run_side_model(sm_last, sm_first, days_recent=int(sm_days),
+                                     opponent_team=sm_opponent if sm_opponent.strip() else None)
+
+            st.subheader(f"{result['pitcher']} — pitcher grades (read whichever hand matches tonight's lineup)")
+            pgc1, pgc2 = st.columns(2)
+            for hand, col in [("L", pgc1), ("R", pgc2)]:
+                with col:
+                    st.write(f"**vs {hand}HH**")
+                    grades = result["pitcher_grades"].get(hand, {"note": "no data"})
+                    df, note = side_model_grades_to_df(grades)
+                    st.caption(note)
+                    if df is not None:
+                        st.dataframe(style_tier_table(df), use_container_width=True)
+
+            if sm_opponent.strip():
+                st.subheader(f"Hitter grades — {result['lineup_status']}")
+                if result["hitter_grades"]:
+                    for h in result["hitter_grades"]:
+                        with st.expander(h["hitter"]):
+                            df, note = side_model_grades_to_df(h["grades"])
+                            st.caption(note)
+                            if df is not None:
+                                st.dataframe(style_tier_table(df), use_container_width=True)
+                else:
+                    st.info(result["lineup_status"])
+        except Exception as e:
+            st.error(f"Side model failed: {e}")
+
 
 st.divider()
 st.caption("matchup_xba and est_hit_probability are shrunk, exposure-weighted estimates — "
