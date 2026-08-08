@@ -230,15 +230,28 @@ st.caption("The simple version: scans every CONFIRMED game today, both pitcher a
            "below without re-scanning. Needs confirmed lineups — best run within a few "
            "hours of first pitch.")
 
-qm_col1, qm_col2 = st.columns(2)
-qm_days = qm_col1.number_input("Days back for player data", value=30, step=5, key="qm_days")
-qm_max_games = qm_col2.number_input("Limit to N games (0 = scan everything)", value=0, step=1, key="qm_max_games")
+qm_col1, qm_col2, qm_col3 = st.columns(3)
+qm_pitcher_days = qm_col1.number_input("Days back for pitcher data", value=68, step=5, key="qm_pitcher_days")
+qm_hitter_season_long = qm_col2.checkbox("Hitters: use whole season", value=True, key="qm_hitter_season_long")
+qm_max_games = qm_col3.number_input("Limit to N games (0 = scan everything)", value=0, step=1, key="qm_max_games")
+
+if not qm_hitter_season_long:
+    qm_hitter_days = st.number_input("Days back for hitter data (since 'whole season' is unchecked)",
+                                     value=68, step=5, key="qm_hitter_days")
+else:
+    qm_hitter_days = None
+    st.caption(f"Hitters will use the full season (from {SEASON_START}).")
 
 if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
     with st.spinner("Scanning every confirmed game today — this can take a while on a full slate..."):
         try:
             max_g = int(qm_max_games) if qm_max_games > 0 else None
-            qm_slate = scan_full_slate_quality_mu(days_recent=int(qm_days), max_games=max_g)
+            qm_slate = scan_full_slate_quality_mu(
+                pitcher_days_recent=int(qm_pitcher_days),
+                hitter_days_recent=int(qm_hitter_days) if qm_hitter_days is not None else None,
+                hitter_season_long=qm_hitter_season_long,
+                season_start=SEASON_START,
+                max_games=max_g)
             if "note" in qm_slate.columns:
                 st.warning(qm_slate.iloc[0]["note"])
                 st.session_state.pop("qm_slate", None)
