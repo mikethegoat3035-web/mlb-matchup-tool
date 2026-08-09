@@ -3224,6 +3224,17 @@ def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict)
                      "games_sampled": len(log), "p_over": round(p_over, 3),
                      "p_under": round(1 - p_over, 3)})
     return pd.DataFrame(rows)
+    def recompute_p_over_from_mu(row, new_line: float) -> float:
+        """
+        Recomputes p_over for a new line using the same Poisson model as the
+        main scoring pipeline (see pitcher_prop_probabilities / hitter scoring
+        above). 'row' must have a 'mu' field (the model's mean for that prop).
+        """
+        if _poisson is None:
+            raise ImportError("pip install scipy --break-system-packages")
+        mean = row["mu"]
+        p_over = 1 - _poisson.cdf(math.floor(new_line), mean)
+        return round(p_over, 3)
 
 
 def pitcher_official_prop_probabilities(person_id: int, season: int, lines: dict) -> pd.DataFrame:
