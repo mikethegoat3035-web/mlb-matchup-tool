@@ -4408,35 +4408,68 @@ def pull_prizepicks_mlb_lines() -> pd.DataFrame:
 
 def pull_underdog_mlb_lines() -> pd.DataFrame:
     """
-    Pulls Underdog's current board via their public over/under lines
-    endpoint (this covers all sports currently live — filter stat_type/
-    player names for MLB-relevant rows downstream, since the endpoint
-    doesn't take a sport filter param as far as could be verified here).
-    Returns columns: player_name, stat_type, line, source.
+    Pulls Underdog's current MLB board via their REAL lobby-content lines
+    endpoint — confirmed by capturing a live browser request while browsing
+    Underdog's actual MLB props page (the original /beta/v6/over_under_lines
+    guess was wrong; it returned an unrelated esports feed with no sport
+    filter at all).
+
+    Response shape (confirmed live, 2026-08): a dict with 'players' (keyed
+    by player_id: first_name/last_name/team_id/...), 'appearances' (keyed
+    by appearance_id: player_id/match_id/...), and 'over_under_lines'
+    (keyed by over_under_line_id: stat_value is the REAL numeric line;
+    'under' or 'over' sub-object has appearance_stat.display_stat, the
+    real stat name, and links back to appearance_id).
+
+    Returns columns: player_name, stat_type, line, status, source.
+    status is included because Underdog marks some lines 'suspended'
+    (typically once that specific game/at-bat goes live) — filter those
+    out downstream (df[df['status'] != 'suspended']) if you only want
+    lines currently open for new picks; left unfiltered here since a
+    suspended line's stat_value is still useful context.
+
+    CAUTION: this URL includes 'product_experience_id' and
+    'state_config_id' query params captured from a live logged-in browser
+    session — these MAY be session-specific and could stop working if
+    tied to a session that expires. If this starts returning empty or
+    wrong data, re-capture the real request from a browser's Network tab
+    (open Underdog's MLB board, DevTools → Network → Fetch/XHR, filter
+    for a request whose URL contains 'sport_id=MLB') and update the URL
+    below with the fresh one.
     """
     if requests is None:
         raise ImportError("pip install requests --break-system-packages")
 
-    url = "https://api.underdogfantasy.com/beta/v6/over_under_lines"
+    url = ("https://api.underdogfantasy.com/v1/lobbies/content/lines"
+           "?include_live=true&product=fantasy"
+           "&product_experience_id=c7ade3c1-71ae-4593-a7e1-07f63c7e94ae"
+           "&show_mass_option_markets=false&sport_id=MLB"
+           "&state_config_id=16fa6ed3-ea21-4654-bcee-fb32d2f31357")
     headers = {"User-Agent": "Mozilla/5.0"}
 
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
-    players_by_id = {p["id"]: f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-                      for p in data.get("players", [])}
+    players_by_id = {
+        pid: f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        for pid, p in data.get("players", {}).items()
+    }
+    appearances_by_id = data.get("appearances", {})
 
     rows = []
-    for line in data.get("over_under_lines", []):
-        ou = line.get("over_under", {})
-        appearance_stat = ou.get("appearance_stat", {})
-        player_id = appearance_stat.get("player_id") or ou.get("player_id")
-        stat_type = ou.get("title") or appearance_stat.get("display_stat")
+    for ou_id, ou in data.get("over_under_lines", {}).items():
+        side = ou.get("under") or ou.get("over") or {}
+        appearance_stat = side.get("appearance_stat", {})
+        appearance_id = appearance_stat.get("appearance_id")
+        appearance = appearances_by_id.get(appearance_id, {})
+        player_id = appearance.get("player_id")
+
         rows.append({
             "player_name": players_by_id.get(player_id, "Unknown"),
-            "stat_type": stat_type,
-            "line": line.get("stat_value"),
+            "stat_type": appearance_stat.get("display_stat"),
+            "line": ou.get("stat_value"),
+            "status": ou.get("status"),
             "source": "Underdog",
         })
 
