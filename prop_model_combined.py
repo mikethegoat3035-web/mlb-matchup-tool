@@ -4420,33 +4420,13 @@ def pull_prizepicks_mlb_lines() -> pd.DataFrame:
 def pull_underdog_mlb_lines() -> pd.DataFrame:
     """
     Pulls Underdog's current MLB board via their REAL lobby-content lines
-    endpoint — confirmed by capturing a live browser request while browsing
-    Underdog's actual MLB props page (the original /beta/v6/over_under_lines
-    guess was wrong; it returned an unrelated esports feed with no sport
-    filter at all).
-
-    Response shape (confirmed live, 2026-08): a dict with 'players' (keyed
-    by player_id: first_name/last_name/team_id/...), 'appearances' (keyed
-    by appearance_id: player_id/match_id/...), and 'over_under_lines'
-    (keyed by over_under_line_id: stat_value is the REAL numeric line;
-    'under' or 'over' sub-object has appearance_stat.display_stat, the
-    real stat name, and links back to appearance_id).
+    endpoint. Response shape: 'players' (keyed by player_id), 'appearances'
+    (keyed by appearance_id: player_id/match_id/...), and 'over_under_lines'
+    (keyed by over_under_line_id: stat_value is the numeric line; the
+    'over_under' sub-object has appearance_stat.display_stat and links
+    back to appearance_id via appearance_stat.appearance_id).
 
     Returns columns: player_name, stat_type, line, status, source.
-    status is included because Underdog marks some lines 'suspended'
-    (typically once that specific game/at-bat goes live) — filter those
-    out downstream (df[df['status'] != 'suspended']) if you only want
-    lines currently open for new picks; left unfiltered here since a
-    suspended line's stat_value is still useful context.
-
-    CAUTION: this URL includes 'product_experience_id' and
-    'state_config_id' query params captured from a live logged-in browser
-    session — these MAY be session-specific and could stop working if
-    tied to a session that expires. If this starts returning empty or
-    wrong data, re-capture the real request from a browser's Network tab
-    (open Underdog's MLB board, DevTools → Network → Fetch/XHR, filter
-    for a request whose URL contains 'sport_id=MLB') and update the URL
-    below with the fresh one.
     """
     if requests is None:
         raise ImportError("pip install requests --break-system-packages")
@@ -4470,8 +4450,8 @@ def pull_underdog_mlb_lines() -> pd.DataFrame:
 
     rows = []
     for ou_id, ou in data.get("over_under_lines", {}).items():
-       over_under = ou.get("over_under", {})
-        appearance_stat = over_under.get("appearance_stat", {})        
+        over_under = ou.get("over_under", {})
+        appearance_stat = over_under.get("appearance_stat", {})
         appearance_id = appearance_stat.get("appearance_id")
         appearance = appearances_by_id.get(appearance_id, {})
         player_id = appearance.get("player_id")
