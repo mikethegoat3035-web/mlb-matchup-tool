@@ -26,7 +26,8 @@ from datetime import datetime
 
 from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
-    pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate
+    pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
+    match_book_line_to_player
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -163,8 +164,34 @@ if "qm_slate" in st.session_state:
     with st.expander("🎯 Best Edges — Adjustable Lines", expanded=True):
         edge_filter = st.radio("Show", ["All", "Best Overs", "Best Unders"], horizontal=True, key="qm_edge_filter")
         top_n = st.slider("Show top N by edge", min_value=5, max_value=100, value=25, key="qm_edge_top_n")
+       stat_map = {
+            "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
+            "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
+            "Home Runs": "home_runs", "Hits + Runs + RBIs": "hitter_fantasy",
+            "Fantasy Points": "hitter_fantasy",
+        }
+        try:
+            ud_lines = pull_underdog_mlb_lines()
+        except Exception:
+            ud_lines = pd.DataFrame()
+
         edit_cols = ["player", "team", "prop_type", "line", "mu"]
         edit_df = view[edit_cols].copy().reset_index(drop=True)
+
+        if not ud_lines.empty:
+            candidate_names = edit_df["player"].unique().tolist()
+            ud_lines = ud_lines.copy()
+            ud_lines["matched_player"] = ud_lines["player_name"].apply(
+                lambda n: match_book_line_to_player(n, candidate_names))
+            ud_lines["mapped_prop_type"] = ud_lines["stat_type"].map(stat_map)
+            line_lookup = {}
+            for _, r in ud_lines.dropna(subset=["matched_player", "mapped_prop_type"]).iterrows():
+                try:
+                    line_lookup[(r["matched_player"], r["mapped_prop_type"])] = float(r["line"])
+                except (TypeError, ValueError):
+                    continue
+            edit_df["line"] = edit_df.apply(
+                lambda r: line_lookup.get((r["player"], r["prop_type"]), r["line"]), axis=1)
         edited = st.data_editor(
             edit_df,
             column_config={"line": st.column_config.NumberColumn("Line", step=0.5)},
