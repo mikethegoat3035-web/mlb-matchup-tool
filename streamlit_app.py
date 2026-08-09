@@ -26,7 +26,7 @@ from datetime import datetime
 
 from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
-    pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,recompute_p_over_from_mu
+    pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
