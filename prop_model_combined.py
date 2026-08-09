@@ -4460,7 +4460,7 @@ def pull_underdog_mlb_lines() -> pd.DataFrame:
     rows = []
     for ou_id, ou in data.get("over_under_lines", {}).items():
        over_under = ou.get("over_under", {})
-    appearance_stat = over_under.get("appearance_stat", {})
+        appearance_stat = over_under.get("appearance_stat", {})
         appearance_id = appearance_stat.get("appearance_id")
         appearance = appearances_by_id.get(appearance_id, {})
         player_id = appearance.get("player_id")
