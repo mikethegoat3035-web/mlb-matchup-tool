@@ -2,11 +2,11 @@
 MLB Matchup Tool — Streamlit app (Quality Mu Slate Scanner only)
 
 Trimmed down to just the slate-wide scanner: scans every confirmed game
-today (both pitcher and hitter props), grades each by quality_score, pulls
-real Underdog lines, and shows one single filtered table — side (pitcher/
-hitter), lean (over/under), sorted by edge — with only rows that have a
-confirmed real line included. See prop_model_combined.py for the full
-backend if you want to bring back any of the older standalone tools.
+today (both pitcher and hitter props), grades each by quality_score, and
+shows one single filtered/sorted table. Underdog auto-line-matching was
+removed as unreliable — check real lines manually against mu/quality_score
+shown here. See prop_model_combined.py for the full backend if you want to
+bring back any of the older standalone tools.
 
 One-time setup:
     pip install streamlit --break-system-packages
@@ -121,18 +121,18 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
             else:
                 st.session_state.qm_slate = qm_slate
                 st.success(f"Found {len(qm_slate)} props with a real edge, across "
-                          f"{qm_slate['player'].nunique()} players. Real Underdog lines are "
-                          f"matched in below.")
+                          f"{qm_slate['player'].nunique()} players.")
         except Exception as e:
             st.error(f"Quality Mu scan failed: {e}")
 
 if "qm_slate" in st.session_state:
     qm_slate = st.session_state.qm_slate
 
-   st.subheader("🎯 Best Edges — Manual Line Check")
-    st.caption("All qualifying props, sorted by side/lean. Check the real line yourself on "
+    st.subheader("🎯 Best Edges — Manual Line Check")
+    st.caption("All qualifying props, sorted by quality_score. Check the real line yourself on "
                "Underdog/PrizePicks and compare it to mu before trusting any specific play — "
-               "auto-matching was unreliable and has been removed.")
+               "auto-matching to live lines was unreliable (too few lines posted this early) "
+               "and has been removed.")
 
     side_pick = st.radio("Side", ["All", "Pitcher", "Hitter"], horizontal=True, key="be_side")
     top_n = st.slider("Show top N by quality_score", min_value=5, max_value=150, value=30, key="be_top_n")
