@@ -3,10 +3,11 @@ MLB Matchup Tool — Streamlit app (Quality Mu Slate Scanner only)
 
 Trimmed down to just the slate-wide scanner: scans every confirmed game
 today (both pitcher and hitter props), grades each by quality_score, and
-shows one single filtered/sorted table. Underdog auto-line-matching was
-removed as unreliable — check real lines manually against mu/quality_score
-shown here. See prop_model_combined.py for the full backend if you want to
-bring back any of the older standalone tools.
+shows one single table with an editable Line column — type in the real
+line from Underdog/PrizePicks yourself, and probability/edge recalculate
+instantly. Auto-matching to a live feed was removed as unreliable (too few
+lines posted this early in the day). See prop_model_combined.py for the
+full backend if you want to bring back any of the older standalone tools.
 
 One-time setup:
     pip install streamlit --break-system-packages
@@ -95,11 +96,11 @@ qm_include_official = st.checkbox(
 st.write("**Filters — this is what keeps the results to real plays, not every prop for every player:**")
 qf1, qf2, qf3 = st.columns(3)
 qm_min_edge = qf1.slider("Minimum edge from a coinflip", min_value=0.0, max_value=0.45,
-                         value=0.25, step=0.05, key="qm_min_edge",
-                         help="0.25 = only show props at 75%+ or 25%-under probability. Raise for fewer, stronger plays.")
-qm_min_games = qf2.number_input("Minimum games sampled", value=5, step=1, key="qm_min_games")
+                         value=0.20, step=0.05, key="qm_min_edge",
+                         help="0.20 = only show props at 70%+ or 30%-under probability. Raise for fewer, stronger plays.")
+qm_min_games = qf2.number_input("Minimum games sampled", value=15, step=1, key="qm_min_games")
 qm_min_quality = qf3.number_input("Minimum quality_score (0 = don't filter on this)",
-                                  value=0, step=5, key="qm_min_quality")
+                                  value=60, step=5, key="qm_min_quality")
 
 if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
     with st.spinner("Scanning every confirmed game today — this can take a while on a full slate..."):
@@ -128,9 +129,10 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
 if "qm_slate" in st.session_state:
     qm_slate = st.session_state.qm_slate
 
-st.subheader("🎯 Best Edges — Editable Lines")
+    st.subheader("🎯 Best Edges — Editable Lines")
     st.caption("Type the real line (from Underdog/PrizePicks) into any row's Line cell — "
-               "probability, edge, and lean recalculate instantly for that row.")
+               "probability, edge, and lean recalculate instantly for that row. Rows you "
+               "don't edit keep the model's default line, which may not match the real book.")
 
     side_pick = st.radio("Side", ["All", "Pitcher", "Hitter"], horizontal=True, key="be_side")
     top_n = st.slider("Show top N by quality_score", min_value=5, max_value=150, value=30, key="be_top_n")
@@ -189,4 +191,4 @@ st.subheader("🎯 Best Edges — Editable Lines")
     csv = final_df.to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download this view as CSV", csv,
                        file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", key="dl_best_edges")   
+                       mime="text/csv", key="dl_best_edges")
