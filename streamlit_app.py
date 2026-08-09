@@ -129,106 +129,41 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
 if "qm_slate" in st.session_state:
     qm_slate = st.session_state.qm_slate
 
-    st.subheader("🎯 Best Edges — Real Lines Only")
-    st.caption("Only props with a confirmed live Underdog line are shown — this is what makes "
-               "the edge/probability numbers trustworthy instead of based on placeholder lines.")
+   st.subheader("🎯 Best Edges — Manual Line Check")
+    st.caption("All qualifying props, sorted by side/lean. Check the real line yourself on "
+               "Underdog/PrizePicks and compare it to mu before trusting any specific play — "
+               "auto-matching was unreliable and has been removed.")
 
     side_pick = st.radio("Side", ["All", "Pitcher", "Hitter"], horizontal=True, key="be_side")
-    lean_pick = st.radio("Lean", ["All", "Over", "Under"], horizontal=True, key="be_lean")
-    top_n = st.slider("Show top N by edge", min_value=5, max_value=150, value=25, key="be_top_n")
+    top_n = st.slider("Show top N by quality_score", min_value=5, max_value=150, value=30, key="be_top_n")
 
-    stat_map = {
-        "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
-        "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
-        "Home Runs": "home_runs", "Hits + Runs + RBIs": "hitter_fantasy",
-        "Fantasy Points": "hitter_fantasy",
-    }
-    try:
-        ud_lines = pull_underdog_mlb_lines()
-    except Exception:
-        ud_lines = pd.DataFrame()
+    view2 = qm_slate.copy()
+    if side_pick != "All":
+        view2 = view2[view2["side"] == side_pick.lower()]
+    view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
-    st.caption(f"Debug: Underdog returned {len(ud_lines)} raw lines total.")
-    if not ud_lines.empty:
-        st.caption(f"Debug: sample stat_type values seen: {sorted(ud_lines['stat_type'].dropna().unique().tolist())[:15]}")
-        st.caption(f"Debug: sample player names seen: {ud_lines['player_name'].dropna().unique().tolist()[:10]}")
+    show_cols = ["side", "player", "team", "opponent", "prop_type", "line", "mu",
+                 "p_over", "games_sampled", "quality_score", "quality_label"]
+    show_cols = [c for c in show_cols if c in view2.columns]
+    display2 = view2[show_cols].reset_index(drop=True)
 
-    base_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score"]
-    table = qm_slate[base_cols].copy().reset_index(drop=True)
-    table["real_line"] = False
+    def color_quality(val):
+        intensity = min(val / 100, 1.0)
+        return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
 
-    if not ud_lines.empty:
-        candidate_names = table["player"].unique().tolist()
-        ud_lines = ud_lines.copy()
-        ud_lines["matched_player"] = ud_lines["player_name"].apply(
-            lambda n: match_book_line_to_player(n, candidate_names))
-        ud_lines["mapped_prop_type"] = ud_lines["stat_type"].map(stat_map)
-        line_lookup = {}
-        for _, r in ud_lines.dropna(subset=["matched_player", "mapped_prop_type"]).iterrows():
-            try:
-                line_lookup[(r["matched_player"], r["mapped_prop_type"])] = float(r["line"])
-            except (TypeError, ValueError):
-                continue
-        for i, r in table.iterrows():
-            key = (r["player"], r["prop_type"])
-            if key in line_lookup:
-                table.at[i, "line"] = line_lookup[key]
-                table.at[i, "real_line"] = True
-
-    st.caption(f"Debug: {table['real_line'].sum()} of {len(qm_slate)} props matched a real line.")
-    st.caption(f"Debug: qm_slate prop_type values: {sorted(qm_slate['prop_type'].unique().tolist())}")
-
-    table = table[table["real_line"]].drop(columns=["real_line"])
-
-    if table.empty:
-        st.warning("No props have a confirmed real Underdog line right now — the live board "
-                   "may not be posted yet, or names/stat types didn't match. Try again closer "
-                   "to game time.")
-    else:
-        results = []
-        for _, row in table.iterrows():
-            r = rescore_quality_mu_row(mu=float(row["mu"]), new_line=float(row["line"]))
-            p_over = r["p_over"]
-            results.append({
-                "side": row["side"], "player": row["player"], "team": row["team"],
-                "prop_type": row["prop_type"], "line": row["line"], "mu": row["mu"],
-                "p_over": p_over, "edge": abs(p_over - 0.5),
-                "lean": "OVER" if p_over > 0.5 else "UNDER",
-                "quality_score": row["quality_score"],
-            })
-        final_df = pd.DataFrame(results)
-
-        if side_pick != "All":
-            final_df = final_df[final_df["side"] == side_pick.lower()]
-        if lean_pick != "All":
-            final_df = final_df[final_df["lean"] == lean_pick.upper()]
-
-        final_df = final_df.sort_values("edge", ascending=False).head(top_n)
-
-        def color_edge(val):
-            intensity = min(val / 0.5, 1.0)
+    def color_prob(val):
+        if val >= 0.5:
+            intensity = min((val - 0.5) / 0.5, 1.0)
             return f"background-color: rgba(0, 200, 0, {intensity * 0.6})"
+        intensity = min((0.5 - val) / 0.5, 1.0)
+        return f"background-color: rgba(200, 0, 0, {intensity * 0.6})"
 
-        def color_prob(val):
-            if val >= 0.5:
-                intensity = min((val - 0.5) / 0.5, 1.0)
-                return f"background-color: rgba(0, 200, 0, {intensity * 0.6})"
-            intensity = min((0.5 - val) / 0.5, 1.0)
-            return f"background-color: rgba(200, 0, 0, {intensity * 0.6})"
+    styled2 = display2.style.map(color_quality, subset=["quality_score"])
+    if "p_over" in display2.columns:
+        styled2 = styled2.map(color_prob, subset=["p_over"])
+    st.dataframe(styled2, use_container_width=True)
 
-        def color_quality(val):
-            intensity = min(val / 100, 1.0)
-            return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
-
-        if final_df.empty:
-            st.warning("No rows match this Side/Lean filter combination.")
-        else:
-            styled = (final_df.style
-                      .map(color_edge, subset=["edge"])
-                      .map(color_prob, subset=["p_over"])
-                      .map(color_quality, subset=["quality_score"]))
-            st.dataframe(styled, use_container_width=True)
-            csv = final_df.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Download this view as CSV", csv,
-                               file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
-                               mime="text/csv", key="dl_best_edges")
+    csv2 = display2.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download this view as CSV", csv2,
+                       file_name=f"quality_shortlist_{datetime.now().strftime('%Y%m%d')}.csv",
+                       mime="text/csv", key="dl_shortlist")
