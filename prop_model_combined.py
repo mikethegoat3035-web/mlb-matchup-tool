@@ -4642,4 +4642,3 @@ if __name__ == "__main__":
     print("estimates — not yet backtested against real outcomes for this pitcher/hitters.")
     print("Run the calibration_check() workflow (Section 4) before trusting this over")
     print("a real sportsbook/Underdog line.")
-
