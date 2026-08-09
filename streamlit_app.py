@@ -128,11 +128,9 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
 if "qm_slate" in st.session_state:
     qm_slate = st.session_state.qm_slate
 
-    st.subheader("🎯 Best Edges — Manual Line Check")
-    st.caption("All qualifying props, sorted by quality_score. Check the real line yourself on "
-               "Underdog/PrizePicks and compare it to mu before trusting any specific play — "
-               "auto-matching to live lines was unreliable (too few lines posted this early) "
-               "and has been removed.")
+st.subheader("🎯 Best Edges — Editable Lines")
+    st.caption("Type the real line (from Underdog/PrizePicks) into any row's Line cell — "
+               "probability, edge, and lean recalculate instantly for that row.")
 
     side_pick = st.radio("Side", ["All", "Pitcher", "Hitter"], horizontal=True, key="be_side")
     top_n = st.slider("Show top N by quality_score", min_value=5, max_value=150, value=30, key="be_top_n")
@@ -142,14 +140,34 @@ if "qm_slate" in st.session_state:
         view2 = view2[view2["side"] == side_pick.lower()]
     view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
-    show_cols = ["side", "player", "team", "opponent", "prop_type", "line", "mu",
-                 "p_over", "games_sampled", "quality_score", "quality_label"]
-    show_cols = [c for c in show_cols if c in view2.columns]
-    display2 = view2[show_cols].reset_index(drop=True)
+    edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score"]
+    edit_cols = [c for c in edit_cols if c in view2.columns]
+    edit_df = view2[edit_cols].reset_index(drop=True)
 
-    def color_quality(val):
-        intensity = min(val / 100, 1.0)
-        return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
+    edited = st.data_editor(
+        edit_df,
+        column_config={"line": st.column_config.NumberColumn("Line", step=0.5)},
+        disabled=["side", "player", "team", "prop_type", "mu", "quality_score"],
+        use_container_width=True,
+        key="be_edit_table",
+    )
+
+    results = []
+    for _, row in edited.iterrows():
+        r = rescore_quality_mu_row(mu=float(row["mu"]), new_line=float(row["line"]))
+        p_over = r["p_over"]
+        results.append({
+            "side": row["side"], "player": row["player"], "team": row["team"],
+            "prop_type": row["prop_type"], "line": row["line"], "mu": row["mu"],
+            "p_over": p_over, "edge": abs(p_over - 0.5),
+            "lean": "OVER" if p_over > 0.5 else "UNDER",
+            "quality_score": row["quality_score"],
+        })
+    final_df = pd.DataFrame(results).sort_values("edge", ascending=False)
+
+    def color_edge(val):
+        intensity = min(val / 0.5, 1.0)
+        return f"background-color: rgba(0, 200, 0, {intensity * 0.6})"
 
     def color_prob(val):
         if val >= 0.5:
@@ -158,12 +176,17 @@ if "qm_slate" in st.session_state:
         intensity = min((0.5 - val) / 0.5, 1.0)
         return f"background-color: rgba(200, 0, 0, {intensity * 0.6})"
 
-    styled2 = display2.style.map(color_quality, subset=["quality_score"])
-    if "p_over" in display2.columns:
-        styled2 = styled2.map(color_prob, subset=["p_over"])
-    st.dataframe(styled2, use_container_width=True)
+    def color_quality(val):
+        intensity = min(val / 100, 1.0)
+        return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
 
-    csv2 = display2.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Download this view as CSV", csv2,
-                       file_name=f"quality_shortlist_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", key="dl_shortlist")
+    styled = (final_df.style
+              .map(color_edge, subset=["edge"])
+              .map(color_prob, subset=["p_over"])
+              .map(color_quality, subset=["quality_score"]))
+    st.dataframe(styled, use_container_width=True)
+
+    csv = final_df.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download this view as CSV", csv,
+                       file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
+                       mime="text/csv", key="dl_best_edges")   
