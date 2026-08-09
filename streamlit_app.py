@@ -3,12 +3,10 @@ MLB Matchup Tool — Streamlit app (Quality Mu Slate Scanner only)
 
 Trimmed down to just the slate-wide scanner: scans every confirmed game
 today (both pitcher and hitter props), grades each by quality_score, pulls
-real PrizePicks/Underdog lines where available, and filters down to only
-props with a real edge. Everything else (single-pitcher lookup, standalone
-hitter probabilities, the old per-pitcher-only scanner, the side model) was
-removed once this scanner covered what those did — see prop_model_combined.py
-for the full backend, which still has all of those functions available if
-you want to bring any of that UI back later.
+real Underdog lines, and shows one single filtered table — side (pitcher/
+hitter), lean (over/under), sorted by edge — with only rows that have a
+confirmed real line included. See prop_model_combined.py for the full
+backend if you want to bring back any of the older standalone tools.
 
 One-time setup:
     pip install streamlit --break-system-packages
@@ -75,8 +73,8 @@ st.caption("The simple version: scans every CONFIRMED game today, both pitcher a
            "actual lineup stacks at the top of the order; hitter rows use the pitch-crosswalk "
            "vulnerability score against the actual starter. Only rows with a REAL edge (not "
            "near-coinflip) and a real sample size make it through — adjust the filters below "
-           "to loosen/tighten that. Adjust any single row's line without re-scanning. Needs "
-           "confirmed lineups — best run within a few hours of first pitch.")
+           "to loosen/tighten that. Needs confirmed lineups — best run within a few hours of "
+           "first pitch.")
 
 qm_col1, qm_col2, qm_col3 = st.columns(3)
 qm_pitcher_days = qm_col1.number_input("Days back for pitcher data", value=68, step=5, key="qm_pitcher_days")
@@ -93,17 +91,6 @@ else:
 qm_include_official = st.checkbox(
     "Include Earned Runs, H+R+RBI, and both Fantasy props (official box-score data — "
     "roughly doubles scan time)", value=True, key="qm_include_official")
-
-qlc1, qlc2 = st.columns(2)
-qm_use_live_lines = qlc1.checkbox(
-    "Use real PrizePicks/Underdog lines where available (falls back to defaults otherwise)",
-    value=True, key="qm_use_live_lines",
-    help="Pulls the live board once, swaps in each player's REAL line wherever a match is "
-         "found. Unofficial endpoint — if it fails, the scan automatically falls back to the "
-         "flat default lines below, nothing breaks.")
-qm_live_source = qlc2.radio("Live line source", ["underdog", "prizepicks"],
-                            horizontal=True, key="qm_live_source",
-                            disabled=not qm_use_live_lines)
 
 st.write("**Filters — this is what keeps the results to real plays, not every prop for every player:**")
 qf1, qf2, qf3 = st.columns(3)
@@ -124,7 +111,7 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 hitter_season_long=qm_hitter_season_long,
                 season_start=SEASON_START,
                 include_official_props=qm_include_official,
-                use_live_lines=qm_use_live_lines, live_line_source=qm_live_source,
+                use_live_lines=False, live_line_source="underdog",
                 min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
                 min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
                 max_games=max_g)
@@ -133,90 +120,82 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 st.session_state.pop("qm_slate", None)
             else:
                 st.session_state.qm_slate = qm_slate
-                n_live = (qm_slate["line_source"] == "live").sum() if "line_source" in qm_slate.columns else 0
                 st.success(f"Found {len(qm_slate)} props with a real edge, across "
-                          f"{qm_slate['player'].nunique()} players — {n_live} used a real "
-                          f"live line, the rest used flat defaults.")
+                          f"{qm_slate['player'].nunique()} players. Real Underdog lines are "
+                          f"matched in below.")
         except Exception as e:
             st.error(f"Quality Mu scan failed: {e}")
 
 if "qm_slate" in st.session_state:
     qm_slate = st.session_state.qm_slate
-    prop_types = sorted(qm_slate["prop_type"].unique().tolist())
-    qm_side_filter = st.radio("Side", ["Both", "Pitcher props", "Hitter props"],
-                               horizontal=True, key="qm_side_filter")
-    qm_prop_filter = st.selectbox("Prop type", ["All"] + prop_types, key="qm_prop_filter")
 
-    view = qm_slate.copy()
-    if qm_side_filter == "Pitcher props":
-        view = view[view["side"] == "pitcher"]
-    elif qm_side_filter == "Hitter props":
-        view = view[view["side"] == "hitter"]
-    if qm_prop_filter != "All":
-        view = view[view["prop_type"] == qm_prop_filter]
-    view = view.sort_values("quality_score", ascending=False)
+    st.subheader("🎯 Best Edges — Real Lines Only")
+    st.caption("Only props with a confirmed live Underdog line are shown — this is what makes "
+               "the edge/probability numbers trustworthy instead of based on placeholder lines.")
 
-    st.dataframe(view.drop(columns=["game_pk"], errors="ignore"), use_container_width=True)
-    csv = view.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Download this view as CSV", csv,
-                       file_name=f"quality_mu_scan_{datetime.now().strftime('%Y%m%d')}.csv",
-                       mime="text/csv", key="dl_qm_slate")
+    side_pick = st.radio("Side", ["All", "Pitcher", "Hitter"], horizontal=True, key="be_side")
+    lean_pick = st.radio("Lean", ["All", "Over", "Under"], horizontal=True, key="be_lean")
+    top_n = st.slider("Show top N by edge", min_value=5, max_value=150, value=25, key="be_top_n")
 
-    with st.expander("🎯 Best Edges — Adjustable Lines", expanded=True):
-        edge_filter = st.radio("Show", ["All", "Best Overs", "Best Unders"], horizontal=True, key="qm_edge_filter")
-        top_n = st.slider("Show top N by edge", min_value=5, max_value=100, value=25, key="qm_edge_top_n")
+    stat_map = {
+        "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
+        "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
+        "Home Runs": "home_runs", "Hits + Runs + RBIs": "hitter_fantasy",
+        "Fantasy Points": "hitter_fantasy",
+    }
+    try:
+        ud_lines = pull_underdog_mlb_lines()
+    except Exception:
+        ud_lines = pd.DataFrame()
 
-        stat_map = {
-            "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
-            "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
-            "Home Runs": "home_runs", "Hits + Runs + RBIs": "hitter_fantasy",
-            "Fantasy Points": "hitter_fantasy",
-        }
-        try:
-            ud_lines = pull_underdog_mlb_lines()
-        except Exception:
-            ud_lines = pd.DataFrame()
+    base_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score"]
+    table = qm_slate[base_cols].copy().reset_index(drop=True)
+    table["real_line"] = False
 
-        edit_cols = ["player", "team", "prop_type", "line", "mu"]
-        edit_df = view[edit_cols].copy().reset_index(drop=True)
+    if not ud_lines.empty:
+        candidate_names = table["player"].unique().tolist()
+        ud_lines = ud_lines.copy()
+        ud_lines["matched_player"] = ud_lines["player_name"].apply(
+            lambda n: match_book_line_to_player(n, candidate_names))
+        ud_lines["mapped_prop_type"] = ud_lines["stat_type"].map(stat_map)
+        line_lookup = {}
+        for _, r in ud_lines.dropna(subset=["matched_player", "mapped_prop_type"]).iterrows():
+            try:
+                line_lookup[(r["matched_player"], r["mapped_prop_type"])] = float(r["line"])
+            except (TypeError, ValueError):
+                continue
+        for i, r in table.iterrows():
+            key = (r["player"], r["prop_type"])
+            if key in line_lookup:
+                table.at[i, "line"] = line_lookup[key]
+                table.at[i, "real_line"] = True
 
-        if not ud_lines.empty:
-            candidate_names = edit_df["player"].unique().tolist()
-            ud_lines = ud_lines.copy()
-            ud_lines["matched_player"] = ud_lines["player_name"].apply(
-                lambda n: match_book_line_to_player(n, candidate_names))
-            ud_lines["mapped_prop_type"] = ud_lines["stat_type"].map(stat_map)
-            line_lookup = {}
-            for _, r in ud_lines.dropna(subset=["matched_player", "mapped_prop_type"]).iterrows():
-                try:
-                    line_lookup[(r["matched_player"], r["mapped_prop_type"])] = float(r["line"])
-                except (TypeError, ValueError):
-                    continue
-            edit_df["line"] = edit_df.apply(
-                lambda r: line_lookup.get((r["player"], r["prop_type"]), r["line"]), axis=1)
+    table = table[table["real_line"]].drop(columns=["real_line"])
 
-        edited = st.data_editor(
-            edit_df,
-            column_config={"line": st.column_config.NumberColumn("Line", step=0.5)},
-            disabled=["player", "team", "prop_type", "mu"],
-            use_container_width=True,
-            key="qm_edge_editor",
-        )
+    if table.empty:
+        st.warning("No props have a confirmed real Underdog line right now — the live board "
+                   "may not be posted yet, or names/stat types didn't match. Try again closer "
+                   "to game time.")
+    else:
         results = []
-        for i, row in edited.iterrows():
+        for _, row in table.iterrows():
             r = rescore_quality_mu_row(mu=float(row["mu"]), new_line=float(row["line"]))
             p_over = r["p_over"]
             results.append({
-                "player": row["player"], "team": row["team"], "prop_type": row["prop_type"],
-                "line": row["line"], "mu": row["mu"], "p_over": p_over,
-                "edge": abs(p_over - 0.5), "lean": "OVER" if p_over > 0.5 else "UNDER",
+                "side": row["side"], "player": row["player"], "team": row["team"],
+                "prop_type": row["prop_type"], "line": row["line"], "mu": row["mu"],
+                "p_over": p_over, "edge": abs(p_over - 0.5),
+                "lean": "OVER" if p_over > 0.5 else "UNDER",
+                "quality_score": row["quality_score"],
             })
-        edge_df = pd.DataFrame(results)
-        if edge_filter == "Best Overs":
-            edge_df = edge_df[edge_df["lean"] == "OVER"]
-        elif edge_filter == "Best Unders":
-            edge_df = edge_df[edge_df["lean"] == "UNDER"]
-        edge_df = edge_df.sort_values("edge", ascending=False).head(top_n)
+        final_df = pd.DataFrame(results)
+
+        if side_pick != "All":
+            final_df = final_df[final_df["side"] == side_pick.lower()]
+        if lean_pick != "All":
+            final_df = final_df[final_df["lean"] == lean_pick.upper()]
+
+        final_df = final_df.sort_values("edge", ascending=False).head(top_n)
 
         def color_edge(val):
             intensity = min(val / 0.5, 1.0)
@@ -229,31 +208,19 @@ if "qm_slate" in st.session_state:
             intensity = min((0.5 - val) / 0.5, 1.0)
             return f"background-color: rgba(200, 0, 0, {intensity * 0.6})"
 
-        styled = edge_df.style.map(color_edge, subset=["edge"]).map(color_prob, subset=["p_over"])
-        st.dataframe(styled, use_container_width=True)
+        def color_quality(val):
+            intensity = min(val / 100, 1.0)
+            return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
 
-    st.subheader("📥 Pull live lines (PrizePicks / Underdog)")
-    st.caption("⚠️ Unofficial endpoints — see prop_model_combined.py notes. Stat-name mapping "
-               "below is a starting point; check the raw stat_type values the first time you "
-               "run this and adjust if the book's naming differs.")
-    default_stat_map = {
-        "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
-        "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
-        "Home Runs": "home_runs",
-    }
-    book_choice = st.radio("Source", ["PrizePicks", "Underdog"], horizontal=True, key="qm_book_choice")
-    if st.button("Pull live lines and merge", key="qm_pull_lines_btn"):
-        with st.spinner("Pulling live board..."):
-            try:
-                book_df = (pull_prizepicks_mlb_lines() if book_choice == "PrizePicks"
-                          else pull_underdog_mlb_lines())
-                if book_df.empty:
-                    st.warning("No lines came back — endpoint may have changed shape, see caption above.")
-                else:
-                    st.caption(f"Raw stat_type values seen: {sorted(book_df['stat_type'].dropna().unique().tolist())}")
-                    merged = merge_book_lines_into_slate(qm_slate, book_df, default_stat_map)
-                    n_matched = merged["book_line"].notna().sum()
-                    st.success(f"Matched {n_matched} of {len(merged)} rows to a live {book_choice} line.")
-                    st.dataframe(merged.drop(columns=["game_pk"], errors="ignore"), use_container_width=True)
-            except Exception as e:
-                st.error(f"Couldn't pull/merge live lines: {e}")
+        if final_df.empty:
+            st.warning("No rows match this Side/Lean filter combination.")
+        else:
+            styled = (final_df.style
+                      .map(color_edge, subset=["edge"])
+                      .map(color_prob, subset=["p_over"])
+                      .map(color_quality, subset=["quality_score"]))
+            st.dataframe(styled, use_container_width=True)
+            csv = final_df.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Download this view as CSV", csv,
+                               file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
+                               mime="text/csv", key="dl_best_edges")
