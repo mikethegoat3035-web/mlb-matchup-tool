@@ -161,10 +161,12 @@ if "qm_slate" in st.session_state:
     st.download_button("📥 Download this view as CSV", csv,
                        file_name=f"quality_mu_scan_{datetime.now().strftime('%Y%m%d')}.csv",
                        mime="text/csv", key="dl_qm_slate")
+
     with st.expander("🎯 Best Edges — Adjustable Lines", expanded=True):
         edge_filter = st.radio("Show", ["All", "Best Overs", "Best Unders"], horizontal=True, key="qm_edge_filter")
         top_n = st.slider("Show top N by edge", min_value=5, max_value=100, value=25, key="qm_edge_top_n")
-       stat_map = {
+
+        stat_map = {
             "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
             "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
             "Home Runs": "home_runs", "Hits + Runs + RBIs": "hitter_fantasy",
@@ -192,6 +194,7 @@ if "qm_slate" in st.session_state:
                     continue
             edit_df["line"] = edit_df.apply(
                 lambda r: line_lookup.get((r["player"], r["prop_type"]), r["line"]), axis=1)
+
         edited = st.data_editor(
             edit_df,
             column_config={"line": st.column_config.NumberColumn("Line", step=0.5)},
@@ -228,4 +231,29 @@ if "qm_slate" in st.session_state:
 
         styled = edge_df.style.map(color_edge, subset=["edge"]).map(color_prob, subset=["p_over"])
         st.dataframe(styled, use_container_width=True)
-    
+
+    st.subheader("📥 Pull live lines (PrizePicks / Underdog)")
+    st.caption("⚠️ Unofficial endpoints — see prop_model_combined.py notes. Stat-name mapping "
+               "below is a starting point; check the raw stat_type values the first time you "
+               "run this and adjust if the book's naming differs.")
+    default_stat_map = {
+        "Strikeouts": "strikeouts", "Pitching Outs": "outs", "Walks Allowed": "walks_allowed",
+        "Hits Allowed": "hits_allowed", "Hits": "hits", "Total Bases": "total_bases",
+        "Home Runs": "home_runs",
+    }
+    book_choice = st.radio("Source", ["PrizePicks", "Underdog"], horizontal=True, key="qm_book_choice")
+    if st.button("Pull live lines and merge", key="qm_pull_lines_btn"):
+        with st.spinner("Pulling live board..."):
+            try:
+                book_df = (pull_prizepicks_mlb_lines() if book_choice == "PrizePicks"
+                          else pull_underdog_mlb_lines())
+                if book_df.empty:
+                    st.warning("No lines came back — endpoint may have changed shape, see caption above.")
+                else:
+                    st.caption(f"Raw stat_type values seen: {sorted(book_df['stat_type'].dropna().unique().tolist())}")
+                    merged = merge_book_lines_into_slate(qm_slate, book_df, default_stat_map)
+                    n_matched = merged["book_line"].notna().sum()
+                    st.success(f"Matched {n_matched} of {len(merged)} rows to a live {book_choice} line.")
+                    st.dataframe(merged.drop(columns=["game_pk"], errors="ignore"), use_container_width=True)
+            except Exception as e:
+                st.error(f"Couldn't pull/merge live lines: {e}")
