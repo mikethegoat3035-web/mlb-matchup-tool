@@ -148,6 +148,11 @@ if "qm_slate" in st.session_state:
     except Exception:
         ud_lines = pd.DataFrame()
 
+    st.caption(f"Debug: Underdog returned {len(ud_lines)} raw lines total.")
+    if not ud_lines.empty:
+        st.caption(f"Debug: sample stat_type values seen: {sorted(ud_lines['stat_type'].dropna().unique().tolist())[:15]}")
+        st.caption(f"Debug: sample player names seen: {ud_lines['player_name'].dropna().unique().tolist()[:10]}")
+
     base_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score"]
     table = qm_slate[base_cols].copy().reset_index(drop=True)
     table["real_line"] = False
@@ -169,6 +174,9 @@ if "qm_slate" in st.session_state:
             if key in line_lookup:
                 table.at[i, "line"] = line_lookup[key]
                 table.at[i, "real_line"] = True
+
+    st.caption(f"Debug: {table['real_line'].sum()} of {len(qm_slate)} props matched a real line.")
+    st.caption(f"Debug: qm_slate prop_type values: {sorted(qm_slate['prop_type'].unique().tolist())}")
 
     table = table[table["real_line"]].drop(columns=["real_line"])
 
