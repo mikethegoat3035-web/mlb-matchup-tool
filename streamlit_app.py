@@ -26,7 +26,7 @@ from datetime import datetime
 from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
-    match_book_line_to_player
+    match_book_line_to_player, get_unconfirmed_games_today
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -61,6 +61,36 @@ st.caption("Pitch-type-level matchup analysis with real probability estimates �
            "not a guess dressed up as one.")
 
 SEASON_START = "2026-03-27"
+
+
+# ---------------------------------------------------------------------------
+# Unconfirmed lineups check — see which games are still missing before scanning
+# ---------------------------------------------------------------------------
+st.header("⏳ Unconfirmed Lineups")
+st.caption("The Quality Mu Scanner below silently skips any game without a confirmed "
+           "lineup posted yet — this shows you exactly which games those are, so you "
+           "know what to rescan later instead of just seeing fewer results with no "
+           "explanation why.")
+
+if st.button("Check which lineups aren't confirmed yet", key="check_unconfirmed_btn"):
+    with st.spinner("Checking today's full schedule against confirmed lineups..."):
+        try:
+            pending = get_unconfirmed_games_today()
+            st.session_state.pending_games = pending
+        except Exception as e:
+            st.error(f"Lineup check failed: {e}")
+
+if "pending_games" in st.session_state:
+    pending = st.session_state.pending_games
+    if pending.empty:
+        st.success("All of today's games have confirmed lineups. Nothing pending.")
+    else:
+        st.warning(f"{len(pending)} game(s) still missing a confirmed lineup:")
+        display_cols = ["away_team", "home_team", "game_time", "lineup_status"]
+        display_cols = [c for c in display_cols if c in pending.columns]
+        st.dataframe(pending[display_cols], use_container_width=True, hide_index=True)
+        st.caption("Rescan closer to first pitch for these specific games once their "
+                   "lineups post — usually 1-3 hours before game time.")
 
 
 # ---------------------------------------------------------------------------
