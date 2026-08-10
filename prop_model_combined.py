@@ -3980,6 +3980,52 @@ def pull_todays_games(date: str = None) -> pd.DataFrame:
     return pd.DataFrame(games)
 
 
+def get_unconfirmed_games_today(date: str = None) -> pd.DataFrame:
+    """
+    NEW: checks today's full MLB schedule and returns which games do NOT
+    yet have a confirmed lineup posted. This is a separate, read-only
+    function from scan_full_slate_quality_mu() - that function already
+    silently skips unconfirmed games (see the `continue` on the
+    lineup_status check above) with no record kept of what was skipped.
+    This gives you that visibility directly: run it alongside a scan to
+    see exactly which games/teams to rescan closer to first pitch.
+
+    Uses the same pull_todays_games() + pull_confirmed_lineup() functions
+    the scanner already uses, so "unconfirmed" here means the exact same
+    thing it means during a real scan - no new lineup-checking logic,
+    just surfacing what's currently silent.
+
+    Returns a DataFrame with one row per game still missing a lineup:
+    home_team, away_team, game_time, lineup_status, game_pk. Empty
+    DataFrame (0 rows) if every game today already has both lineups in.
+    """
+    games = pull_todays_games(date=date)
+    if games.empty:
+        return pd.DataFrame()
+
+    pending_rows = []
+    for _, game in games.iterrows():
+        game_pk = game.get("game_id")
+        if game_pk is None:
+            continue
+        try:
+            lineup_check = pull_confirmed_lineup(game_pk)
+            status = lineup_check.get("lineup_status")
+        except Exception as e:
+            status = f"error: {e}"
+
+        if status != "confirmed":
+            pending_rows.append({
+                "home_team": game.get("home_name", "?"),
+                "away_team": game.get("away_name", "?"),
+                "game_time": game.get("game_datetime", "?"),
+                "lineup_status": status,
+                "game_pk": game_pk,
+            })
+
+    return pd.DataFrame(pending_rows)
+
+
 def pull_confirmed_lineup(game_pk: int) -> dict:
     """
     Pull the confirmed batting order + starting pitcher for a specific game.
