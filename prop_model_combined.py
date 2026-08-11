@@ -96,7 +96,10 @@ class PitchProfile:
     avg_velo: float
     avg_spin_rate: float
     groundball_pct: float    # of batted balls in play off this pitch/hand
-    hardhit_pct: float       # exit velo >= 95mph, of batted balls in play
+    hardhit_pct: float       # exit velo >= 95mph, of batted balls in play — blunt threshold, kept for compatibility
+    xba_against: float = float("nan")       # expected BA allowed on this pitch — real hit-probability signal
+    xwobacon_against: float = float("nan")  # expected wOBA allowed ON CONTACT — run-value-weighted quality of contact allowed, catches launch angle too, not just exit velo threshold
+    two_strike_called_pct: float = float("nan")  # called strikes / TAKEN pitches, restricted to two-strike counts — the "backwards K" (looking strikeout) signal putaway_pct doesn't cover
 
 
 def build_arsenal_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[PitchProfile]:
@@ -139,11 +142,45 @@ def build_arsenal_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[
         two_strike_swings = swings & (grp["strikes"] == 2) if "strikes" in grp else pd.Series(dtype=bool)
         two_strike_swings_n = max(two_strike_swings.sum(), 1)
 
+        # Two-strike CALLED-strike%: the "backwards K" signal — putaway_pct
+        # above only covers swinging strikeouts. Denominator is TAKEN pitches
+        # (not swung at) in a 2-strike count, so this reads as "when he
+        # doesn't swing in a 2-strike count, how often does the ump ring him
+        # up" — the direct mirror of putaway_pct's swing-based framing, just
+        # for the take side instead of the swing side.
+        two_strike_pitches = grp["strikes"] == 2 if "strikes" in grp else pd.Series(dtype=bool)
+        two_strike_takes = two_strike_pitches & ~swings
+        two_strike_takes_n = max(two_strike_takes.sum(), 1)
+
         # Batted-ball quality: only rows where contact was made in play
         in_play = grp[grp["description"] == "hit_into_play"]
         n_in_play = max(len(in_play), 1)
         groundballs = in_play["bb_type"] == "ground_ball" if "bb_type" in in_play else pd.Series(dtype=bool)
         hardhit = in_play["launch_speed"] >= 95 if "launch_speed" in in_play else pd.Series(dtype=bool)
+
+        # xBA allowed / xwOBAcon allowed — the deeper contact-quality-against
+        # signals hardhit_pct alone misses (hardhit_pct is a blunt exit-velo
+        # >=95mph threshold; xwOBAcon folds in launch angle too, so a scorched
+        # line drive and a scorched popup don't get treated the same). Same
+        # math/columns as ba_slg_by_pitch_hand()/woba_by_pitch_hand() elsewhere
+        # in this file, just computed inline here so it lands on this same row
+        # instead of needing a separate join. Gated at 10+ AB/contact events —
+        # same min_ab/min_pa convention those functions use — else NaN, which
+        # blend_profiles()/the normalize step both already handle safely.
+        terminal = grp[grp["events"].notna()]
+        ab_rows = terminal[~terminal["events"].isin(AB_EXCLUDED_EVENTS)]
+        if len(ab_rows) >= 10:
+            xba_vals = ab_rows.apply(
+                lambda r: r["estimated_ba_using_speedangle"]
+                if pd.notna(r["estimated_ba_using_speedangle"]) else 0.0, axis=1)
+            xba_against_val = round(xba_vals.mean(), 3)
+        else:
+            xba_against_val = float("nan")
+
+        if n_in_play >= 10 and len(in_play) >= 10:
+            xwobacon_against_val = round(in_play["estimated_woba_using_speedangle"].mean(), 3)
+        else:
+            xwobacon_against_val = float("nan")
 
         profiles.append(PitchProfile(
             pitch_type=ptype,
@@ -167,6 +204,10 @@ def build_arsenal_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[
             avg_spin_rate=round(grp["release_spin_rate"].mean(), 0) if "release_spin_rate" in grp else float("nan"),
             groundball_pct=round(groundballs.mean() * 100, 1) if len(in_play) else float("nan"),
             hardhit_pct=round(hardhit.mean() * 100, 1) if len(in_play) else float("nan"),
+            xba_against=xba_against_val,
+            xwobacon_against=xwobacon_against_val,
+            two_strike_called_pct=round((called_strikes & two_strike_pitches).sum()
+                                         / two_strike_takes_n * 100, 1),
         ))
 
     return profiles
@@ -296,6 +337,10 @@ STABILIZATION_POINTS = {
     "woba": 250, "xwoba": 150, "wobacon": 200, "xwobacon": 120,
     "ba": 300, "xba": 150, "slg": 300, "iso": 300,
     "groundball_pct": 100, "hardhit_pct": 150,
+    "putaway_pct": 80,  # 2-strike-swing subsample — treat like whiff_pct's stabilization, approximate
+    "xba_against": 150,       # mirrors "xba"'s stabilization point — same underlying stat, allowed instead of produced
+    "xwobacon_against": 120,  # mirrors "xwobacon"'s stabilization point (contact-only, expected — faster than raw wOBA)
+    "two_strike_called_pct": 80,  # taken-pitch subsample in 2-strike counts — treat like putaway_pct's, approximate
 }
 
 
@@ -998,6 +1043,13 @@ TIER_BENCHMARKS = {
     "groundball_pct":    {"elite": 50.0,  "poor": 38.0,  "direction": "high"},
     "zone_pct":          {"elite": 46.0,  "poor": 38.0,  "direction": "high"},
     "hardhit_pct_against": {"elite": 32.0, "poor": 42.0, "direction": "low"},   # what pitcher ALLOWS — low is good
+    "putaway_pct":       {"elite": 33.0,  "poor": 18.0,  "direction": "high"},  # whiff% on 2-strike swings only — the real K-prop "he can put you away" signal
+    "csw_pct":           {"elite": 31.0,  "poor": 24.0,  "direction": "high"},  # called strikes + whiffs, per-pitch efficiency
+    "called_strike_pct": {"elite": 19.0,  "poor": 14.0,  "direction": "high"},  # command/edge-of-zone signal, feeds walk-risk scoring
+    "xba_against":       {"elite": 0.220, "poor": 0.280, "direction": "low"},   # expected hit probability ALLOWED on this pitch — direct signal for Hits Allowed
+    "xwobacon_against":  {"elite": 0.330, "poor": 0.410, "direction": "low"},   # expected run value ALLOWED on contact — folds in launch angle, not just exit velo threshold; signal for Earned Runs
+    "chase_pct_induced": {"elite": 33.0,  "poor": 22.0,  "direction": "high"},  # PITCHER'S OWN benefit from inducing chases (opposite direction from the hitter-discipline "chase_pct" entry above, same underlying stat) — feeds Strikeouts (sets up whiff opportunities) and Walks Allowed (chased pitches don't become balls)
+    "two_strike_called_pct": {"elite": 28.0, "poor": 14.0, "direction": "high"},  # backwards-K rate — called strikes on TAKEN two-strike pitches
 }
 
 
@@ -1727,6 +1779,7 @@ class HitterPitchProfile:
     xwoba: float
     woba_minus_xwoba: float
     hardhit_pct: float
+    xwobacon: float = float("nan")  # expected wOBA restricted to contact ONLY (unlike xwoba, not diluted by K/BB) — folds in launch angle, the real "quality of contact when he connects" signal, not just exit velo threshold
 
 
 def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[HitterPitchProfile]:
@@ -1783,6 +1836,13 @@ def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[H
         in_play = grp[grp["description"] == "hit_into_play"]
         hardhit_pct = ((in_play["launch_speed"] >= 95).mean() * 100
                        if len(in_play) and "launch_speed" in in_play else float("nan"))
+        # xwOBAcon: expected wOBA restricted to contact-only PAs. xwoba above
+        # is diluted by strikeouts/walks (a hitter who takes a lot of walks on
+        # this pitch looks "better" on xwoba even with weak contact) — this
+        # isolates just "when he actually connects, how good is the contact,"
+        # same math/gating convention as the pitcher-side xwobacon_against.
+        xwobacon = (round(in_play["estimated_woba_using_speedangle"].mean(), 3)
+                    if len(in_play) >= 10 else float("nan"))
 
         profiles.append(HitterPitchProfile(
             pitch_type=ptype,
@@ -1803,6 +1863,7 @@ def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[H
             xwoba=round(xwoba, 3) if pd.notna(xwoba) else float("nan"),
             woba_minus_xwoba=round(woba - xwoba, 3) if pd.notna(woba) and pd.notna(xwoba) else float("nan"),
             hardhit_pct=round(hardhit_pct, 1) if pd.notna(hardhit_pct) else float("nan"),
+            xwobacon=xwobacon,
         ))
 
     return profiles
@@ -1836,6 +1897,17 @@ def hitter_metric_dict(profile: list[HitterPitchProfile], pitcher_hand: str,
 # this was built to answer.
 
 LEAGUE_AVG_XWOBA_PITCH = 0.320  # same default weighted_matchup_score() uses
+LEAGUE_AVG_XBA_PITCH = 0.250    # approximate per-pitch-type-cell league average xBA
+LEAGUE_AVG_ISO_PITCH = 0.150    # approximate per-pitch-type-cell league average ISO
+LEAGUE_AVG_HITTER_HARDHIT = 38.0  # approximate MLB-wide hard-hit% on balls in play
+LEAGUE_AVG_HITTER_XWOBACON = 0.360  # approximate MLB-wide xwOBA on contact-only PAs (runs higher than full xwOBA since Ks/BBs are excluded from the denominator)
+# LEAGUE_AVG_CHASE / LEAGUE_AVG_HITTER_WHIFF are the module's real definitions
+# (used elsewhere too) but live further down near opponent_lineup_strength()
+# — duplicated here with the SAME values so HITTER_PROP_VULN_METRICS below
+# can reference them at module-load time instead of only inside a function
+# body. If you ever change one location, change both.
+LEAGUE_AVG_CHASE = 28.0          # approximate MLB-wide O-Swing%
+LEAGUE_AVG_HITTER_WHIFF = 11.0   # same definition/benchmark as pitcher SwStr%
 
 
 def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
@@ -1882,6 +1954,15 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
             "hitter_chase_pct": h.chase_pct if h else None,
             "hitter_xwoba": h.xwoba if h else None,
             "hitter_hardhit_pct": h.hardhit_pct if h else None,
+            # ba/xba/slg/iso were already computed on every HitterPitchProfile
+            # (build_hitter_profile) but never made it into the crosswalk row —
+            # needed so hits/power props can score off the metric that actually
+            # maps to them (xba->hits, iso->power) instead of xwoba for everything.
+            "hitter_ba": h.ba if h else None,
+            "hitter_xba": h.xba if h else None,
+            "hitter_slg": h.slg if h else None,
+            "hitter_iso": h.iso if h else None,
+            "hitter_xwobacon": h.xwobacon if h else None,  # contact-only quality — folds in launch angle, unlike hardhit_pct's blunt threshold
         }
 
         if h is None:
@@ -1966,6 +2047,140 @@ def crosswalk_vulnerability_score(crosswalk_df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Per-prop hitter vulnerability scoring — replaces reusing ONE
+# crosswalk_vulnerability_score() (xwOBA + chase% + whiff%) for every
+# hitter prop. Different outcomes are driven by different real metrics:
+# Hits/Singles care about contact-to-hit conversion (xBA), Total Bases/HR
+# care about power (ISO, hard-hit%), not the same blend for both. Reuses
+# the SAME crosswalk table build_pitch_crosswalk() already produces (the
+# real per-pitch join is shared work) — only which columns get weighted
+# changes per prop_type. Same sign convention as crosswalk_vulnerability_
+# score(): positive = pitcher's usage leans toward this hitter's weak spot
+# for THIS prop (bad for hitter's over); negative = leans toward strength.
+# ---------------------------------------------------------------------------
+
+# prop_type -> list of (crosswalk column, league_avg constant, scale, sign)
+# sign=+1 means "higher hitter value = MORE favorable for hitter" (so the
+# term is (league_avg - value)/scale, same pattern as the xwOBA term above);
+# sign=-1 means "higher hitter value = LESS favorable for hitter" (chase%,
+# whiff% — the term is (value - league_avg)/scale, unchanged direction).
+HITTER_PROP_VULN_METRICS = {
+    "hits":       [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
+                    ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],  # a hitter who chases this pitch typically makes weaker contact on it, on the swings that do happen — same discipline logic already used for Strikeouts, just missing here before
+    "singles":    [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
+                    ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],
+    "total_bases": [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
+                      ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
+                      ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1)],
+    "home_runs":  [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
+                    ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
+                    ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1)],
+    "strikeouts": [("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],
+    # RBI/Runs/H+R+RBI: no lineup-protection data in this crosswalk (who
+    # bats around this hitter) — that's a real, separate, still-unbuilt
+    # gap, not a metric-swap job. Kept on the original generic xwOBA+chase+
+    # whiff blend as the best available proxy until that's built.
+}
+
+
+def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
+                                     low_sample_threshold: int = 20,
+                                     lineup_protection: dict = None) -> dict:
+    """
+    Per-prop version of crosswalk_vulnerability_score().
+
+    lineup_protection: optional output of lineup_protection_context(),
+    computed ONCE per hitter by the caller (pulling season game logs for
+    the surrounding lineup spots isn't free — no need to redo it per prop
+    row). Used only for prop_type == 'hitter_hits_runs_rbi' (and, through
+    that, 'hitter_fantasy' which blends it in) — every other prop_type
+    ignores this argument entirely.
+
+    'hitter_hits_runs_rbi' blends TWO genuinely different signals: the
+    pitcher-matchup crosswalk (still real — a tough matchup suppresses
+    H+R+RBI regardless of lineup) at 60% weight, and the new lineup-
+    protection signal (who's on base before him / who drives him in after
+    him — invisible to the crosswalk, which only knows about this hitter
+    vs this pitcher) at 40%. If lineup_protection wasn't supplied or came
+    back with no data, this falls back to the matchup-only score exactly
+    like before — never breaks or drops the row over missing lineup data.
+
+    stolen_bases returns a neutral score rather than 0, so it doesn't get
+    unfairly filtered out by a min_quality_score threshold that has
+    nothing to do with base-stealing (no pitch-quality mechanism applies).
+    """
+    if prop_type == "stolen_bases":
+        return {"score": 0.0, "label": "No pitch-quality mechanism applies to stolen bases — "
+                "neutral by design (driven by catcher pop time / pitcher hold, not pitch matchup).",
+                "weighted_usage_counted": 0.0}
+
+    if prop_type == "hitter_fantasy":
+        parts = [hitter_prop_vulnerability_score(crosswalk_df, p, low_sample_threshold, lineup_protection)
+                 for p in ("hits", "total_bases", "hitter_hits_runs_rbi")]
+        scores = [p["score"] for p in parts if p["score"] is not None]
+        if not scores:
+            return {"score": None, "label": "Not enough data to score.", "weighted_usage_counted": 0.0}
+        return {"score": round(sum(scores) / len(scores), 2),
+                "label": "Blended from hits/power/rbi(+lineup-protection) sub-scores (fantasy combines all three).",
+                "weighted_usage_counted": None}
+
+    if prop_type == "hitter_hits_runs_rbi":
+        matchup = crosswalk_vulnerability_score(crosswalk_df, low_sample_threshold)
+        if lineup_protection is None or lineup_protection.get("score") is None:
+            # No lineup data available — matchup-only, same behavior as before this feature existed.
+            return matchup
+        if matchup["score"] is None:
+            # No usable matchup data — lean on lineup-protection alone rather than returning nothing.
+            lineup_vuln = round((50 - lineup_protection["score"]) / 15, 2)
+            return {"score": lineup_vuln, "label": f"Lineup only (no matchup data): {lineup_protection['label']}",
+                    "weighted_usage_counted": 0.0}
+        lineup_vuln = (50 - lineup_protection["score"]) / 15  # same -X..+X scale crosswalk_vulnerability_score uses
+        blended = round(0.6 * matchup["score"] + 0.4 * lineup_vuln, 2)
+        return {"score": blended, "label": f"{matchup['label']} | Lineup: {lineup_protection['label']}",
+                "weighted_usage_counted": matchup.get("weighted_usage_counted")}
+
+    metrics = HITTER_PROP_VULN_METRICS.get(prop_type)
+    if metrics is None:
+        return crosswalk_vulnerability_score(crosswalk_df, low_sample_threshold)  # generic fallback
+
+    if crosswalk_df is None or crosswalk_df.empty or "note" in crosswalk_df.columns:
+        return {"score": None, "label": "Not enough data to score.", "weighted_usage_counted": 0.0}
+
+    usable = crosswalk_df[crosswalk_df["hitter_n_pitches"] >= low_sample_threshold]
+    if usable.empty:
+        return {"score": None, "label": "All pitches too thin-sampled on the hitter side to score.",
+                "weighted_usage_counted": 0.0}
+
+    total_usage = usable["pitcher_usage_pct"].sum()
+    weighted_score = 0.0
+    for _, row in usable.iterrows():
+        w = row["pitcher_usage_pct"] / total_usage
+        per_pitch = 0.0
+        for col, league_avg, scale, sign in metrics:
+            val = row.get(col)
+            if pd.notna(val):
+                per_pitch += ((league_avg - val) / scale) if sign == 1 else ((val - league_avg) / scale)
+        weighted_score += w * per_pitch
+
+    if weighted_score >= 1.5:
+        label = "🟢 Pitcher's real usage leans HEAVILY toward this hitter's weak spot for this prop."
+    elif weighted_score >= 0.5:
+        label = "🟡 Pitcher's usage leans somewhat toward this hitter's weak spot for this prop."
+    elif weighted_score > -0.5:
+        label = "⬜ Roughly neutral for this prop — usage doesn't lean either way."
+    elif weighted_score > -1.5:
+        label = "🟡 Pitcher's usage leans somewhat toward this hitter's strength for this prop."
+    else:
+        label = "🔴 Pitcher's real usage leans HEAVILY toward this hitter's strength for this prop — caution."
+
+    return {"score": round(weighted_score, 2), "label": label,
+            "weighted_usage_counted": round(total_usage, 1)}
+
+
+# ---------------------------------------------------------------------------
 # 3. Hitter prop targets (Underdog) + fantasy score
 # ---------------------------------------------------------------------------
 
@@ -2007,8 +2222,16 @@ from dataclasses import dataclass
 SHRINKABLE_FIELDS = ["chase_pct", "z_swing_pct", "contact_pct", "z_contact_pct",
                       "whiff_pct", "z_whiff_pct", "chase_whiff_pct",
                       "called_strike_pct", "csw_pct", "hardhit_pct",
-                      "groundball_pct"]
-OUTCOME_FIELDS = ["ba", "xba", "slg", "iso"]  # from ba_slg_by_pitch_hand, joined separately
+                      "groundball_pct", "putaway_pct",
+                      "ba", "xba", "slg", "iso", "woba", "xwoba", "xwobacon",
+                      "xba_against", "xwobacon_against", "two_strike_called_pct"]
+# ba/xba/slg/iso/woba/xwoba only exist as attributes on HitterPitchProfile
+# (build_hitter_profile computes them directly) — PitchProfile doesn't carry
+# them, so blend_profiles()'s hasattr() check just skips these harmlessly for
+# pitchers. putaway_pct was previously left out of shrinkage entirely despite
+# being the real K-prop signal — its sample (2-strike swings only) is smaller
+# than whiff_pct's, so it needed this more than most fields did.
+OUTCOME_FIELDS = ["ba", "xba", "slg", "iso"]  # now included above; kept for reference
 
 
 def blend_profiles(recent: list, season: list, key_field: str = "pitch_type",
@@ -2864,6 +3087,166 @@ def pitcher_quality_mu_score(pitcher_arsenal: list, lineup_hand_weights: dict,
             "hand_weights_pa": lineup_hand_weights}
 
 
+# ---------------------------------------------------------------------------
+# Per-prop pitcher quality scoring — replaces reusing ONE
+# pitcher_quality_mu_score() composite (zone% + chase-whiff% + whiff%,
+# blended) for every pitcher prop row. Different props are driven by
+# genuinely different pitch-level mechanisms:
+#   - Strikeouts: chase/whiff alignment out of the zone, whiff on pitches
+#     actually in the zone, AND putaway_pct — whiff rate specifically on
+#     2-strike swings, which the old composite never used even though it
+#     was already sitting on PitchProfile as the real "can he put you away"
+#     signal.
+#   - Walks Allowed: command (zone%, called-strike/edge rate), not
+#     whiff/chase at all — a pitcher can miss bats and still miss the zone.
+#   - Hits Allowed: contact quality ALLOWED (hard-hit%, groundball%, CSW%,
+#     xBA-against) — a completely different mechanism than K stuff. Uses
+#     xBA specifically because it's a direct hit-probability estimate.
+#   - Earned Runs: same base (hard-hit%, groundball%, CSW%) plus xwOBAcon-
+#     against instead of xBA — xwOBA weights extra-base hits/HR far more
+#     than singles, which matches "runs" better than "hits" does. Hits
+#     Allowed and Earned Runs used to share one identical metric list; this
+#     was the same one-size-fits-all problem in miniature, just not noticed
+#     until the contact-quality question below.
+#   - Outs/IP: whiff-driven pitch efficiency (fewer pitches per out).
+#   - Fantasy: blended from the three components above, since Underdog
+#     fantasy scoring is itself a blend of Ks + outs + earned-run prevention.
+# ---------------------------------------------------------------------------
+
+PITCHER_PROP_METRICS = {
+    # prop_type -> list of (PitchProfile attribute, TIER_BENCHMARKS key)
+    #
+    # NOTE on raw stuff (velo/spin) vs outcome-based location metrics: none
+    # of the lists below use avg_velo/avg_spin_rate directly, on purpose.
+    # Those two fields exist on PitchProfile but can't be fairly benchmarked
+    # on one universal scale — 95mph is average for a fastball and elite for
+    # a slider, so a flat "elite/poor" cutoff (the same TIER_BENCHMARKS
+    # pattern every other metric here uses) would silently reward/punish the
+    # wrong pitch types. chase_whiff_pct/z_whiff_pct/putaway_pct ARE the
+    # "quality of his stuff when he goes in-zone vs. when he gets a chase"
+    # signal — just measured by what actually happened (swing-and-miss rate
+    # in each location) instead of the radar-gun number that produced it.
+    # That's a truer signal anyway: two pitchers can share a velo/spin
+    # reading and get very different swing-and-miss results because of
+    # movement, tunneling, sequencing, etc. that raw velo/spin can't see.
+    "strikeouts":  [("chase_whiff_pct", "chase_whiff_pct"),
+                     ("z_whiff_pct", "z_whiff_pct"),
+                     ("putaway_pct", "putaway_pct"),
+                     ("chase_pct", "chase_pct_induced"),          # does he even GET the chase in the first place, not just whether the chase becomes a whiff
+                     ("two_strike_called_pct", "two_strike_called_pct")],  # looking strikeouts — a real chunk of Ks that chase_whiff/z_whiff/putaway (all swing-based) miss entirely
+    "outs":        [("whiff_pct", "whiff_pct"),
+                     ("csw_pct", "csw_pct"),
+                     ("putaway_pct", "putaway_pct"),
+                     ("groundball_pct", "groundball_pct"),        # quick, 1-pitch-of-action outs — keeps his own pitch count down over the outing
+                     ("hardhit_pct", "hardhit_pct_against")],     # avoiding damage that gets him an early hook is as much a durability driver as swing-and-miss efficiency
+    "walks_allowed": [("zone_pct", "zone_pct"),
+                        ("called_strike_pct", "called_strike_pct"),
+                        ("chase_pct", "chase_pct_induced")],      # a pitcher who lives out of the zone but still gets hitters to chase isn't actually walking as many people as raw zone% alone would suggest — those chased pitches become strikes, not balls
+    "hits_allowed": [("hardhit_pct", "hardhit_pct_against"),
+                       ("groundball_pct", "groundball_pct"),
+                       ("csw_pct", "csw_pct"),
+                       ("xba_against", "xba_against")],   # direct hit-probability signal — the right metric specifically for HITS
+    "pitcher_earned_runs": [("hardhit_pct", "hardhit_pct_against"),
+                              ("groundball_pct", "groundball_pct"),
+                              ("csw_pct", "csw_pct"),
+                              ("xwobacon_against", "xwobacon_against")],  # run-VALUE signal (weights HR/2B higher than a single) — the right metric specifically for RUNS
+}
+
+
+def _normalize_benchmark(value, benchmark_key: str) -> float:
+    """Maps a raw metric value to 0-100 via TIER_BENCHMARKS — same scale/
+    clipping convention pitcher_quality_mu_score already used, factored out
+    so every per-prop score reads on the same axis. Missing value -> neutral
+    50, doesn't drag the composite toward 0 just because one signal is absent."""
+    if value is None or pd.isna(value):
+        return 50.0
+    b = TIER_BENCHMARKS[benchmark_key]
+    lo, hi = (b["poor"], b["elite"]) if b["direction"] == "high" else (b["elite"], b["poor"])
+    pct = (value - lo) / (hi - lo) * 100
+    return max(0.0, min(100.0, pct))
+
+
+def _quality_label(score: float) -> str:
+    """Shared 0-100 -> emoji label convention, used by both the pitcher and
+    (indirectly, via the same scale) hitter per-prop scores."""
+    if score >= 70:
+        return "🟢 Elite for this specific prop's real mechanism"
+    elif score >= 55:
+        return "🟡 Above-average for this prop's mechanism"
+    elif score >= 45:
+        return "⬜ Roughly average"
+    elif score >= 30:
+        return "🟠 Below-average for this prop's mechanism"
+    else:
+        return "🔴 Weak for this prop's real mechanism"
+
+
+def pitcher_prop_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
+                                prop_type: str, usage_threshold: float = 15.0) -> dict:
+    """
+    Per-prop-type version of pitcher_quality_mu_score(): scores the
+    pitcher's real stuff using only the metrics that actually drive THIS
+    prop's outcome, weighted toward whichever hand tonight's real lineup
+    will throw at him more (same lineup_hand_composition() weighting as
+    before). Same return shape as pitcher_quality_mu_score() so callers
+    don't need to change how they consume it.
+
+    prop_type: a key in PITCHER_PROP_METRICS, or 'pitcher_fantasy' (blended
+    from strikeouts/outs/pitcher_earned_runs — fantasy scoring combines all
+    three, so there's no single mechanism to point at). Any other prop_type
+    (e.g. 'pitcher_win', which is mostly game-context/bullpen-driven, not
+    pitch-mechanism-driven) returns a neutral score rather than guessing.
+    """
+    if prop_type == "pitcher_fantasy":
+        parts = {p: pitcher_prop_quality_score(pitcher_arsenal, lineup_hand_weights, p, usage_threshold)
+                 for p in ("strikeouts", "outs", "pitcher_earned_runs")}
+        scores = [p["score"] for p in parts.values() if p["score"] is not None]
+        if not scores:
+            return {"score": None, "label": "Not enough arsenal/lineup data to score.", "hand_breakdown": {}}
+        final_score = round(sum(scores) / len(scores), 1)
+        return {"score": final_score, "label": _quality_label(final_score),
+                "hand_breakdown": {}, "component_scores": {k: v["score"] for k, v in parts.items()}}
+
+    metrics = PITCHER_PROP_METRICS.get(prop_type)
+    if not metrics:
+        return {"score": 50.0, "label": "No tailored pitch-mechanism metric set for this prop "
+                f"('{prop_type}') — neutral by design rather than guessed.", "hand_breakdown": {}}
+
+    total_pa = sum(lineup_hand_weights.values()) or 1.0
+    hand_shares = {h: w / total_pa for h, w in lineup_hand_weights.items()}
+
+    per_hand_scores = {}
+    for hand in ("L", "R"):
+        relevant = [p for p in pitcher_arsenal if p.vs_hand == hand]
+        sig = [p for p in relevant if p.usage_pct >= usage_threshold]
+        if not sig:
+            per_hand_scores[hand] = None
+            continue
+
+        def wavg(field, plist=sig):
+            vals = [(getattr(p, field), p.usage_pct) for p in plist if pd.notna(getattr(p, field))]
+            return sum(v * w for v, w in vals) / sum(w for _, w in vals) if vals else None
+
+        component_scores = [_normalize_benchmark(wavg(attr), bench_key) for attr, bench_key in metrics]
+        per_hand_scores[hand] = round(sum(component_scores) / len(component_scores), 1)
+
+    weighted_total, weight_used = 0.0, 0.0
+    for hand in ("L", "R"):
+        s = per_hand_scores.get(hand)
+        share = hand_shares.get(hand, 0.0)
+        if s is not None and share > 0:
+            weighted_total += s * share
+            weight_used += share
+
+    if weight_used == 0:
+        return {"score": None, "label": "Not enough arsenal/lineup data to score.",
+                "hand_breakdown": per_hand_scores}
+
+    final_score = round(weighted_total / weight_used, 1)
+    return {"score": final_score, "label": _quality_label(final_score),
+            "hand_breakdown": per_hand_scores, "hand_weights_pa": lineup_hand_weights}
+
+
 DEFAULT_BOOK_STAT_MAP = {
     # Book stat_type string -> this file's internal prop_type. NAMES ARE
     # BEST-EFFORT — never confirmed against a live pull (see module notes on
@@ -3001,6 +3384,20 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
     (abs(p_over - 0.5), how far from a coinflip) so the output reads
     directly as "here are the real plays," sorted by edge within each
     prop_type — not a raw dump of every prop for every player.
+
+    QUALITY SCORE — every row's quality_score/quality_label now come from a
+    metric set tailored to THAT row's specific prop_type (see
+    pitcher_prop_quality_score() / hitter_prop_vulnerability_score()), not
+    one blended composite reused across every prop. A strikeouts row is
+    scored on chase/whiff/putaway; a walks_allowed row on command/zone%; a
+    hits_allowed/earned_runs row on contact quality allowed; a hits/singles
+    row on xBA; a total_bases/home_runs row on ISO/hard-hit%.
+
+    SAMPLE SIZE — both sides' arsenal/profile now get shrunk toward that
+    SAME player's season-long value per (pitch_type, hand) before scoring
+    (via blend_profiles()), not a hand-collapsed average — a thin sample on
+    one specific pitch no longer gets treated as if all his pitches to that
+    hand behave the same way.
     """
     from datetime import datetime, timedelta
 
@@ -3016,6 +3413,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     pitcher_start = (datetime.now() - timedelta(days=pitcher_days_recent)).strftime("%Y-%m-%d")
+    pitcher_season_start = season_start  # season-long window the recent arsenal gets shrunk toward
 
     if hitter_season_long:
         hitter_start = season_start
@@ -3056,26 +3454,42 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 pid = pitcher_info["player_id"]
                 pitcher_name = pitcher_info.get("name", "Unknown")
 
-                pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, pitcher_start, today_str))
-                if not pitcher_recent:
+                pitcher_recent_raw = build_arsenal_profile(pull_pitcher_pitches(pid, pitcher_start, today_str))
+                if not pitcher_recent_raw:
                     continue
+
+                # Sample-size fix: shrink each thin (pitch_type, hand) cell toward
+                # THIS pitcher's own season-long value for that SAME pitch type —
+                # never toward a hand-collapsed average, since different pitches
+                # behave differently even against the same hand. This mirrors the
+                # fix already applied on the hitter side via blend_profiles(), just
+                # never wired in for pitchers before. Falls back to the raw recent
+                # profile if the season pull fails for any reason — never breaks
+                # the scan over this.
+                try:
+                    pitcher_season_profile = build_arsenal_profile(
+                        pull_pitcher_pitches(pid, pitcher_season_start, today_str))
+                    pitcher_recent = (blend_profiles(pitcher_recent_raw, pitcher_season_profile)
+                                       if pitcher_season_profile else pitcher_recent_raw)
+                except Exception:
+                    pitcher_recent = pitcher_recent_raw
 
                 opposing_lineup = lineup_check.get(batting_side, [])
                 hand_weights = lineup_hand_composition(opposing_lineup)
-                quality = pitcher_quality_mu_score(pitcher_recent, hand_weights)
 
                 p_lines, p_matched = _player_lines_with_live(
                     pitcher_name, p_lines_default, live_lookup, stat_map)
                 probs = pitcher_prop_probabilities(pid, pitcher_start, today_str, p_lines)
                 if "p_over" in probs.columns:
                     for _, prow in probs.iterrows():
+                        prop_quality = pitcher_prop_quality_score(pitcher_recent, hand_weights, prow["stat"])
                         rows.append({
                             "side": "pitcher", "prop_type": prow["stat"],
                             "player": pitcher_name,
                             "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                             "line": prow["line"], "mu": prow["recent_avg"],
                             "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
-                            "quality_score": quality["score"], "quality_label": quality["label"],
+                            "quality_score": prop_quality["score"], "quality_label": prop_quality["label"],
                             "line_source": "live" if prow["stat"] in p_matched else "default",
                             "game_pk": game_pk,
                         })
@@ -3092,13 +3506,14 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         if "p_over" in p_official.columns:
                             for _, prow in p_official.iterrows():
                                 full_stat = "pitcher_" + prow["stat"]
+                                prop_quality = pitcher_prop_quality_score(pitcher_recent, hand_weights, full_stat)
                                 rows.append({
                                     "side": "pitcher", "prop_type": full_stat,
                                     "player": pitcher_name,
                                     "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                                     "line": prow["line"], "mu": prow["recent_avg"],
                                     "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
-                                    "quality_score": quality["score"], "quality_label": quality["label"],
+                                    "quality_score": prop_quality["score"], "quality_label": prop_quality["label"],
                                     "line_source": "live" if full_stat in p_official_matched else "default",
                                     "game_pk": game_pk,
                                 })
@@ -3113,24 +3528,47 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         batter_hand = get_batter_hand(bid)
                         batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
 
-                        h_recent = build_hitter_profile(pull_batter_pitches(bid, hitter_start, today_str))
-                        if not h_recent:
+                        h_recent_raw = build_hitter_profile(pull_batter_pitches(bid, hitter_start, today_str))
+                        if not h_recent_raw:
                             continue
+
+                        # Same sample-size fix as the pitcher side — only needed
+                        # when using a trimmed recent window (hitter_season_long=
+                        # False). When hitters are already using the full season,
+                        # recent IS season already, nothing to blend toward.
+                        if hitter_season_long:
+                            h_recent = h_recent_raw
+                        else:
+                            try:
+                                h_season_profile = build_hitter_profile(
+                                    pull_batter_pitches(bid, season_start, today_str))
+                                h_recent = (blend_profiles(h_recent_raw, h_season_profile)
+                                            if h_season_profile else h_recent_raw)
+                            except Exception:
+                                h_recent = h_recent_raw
 
                         h_lines, h_matched = _player_lines_with_live(
                             hitter_name, h_lines_default, live_lookup, stat_map)
                         h_probs = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines)
                         crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
-                        vuln = crosswalk_vulnerability_score(crosswalk)
 
-                        # Flip vuln's sign onto a 0-100 scale: vuln score < 0 means the
-                        # PITCHER's usage leans toward this hitter's STRONG spots, i.e.
-                        # good for the hitter's over — so quality_score should be HIGH.
-                        h_quality = (None if vuln["score"] is None
-                                     else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
+                        # Computed ONCE per hitter — reused across every prop row for him — since
+                        # it needs two extra season-log pulls (the hitters batting immediately
+                        # before/after him), not something to redo per prop.
+                        try:
+                            lineup_protection = lineup_protection_context(opposing_lineup, bid, season)
+                        except Exception:
+                            lineup_protection = None
 
                         if "p_over" in h_probs.columns:
                             for _, hrow in h_probs.iterrows():
+                                vuln = hitter_prop_vulnerability_score(crosswalk, hrow["stat"],
+                                                                        lineup_protection=lineup_protection)
+                                # Flip vuln's sign onto a 0-100 scale: vuln score < 0 means the
+                                # PITCHER's usage leans toward this hitter's STRONG spots for
+                                # THIS prop, i.e. good for the hitter's over — quality_score HIGH.
+                                h_quality = (None if vuln["score"] is None
+                                             else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
                                 rows.append({
                                     "side": "hitter", "prop_type": hrow["stat"],
                                     "player": hitter_name, "team": game.get(opp_name_col, "?"),
@@ -3152,6 +3590,10 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                 if "p_over" in h_official.columns:
                                     for _, hrow in h_official.iterrows():
                                         full_stat = "hitter_" + hrow["stat"]
+                                        vuln = hitter_prop_vulnerability_score(crosswalk, full_stat,
+                                                                                lineup_protection=lineup_protection)
+                                        h_quality = (None if vuln["score"] is None
+                                                     else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
                                         rows.append({
                                             "side": "hitter", "prop_type": full_stat,
                                             "player": hitter_name, "team": game.get(opp_name_col, "?"),
@@ -3367,6 +3809,104 @@ def pull_official_hitter_game_log(person_id: int, season: int) -> pd.DataFrame:
         })
 
     return pd.DataFrame(rows).sort_values("game_date") if rows else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Lineup protection context — the real fix for the RBI/Runs/H+R+RBI gap
+# flagged repeatedly above. Pulls season game logs (via the SAME
+# pull_official_hitter_game_log() already trusted elsewhere in this file —
+# no new/unverified data source) for the hitters batting immediately
+# BEFORE and AFTER this one in tonight's confirmed lineup, since who's on
+# base when he bats (RBI opportunity) and who's behind him (gets him driven
+# in, feeding Runs) is a genuinely different mechanism than the pitcher
+# matchup crosswalk can see at all — the crosswalk only knows about THIS
+# hitter vs THIS pitcher, never about his own lineup.
+# ---------------------------------------------------------------------------
+
+LEAGUE_AVG_OBP = {"elite": 0.360, "poor": 0.300}          # real, well-known MLB OBP benchmarks
+LEAGUE_AVG_RBI_RATE = {"elite": 0.16, "poor": 0.08}       # approximate RBI per plate-appearance — elite run producer vs weak one
+
+
+def lineup_protection_context(opposing_lineup: list, batter_id: int, season: int) -> dict:
+    """
+    Real lineup-protection signal for RBI/Runs-family props. Order is
+    treated as cyclical (9-hole wraps to leadoff), matching how a lineup
+    actually cycles through 9 innings.
+
+    on_base_before: real OBP (H+BB+HBP)/(AB+BB+HBP), season-long, of the
+    hitter batting immediately in front of THIS hitter — how often someone
+    is actually on base for him to drive in (feeds RBI).
+    production_after: RBI per plate appearance, season-long, of the hitter
+    batting immediately behind THIS hitter — how often that hitter actually
+    drives runners in, i.e. how often THIS hitter gets driven in himself
+    (feeds Runs).
+
+    Returns {'score': float 0-100 or None, 'label': str,
+             'on_base_before': float or None, 'production_after': float or None}.
+    Missing data on either side degrades gracefully toward neutral (50)
+    rather than zeroing the whole score or crashing — same discipline as
+    every other _normalize step in this file.
+    """
+    order_by_slot = {h.get("order_slot"): h for h in opposing_lineup if h.get("order_slot") is not None}
+    this_hitter = next((h for h in opposing_lineup if h.get("player_id") == batter_id), None)
+    if not order_by_slot or this_hitter is None or this_hitter.get("order_slot") not in order_by_slot:
+        return {"score": None, "label": "No lineup order data available for this hitter.",
+                "on_base_before": None, "production_after": None}
+
+    slots = sorted(order_by_slot.keys())
+    n_slots = len(slots)
+    my_idx = slots.index(this_hitter["order_slot"])
+    before_hitter = order_by_slot[slots[(my_idx - 1) % n_slots]]
+    after_hitter = order_by_slot[slots[(my_idx + 1) % n_slots]]
+
+    def _season_obp(hitter):
+        try:
+            log = pull_official_hitter_game_log(hitter["player_id"], season)
+            if log.empty:
+                return None
+            ab, bb, hbp, h = (log["at_bats"].sum(), log["walks"].sum(),
+                              log["hbp"].sum(), log["hits"].sum())
+            denom = ab + bb + hbp
+            return round((h + bb + hbp) / denom, 3) if denom else None
+        except Exception:
+            return None
+
+    def _season_rbi_rate(hitter):
+        try:
+            log = pull_official_hitter_game_log(hitter["player_id"], season)
+            if log.empty:
+                return None
+            pa_approx = log["at_bats"].sum() + log["walks"].sum() + log["hbp"].sum()
+            return round(log["rbi"].sum() / pa_approx, 3) if pa_approx else None
+        except Exception:
+            return None
+
+    on_base_before = _season_obp(before_hitter)
+    production_after = _season_rbi_rate(after_hitter)
+
+    def _normalize(value, benchmarks):
+        if value is None:
+            return 50.0
+        pct = (value - benchmarks["poor"]) / (benchmarks["elite"] - benchmarks["poor"]) * 100
+        return max(0.0, min(100.0, pct))
+
+    ob_score = _normalize(on_base_before, LEAGUE_AVG_OBP)
+    prod_score = _normalize(production_after, LEAGUE_AVG_RBI_RATE)
+    final_score = round((ob_score + prod_score) / 2, 1)
+
+    if final_score >= 70:
+        label = "🟢 Real protection — strong on-base setup ahead and production behind him"
+    elif final_score >= 55:
+        label = "🟡 Above-average lineup context"
+    elif final_score >= 45:
+        label = "⬜ Roughly average lineup context"
+    elif final_score >= 30:
+        label = "🟠 Below-average lineup context — thin protection"
+    else:
+        label = "🔴 Weak lineup context — little on-base setup ahead or production behind him"
+
+    return {"score": final_score, "label": label,
+            "on_base_before": on_base_before, "production_after": production_after}
 
 
 def pull_official_pitcher_game_log(person_id: int, season: int) -> pd.DataFrame:
