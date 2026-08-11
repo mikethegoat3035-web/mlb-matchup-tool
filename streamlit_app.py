@@ -222,3 +222,4 @@ if "qm_slate" in st.session_state:
     st.download_button("📥 Download this view as CSV", csv,
                        file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
                        mime="text/csv", key="dl_best_edges")
+    
