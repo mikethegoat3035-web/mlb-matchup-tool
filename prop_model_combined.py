@@ -100,6 +100,7 @@ class PitchProfile:
     xba_against: float = float("nan")       # expected BA allowed on this pitch — real hit-probability signal
     xwobacon_against: float = float("nan")  # expected wOBA allowed ON CONTACT — run-value-weighted quality of contact allowed, catches launch angle too, not just exit velo threshold
     two_strike_called_pct: float = float("nan")  # called strikes / TAKEN pitches, restricted to two-strike counts — the "backwards K" (looking strikeout) signal putaway_pct doesn't cover
+    flyball_pct: float = float("nan")  # of batted balls in play off this pitch/hand — the batted-ball type most likely to become a HR, unlike groundballs which almost never do
 
 
 def build_arsenal_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[PitchProfile]:
@@ -156,6 +157,7 @@ def build_arsenal_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[
         in_play = grp[grp["description"] == "hit_into_play"]
         n_in_play = max(len(in_play), 1)
         groundballs = in_play["bb_type"] == "ground_ball" if "bb_type" in in_play else pd.Series(dtype=bool)
+        flyballs = in_play["bb_type"] == "fly_ball" if "bb_type" in in_play else pd.Series(dtype=bool)
         hardhit = in_play["launch_speed"] >= 95 if "launch_speed" in in_play else pd.Series(dtype=bool)
 
         # xBA allowed / xwOBAcon allowed — the deeper contact-quality-against
@@ -208,6 +210,7 @@ def build_arsenal_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[
             xwobacon_against=xwobacon_against_val,
             two_strike_called_pct=round((called_strikes & two_strike_pitches).sum()
                                          / two_strike_takes_n * 100, 1),
+            flyball_pct=round(flyballs.mean() * 100, 1) if len(in_play) else float("nan"),
         ))
 
     return profiles
@@ -341,6 +344,8 @@ STABILIZATION_POINTS = {
     "xba_against": 150,       # mirrors "xba"'s stabilization point — same underlying stat, allowed instead of produced
     "xwobacon_against": 120,  # mirrors "xwobacon"'s stabilization point (contact-only, expected — faster than raw wOBA)
     "two_strike_called_pct": 80,  # taken-pitch subsample in 2-strike counts — treat like putaway_pct's, approximate
+    "flyball_pct": 100,  # same batted-ball-sample-size category as groundball_pct
+    "pull_pct": 100,  # same batted-ball-sample-size category
 }
 
 
@@ -567,6 +572,178 @@ def get_park_factor(team_query: str) -> dict:
             return factors
     return {"hr_factor": 100, "hits_factor": 100,
             "note": f"No park factor match for '{team_query}' — using neutral (100/100) as a default."}
+
+
+# ---------------------------------------------------------------------------
+# Game-day weather — the one signal no amount of historical data can
+# capture, since it's specific to TONIGHT, not his season
+# ---------------------------------------------------------------------------
+# HONESTY NOTE, stated as plainly as possible: this pulls from the National
+# Weather Service's public API (api.weather.gov) — free, no API key to
+# manage, government-run, well-documented. Chosen for exactly those reasons
+# over a commercial weather API. BUT: I have NO network access in this
+# build environment and could NOT test a single live call. The two-step
+# points->forecast flow below matches NWS's documented, stable API pattern,
+# but if the response shape doesn't match what this expects, print the raw
+# JSON and I'll fix the field paths — the exact same "if this breaks, check
+# the real response" caution already applied to pull_confirmed_lineup() and
+# the PrizePicks/Underdog pulls elsewhere in this file. Also: this only
+# covers OUTDOOR parks in the continental US. Retractable-roof parks (e.g.
+# Rogers Centre, T-Mobile Park, American Family Field, loanDepot Park,
+# Chase Field, Globe Life Field) will still return a real outside forecast
+# even when the roof is closed — that's a real, unavoidable limitation,
+# not a bug; there's no public "is the roof open right now" data source
+# this file can reach. Toronto (Rogers Centre) is outside NWS's US-only
+# coverage entirely and will return "no data."
+#
+# Deliberately kept STANDALONE, not wired into scan_full_slate_quality_mu's
+# automatic quality_score — same caution the file already applies to
+# Stuff+/Location+ (get_pitch_modeling_grades) and the Savant arsenal
+# leaderboard pull: unverified-live external calls don't get silently
+# blended into the core scoring pipeline. Call it yourself for a specific
+# game once you've confirmed it actually works against the real API.
+
+BALLPARK_COORDS = {
+    # team name substring -> (latitude, longitude) of the ballpark. Public,
+    # stable geographic facts (unlike park factors/orientation below, these
+    # don't need a "not exact current season" caveat — a stadium's location
+    # doesn't change year to year).
+    "rockies": (39.7559, -104.9942), "reds": (39.0975, -84.5061),
+    "orioles": (39.2839, -76.6218), "rangers": (32.7473, -97.0847),
+    "phillies": (39.9061, -75.1665), "blue jays": (43.6414, -79.3894),
+    "diamondbacks": (33.4455, -112.0667), "red sox": (42.3467, -71.0972),
+    "yankees": (40.8296, -73.9262), "braves": (33.8907, -84.4677),
+    "twins": (44.9817, -93.2776), "cardinals": (38.6226, -90.1928),
+    "brewers": (43.0280, -87.9712), "guardians": (41.4962, -81.6852),
+    "pirates": (40.4469, -80.0057), "athletics": (38.5802, -121.4936),
+    "royals": (39.0517, -94.4803), "tigers": (42.3390, -83.0485),
+    "angels": (33.8003, -117.8827), "astros": (29.7570, -95.3555),
+    "rays": (27.7683, -82.6534), "white sox": (41.8299, -87.6338),
+    "cubs": (41.9484, -87.6553), "nationals": (38.8730, -77.0074),
+    "mets": (40.7571, -73.8458), "marlins": (25.7781, -80.2196),
+    "padres": (32.7073, -117.1566), "giants": (37.7786, -122.3893),
+    "dodgers": (34.0739, -118.2400), "mariners": (47.5914, -122.3325),
+}
+
+# Approximate home-plate-to-center-field compass bearing, degrees (0=N,
+# 90=E, 180=S, 270=W). Most MLB parks point roughly NE-ENE (60-90°) so the
+# setting sun isn't in the batter's eyes — these are commonly-cited public
+# approximations, same honesty level as PARK_FACTORS above, NOT precisely
+# surveyed values. Treat as directional context, not exact geometry.
+BALLPARK_CF_BEARING = {
+    "rockies": 75, "reds": 90, "orioles": 30, "rangers": 50, "phillies": 4,
+    "blue jays": 80, "diamondbacks": 45, "red sox": 39, "yankees": 75,
+    "braves": 72, "twins": 60, "cardinals": 60, "brewers": 65,
+    "guardians": 0, "pirates": 75, "athletics": 45, "royals": 45,
+    "tigers": 55, "angels": 30, "astros": 80, "rays": 50, "white sox": 135,
+    "cubs": 30, "nationals": 55, "mets": 30, "marlins": 30, "padres": 50,
+    "giants": 95, "dodgers": 15, "mariners": 45,
+}
+
+
+def pull_game_weather(team_query: str) -> dict:
+    """
+    Pulls today's/tonight's forecast for a team's ballpark via the National
+    Weather Service's free public API. Two-step flow NWS requires: first
+    resolve lat/lon to their forecast grid via /points/, then pull the
+    actual forecast from the grid URL that returns.
+
+    Returns {'temp_f': int, 'wind_mph': int, 'wind_direction': str,
+    'short_forecast': str, 'note': str} or {'note': '...'} on any failure —
+    never raises, so a bad/changed endpoint or an out-of-coverage park
+    (Toronto) never breaks whatever's calling this.
+    """
+    if requests is None:
+        return {"note": "requests not installed — pip install requests --break-system-packages"}
+
+    coords = None
+    q = team_query.lower()
+    for key, latlon in BALLPARK_COORDS.items():
+        if key in q or q in key:
+            coords = latlon
+            break
+    if coords is None:
+        return {"note": f"No ballpark coordinates for '{team_query}' — either a typo, or "
+                        f"this is Toronto (outside NWS's US-only coverage, no data source here)."}
+
+    lat, lon = coords
+    headers = {"User-Agent": "mlb-matchup-tool (personal use)"}  # NWS requires a real User-Agent
+    try:
+        points_resp = requests.get(f"https://api.weather.gov/points/{lat},{lon}",
+                                    headers=headers, timeout=10)
+        points_resp.raise_for_status()
+        forecast_url = points_resp.json()["properties"]["forecastHourly"]
+
+        forecast_resp = requests.get(forecast_url, headers=headers, timeout=10)
+        forecast_resp.raise_for_status()
+        period = forecast_resp.json()["properties"]["periods"][0]  # nearest upcoming hour
+
+        wind_speed_str = period.get("windSpeed", "0 mph")  # NWS format: "10 mph" or "10 to 15 mph"
+        wind_mph = int(wind_speed_str.split()[0]) if wind_speed_str.split()[0].isdigit() else None
+
+        return {
+            "temp_f": period.get("temperature"),
+            "wind_mph": wind_mph,
+            "wind_direction": period.get("windDirection"),
+            "short_forecast": period.get("shortForecast"),
+            "note": "Live NWS forecast, nearest upcoming hour — UNTESTED live in this build, "
+                    "verify the numbers look sane before trusting them.",
+        }
+    except Exception as e:
+        return {"note": f"Weather pull failed ({e}) — either the NWS API structure differs from "
+                        f"what this expects (print the raw JSON and I'll fix the field paths), "
+                        f"or this park is outside NWS coverage."}
+
+
+_COMPASS_TO_DEGREES = {"N": 0, "NNE": 22.5, "NE": 45, "ENE": 67.5, "E": 90, "ESE": 112.5,
+                       "SE": 135, "SSE": 157.5, "S": 180, "SSW": 202.5, "SW": 225,
+                       "WSW": 247.5, "W": 270, "WNW": 292.5, "NW": 315, "NNW": 337.5}
+
+
+def wind_hr_read(team_query: str, wind_mph: int, wind_direction: str) -> str:
+    """
+    Plain-language read on whether tonight's wind favors or suppresses HR/
+    fly-ball power, by comparing the forecast wind direction to the park's
+    approximate CF bearing (BALLPARK_CF_BEARING — same caveat as that dict:
+    approximate, not surveyed). wind_direction: NWS-style string ('NW',
+    'SSE', etc.) or plain compass, wind_mph: from pull_game_weather().
+
+    Deliberately simple: wind roughly FROM the CF bearing's opposite side
+    (blowing toward CF, i.e. "out") helps fly balls carry; wind FROM the CF
+    side (blowing "in") suppresses them. Anything under 8mph or a
+    crosswind-ish angle is called negligible/mixed rather than forced into
+    a false-confident read.
+    """
+    q = team_query.lower()
+    cf_bearing = next((v for k, v in BALLPARK_CF_BEARING.items() if k in q or q in k), None)
+    if cf_bearing is None:
+        return f"No park orientation data for '{team_query}' — can't form a wind read."
+    if wind_mph is None:
+        return "No wind speed in the forecast data — can't form a read."
+    if wind_mph < 8:
+        return f"Wind is light ({wind_mph}mph) — negligible effect on fly-ball carry either way."
+
+    wind_from_deg = _COMPASS_TO_DEGREES.get(wind_direction.upper()) if isinstance(wind_direction, str) else None
+    if wind_from_deg is None:
+        return f"Couldn't parse wind direction '{wind_direction}' — can't form a directional read."
+
+    # Wind direction from NWS is where it's blowing FROM. "Blowing out" (helps
+    # HR) means wind FROM roughly the home-plate side, i.e. FROM the bearing
+    # opposite center field.
+    blowing_out_from = (cf_bearing + 180) % 360
+    diff = min(abs(wind_from_deg - blowing_out_from), 360 - abs(wind_from_deg - blowing_out_from))
+
+    if diff <= 45:
+        return (f"🟢 Wind ({wind_mph}mph from {wind_direction}) is blowing roughly OUT toward "
+                f"center — tends to help fly-ball carry/HR tonight (approximate park orientation, "
+                f"treat as directional context).")
+    elif diff >= 135:
+        return (f"🔴 Wind ({wind_mph}mph from {wind_direction}) is blowing roughly IN from center "
+                f"— tends to suppress fly-ball carry/HR tonight (approximate park orientation, "
+                f"treat as directional context).")
+    else:
+        return (f"🟡 Wind ({wind_mph}mph from {wind_direction}) is mostly crosswise to the field "
+                f"— mixed/unclear effect on carry.")
 
 
 def hitter_matchup_verdict(pitcher_recent: list, hitter_recent: list, batter_hand: str) -> dict:
@@ -1049,6 +1226,7 @@ TIER_BENCHMARKS = {
     "xba_against":       {"elite": 0.220, "poor": 0.280, "direction": "low"},   # expected hit probability ALLOWED on this pitch — direct signal for Hits Allowed
     "xwobacon_against":  {"elite": 0.330, "poor": 0.410, "direction": "low"},   # expected run value ALLOWED on contact — folds in launch angle, not just exit velo threshold; signal for Earned Runs
     "chase_pct_induced": {"elite": 33.0,  "poor": 22.0,  "direction": "high"},  # PITCHER'S OWN benefit from inducing chases (opposite direction from the hitter-discipline "chase_pct" entry above, same underlying stat) — feeds Strikeouts (sets up whiff opportunities) and Walks Allowed (chased pitches don't become balls)
+    "z_contact_pct_against": {"elite": 80.0, "poor": 90.0, "direction": "low"},  # in-zone contact ALLOWED — more contact on his best pitches means more balls in play, more chances at damage
     "two_strike_called_pct": {"elite": 28.0, "poor": 14.0, "direction": "high"},  # backwards-K rate — called strikes on TAKEN two-strike pitches
 }
 
@@ -1780,13 +1958,23 @@ class HitterPitchProfile:
     woba_minus_xwoba: float
     hardhit_pct: float
     xwobacon: float = float("nan")  # expected wOBA restricted to contact ONLY (unlike xwoba, not diluted by K/BB) — folds in launch angle, the real "quality of contact when he connects" signal, not just exit velo threshold
+    flyball_pct: float = float("nan")  # of batted balls in play — his own tendency to lift this pitch, the batted-ball type most likely to become a HR
+    pull_pct: float = float("nan")  # of batted balls in play — see the large caveat where this is computed: community-derived spray-angle formula, higher uncertainty than every other metric in this file
 
 
-def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[HitterPitchProfile]:
+def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20,
+                          batter_hand: str = None) -> list[HitterPitchProfile]:
     """
     Collapse a hitter's pitch-level Statcast rows into one row per
     (pitch_type, pitcher-hand) — the mirror of build_arsenal_profile() in
     the pitcher script, but from the batter's side of the matchup.
+
+    batter_hand: 'L' or 'R' — THIS hitter's own bats-hand, needed to
+    correctly compute pull_pct (pulling means something different for a
+    lefty vs a righty). Optional and backward-compatible: existing calls
+    that don't pass it just get pull_pct as NaN for every pitch, same
+    graceful-degradation pattern as every other optional signal in this
+    file — nothing breaks, that one field just isn't populated.
     """
     profiles = []
 
@@ -1843,6 +2031,39 @@ def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[H
         # same math/gating convention as the pitcher-side xwobacon_against.
         xwobacon = (round(in_play["estimated_woba_using_speedangle"].mean(), 3)
                     if len(in_play) >= 10 else float("nan"))
+        # Fly-ball%: same bb_type column build_arsenal_profile() already
+        # relies on for groundball_pct, just tracked on the hitter side too —
+        # this hitter's OWN tendency to lift the ball on this pitch, the
+        # batted-ball type most likely to become a HR (unlike grounders,
+        # which almost never do).
+        flyball_pct = ((in_play["bb_type"] == "fly_ball").mean() * 100
+                       if len(in_play) and "bb_type" in in_play else float("nan"))
+
+        # Pull%: HIGHER RISK than every other metric in this file, stated
+        # plainly. hc_x/hc_y (batted-ball landing coordinates) are standard
+        # Statcast columns, but the formula below to convert them into a
+        # spray angle is a widely-used, COMMUNITY-REVERSE-ENGINEERED
+        # convention (the coordinate origin/scale MLB uses for hc_x/hc_y
+        # has never been officially published) — not something this file
+        # can verify is exactly right. A wrong constant here wouldn't
+        # error out, it would just quietly shift every computed angle —
+        # spot-check a known extreme pull hitter's computed pull_pct
+        # against his real published number before trusting this.
+        # +angle = pulled toward 1B/RF side, -angle = toward 3B/LF side,
+        # from home plate looking out — standard convention, batter_hand
+        # then decides which sign counts as "pulled" for THIS hitter.
+        # Only computed when batter_hand was supplied; else NaN (same
+        # graceful-degradation as every optional signal elsewhere here).
+        pull_pct = float("nan")
+        if batter_hand in ("L", "R") and len(in_play) and "hc_x" in in_play and "hc_y" in in_play:
+            valid = in_play.dropna(subset=["hc_x", "hc_y"])
+            if len(valid) >= 10:
+                import math
+                angles = (valid["hc_x"] - 125.42).combine(
+                    198.27 - valid["hc_y"],
+                    lambda x, y: math.degrees(math.atan2(x, y)) * 0.75 if y != 0 else 0.0)
+                pulled = (angles > 15) if batter_hand == "L" else (angles < -15)
+                pull_pct = round(pulled.mean() * 100, 1)
 
         profiles.append(HitterPitchProfile(
             pitch_type=ptype,
@@ -1864,6 +2085,8 @@ def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[H
             woba_minus_xwoba=round(woba - xwoba, 3) if pd.notna(woba) and pd.notna(xwoba) else float("nan"),
             hardhit_pct=round(hardhit_pct, 1) if pd.notna(hardhit_pct) else float("nan"),
             xwobacon=xwobacon,
+            flyball_pct=round(flyball_pct, 1) if pd.notna(flyball_pct) else float("nan"),
+            pull_pct=pull_pct,
         ))
 
     return profiles
@@ -1900,6 +2123,8 @@ LEAGUE_AVG_XWOBA_PITCH = 0.320  # same default weighted_matchup_score() uses
 LEAGUE_AVG_XBA_PITCH = 0.250    # approximate per-pitch-type-cell league average xBA
 LEAGUE_AVG_ISO_PITCH = 0.150    # approximate per-pitch-type-cell league average ISO
 LEAGUE_AVG_HITTER_HARDHIT = 38.0  # approximate MLB-wide hard-hit% on balls in play
+LEAGUE_AVG_HITTER_FLYBALL = 35.0  # approximate MLB-wide fly-ball% on balls in play
+LEAGUE_AVG_HITTER_PULL = 40.0  # approximate MLB-wide pull% on balls in play — see pull_pct's computation-site caveat, this benchmark inherits that same uncertainty
 LEAGUE_AVG_HITTER_XWOBACON = 0.360  # approximate MLB-wide xwOBA on contact-only PAs (runs higher than full xwOBA since Ks/BBs are excluded from the denominator)
 # LEAGUE_AVG_CHASE / LEAGUE_AVG_HITTER_WHIFF are the module's real definitions
 # (used elsewhere too) but live further down near opponent_lineup_strength()
@@ -1963,6 +2188,8 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
             "hitter_slg": h.slg if h else None,
             "hitter_iso": h.iso if h else None,
             "hitter_xwobacon": h.xwobacon if h else None,  # contact-only quality — folds in launch angle, unlike hardhit_pct's blunt threshold
+            "hitter_flyball_pct": h.flyball_pct if h else None,  # his own lift tendency on this pitch — feeds HR/TB alongside power (iso/hardhit alone don't capture whether the ball is even in the air)
+            "hitter_pull_pct": h.pull_pct if h else None,  # HIGH UNCERTAINTY — see build_hitter_profile's pull_pct computation-site comment. Included because it's the closest available signal to real HR-specific modeling, not because it's as trustworthy as everything else in this row.
         }
 
         if h is None:
@@ -2070,13 +2297,25 @@ HITTER_PROP_VULN_METRICS = {
                     ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],  # a hitter who chases this pitch typically makes weaker contact on it, on the swings that do happen — same discipline logic already used for Strikeouts, just missing here before
     "singles":    [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
                     ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
-                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),
+                    ("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.05, -1)],  # power SUPPRESSES singles specifically — a hit off this pitch is more likely to leave the infield as a double/HR instead of staying a single. Wider scale than TB/HR's 0.03 since this is a secondary adjustment, not the primary driver for this prop.
     "total_bases": [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
                       ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
-                      ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1)],
+                      ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1),
+                      ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1)],
+                      # hitter_pull_pct deliberately NOT included here — the
+                      # field is still computed (see build_hitter_profile,
+                      # and it's still in the crosswalk table for manual
+                      # inspection) but kept OUT of the automatic score,
+                      # same treatment as weather: unverified coordinate-
+                      # formula risk shouldn't silently move every score
+                      # until someone's actually checked it against a known
+                      # extreme pull hitter's real published pull%.
     "home_runs":  [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
                     ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
-                    ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1)],
+                    ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1),
+                    ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1)],
+                    # same as total_bases above — hitter_pull_pct intentionally excluded from auto-scoring
     "strikeouts": [("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
                     ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],
     # RBI/Runs/H+R+RBI: no lineup-protection data in this crosswalk (who
@@ -2112,7 +2351,7 @@ def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
     unfairly filtered out by a min_quality_score threshold that has
     nothing to do with base-stealing (no pitch-quality mechanism applies).
     """
-    if prop_type == "stolen_bases":
+    if prop_type in ("stolen_bases", "hitter_stolen_bases"):
         return {"score": 0.0, "label": "No pitch-quality mechanism applies to stolen bases — "
                 "neutral by design (driven by catcher pop time / pitcher hold, not pitch matchup).",
                 "weighted_usage_counted": 0.0}
@@ -2224,7 +2463,8 @@ SHRINKABLE_FIELDS = ["chase_pct", "z_swing_pct", "contact_pct", "z_contact_pct",
                       "called_strike_pct", "csw_pct", "hardhit_pct",
                       "groundball_pct", "putaway_pct",
                       "ba", "xba", "slg", "iso", "woba", "xwoba", "xwobacon",
-                      "xba_against", "xwobacon_against", "two_strike_called_pct"]
+                      "xba_against", "xwobacon_against", "two_strike_called_pct",
+                      "flyball_pct", "pull_pct"]
 # ba/xba/slg/iso/woba/xwoba only exist as attributes on HitterPitchProfile
 # (build_hitter_profile computes them directly) — PitchProfile doesn't carry
 # them, so blend_profiles()'s hasattr() check just skips these harmlessly for
@@ -3145,11 +3385,13 @@ PITCHER_PROP_METRICS = {
     "hits_allowed": [("hardhit_pct", "hardhit_pct_against"),
                        ("groundball_pct", "groundball_pct"),
                        ("csw_pct", "csw_pct"),
-                       ("xba_against", "xba_against")],   # direct hit-probability signal — the right metric specifically for HITS
+                       ("xba_against", "xba_against"),
+                       ("z_contact_pct", "z_contact_pct_against")],   # in-zone contact allowed — more contact on his best pitches = more balls in play = more hit opportunities
     "pitcher_earned_runs": [("hardhit_pct", "hardhit_pct_against"),
                               ("groundball_pct", "groundball_pct"),
                               ("csw_pct", "csw_pct"),
-                              ("xwobacon_against", "xwobacon_against")],  # run-VALUE signal (weights HR/2B higher than a single) — the right metric specifically for RUNS
+                              ("xwobacon_against", "xwobacon_against"),
+                              ("z_contact_pct", "z_contact_pct_against")],
 }
 
 
@@ -3247,6 +3489,191 @@ def pitcher_prop_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
             "hand_breakdown": per_hand_scores, "hand_weights_pa": lineup_hand_weights}
 
 
+# ---------------------------------------------------------------------------
+# Lineup verification — does TONIGHT'S ACTUAL lineup behave the way the
+# pitcher's own numbers assume it will?
+# ---------------------------------------------------------------------------
+# pitcher_prop_quality_score() above answers "how good is his stuff" using
+# HIS OWN history against hitters in general — it never checks whether the
+# specific hitters he faces tonight actually have the tendency his stuff
+# depends on. Example: a pitcher who lives on chasing LHH out of the zone
+# only gets that benefit if tonight's actual LHH — weighted by how many
+# plate appearances they'll really get, e.g. 3 LHH in the top of the order
+# outweigh 6 LHH scattered through the bottom — are themselves real
+# chasers. A generically "good chase pitcher" facing a lineup of patient
+# hitters who don't chase is a different, weaker matchup than his own
+# season numbers alone would suggest.
+#
+# Only metrics with a genuine hitter-side equivalent get checked — zone%,
+# called-strike%, CSW%, groundball%, putaway%, and two-strike-called% are
+# pitcher-controlled mechanics (or need a 2-strike-specific hitter field
+# this build doesn't compute) with no matching "does the hitter have this
+# tendency" field, so they're honestly left out rather than faked.
+
+PITCHER_TO_HITTER_METRIC_MAP = {
+    # pitcher-side PitchProfile attribute -> hitter-side HitterPitchProfile attribute
+    "chase_whiff_pct": "chase_whiff_pct",
+    "z_whiff_pct": "z_whiff_pct",
+    "chase_pct": "chase_pct",
+    "whiff_pct": "whiff_pct",
+    "hardhit_pct": "hardhit_pct",
+    "xba_against": "xba",
+    "xwobacon_against": "xwobacon",
+    "z_contact_pct": "z_contact_pct",
+    # NOT mapped (no hitter-side equivalent exists): zone_pct,
+    # called_strike_pct, csw_pct, groundball_pct, putaway_pct,
+    # two_strike_called_pct
+}
+
+
+def lineup_verification_score(pitcher_arsenal: list, opposing_lineup_hitters: list,
+                                prop_type: str, usage_threshold: float = 15.0) -> dict:
+    """
+    opposing_lineup_hitters: list of (hitter_recent: list[HitterPitchProfile],
+    hand: str, expected_pa: float) — one tuple per hitter in tonight's real
+    lineup, expected_pa from EXPECTED_PA_BY_ORDER_SLOT so top-of-order
+    hitters actually outweigh bottom-of-order ones of the same hand.
+
+    For each of this prop's metrics that has a hitter-side equivalent (see
+    PITCHER_TO_HITTER_METRIC_MAP), computes each hitter's own value against
+    the pitcher's significant pitches for their hand (pitcher-usage-
+    weighted, same math as weighted_matchup_score), then averages across
+    hitters of that hand weighted by expected_pa, then blends the two hands
+    by their real share of tonight's plate appearances. Normalized on the
+    SAME TIER_BENCHMARKS key the pitcher-side metric uses, so "the lineup
+    itself is a good chase-lineup" reads on the identical scale as "the
+    pitcher himself is a good chase-inducer."
+
+    Returns {'score': float 0-100 or None, 'label': str, 'metrics_checked': list}.
+    None if this prop has no hitter-checkable metrics or no lineup data —
+    callers should fall back to the pitcher-own-stuff score alone in that case.
+    """
+    metrics = PITCHER_PROP_METRICS.get(prop_type)
+    if not metrics:
+        return {"score": None, "label": "No metric set for this prop.", "metrics_checked": []}
+
+    checkable = [(p_attr, bench_key) for p_attr, bench_key in metrics
+                 if p_attr in PITCHER_TO_HITTER_METRIC_MAP]
+    if not checkable:
+        return {"score": None, "label": "This prop's metrics are pitcher-controlled "
+                "mechanics with no hitter-side tendency to check (e.g. zone%, command).",
+                "metrics_checked": []}
+
+    if not opposing_lineup_hitters:
+        return {"score": None, "label": "No lineup data available to verify against.",
+                "metrics_checked": []}
+
+    total_pa = sum(pa for _, _, pa in opposing_lineup_hitters) or 1.0
+    hand_shares = {"L": 0.0, "R": 0.0}
+    for _, hand, pa in opposing_lineup_hitters:
+        if hand in hand_shares:
+            hand_shares[hand] += pa / total_pa
+
+    per_hand_scores = {}
+    for hand in ("L", "R"):
+        sig_pitches = [p for p in pitcher_arsenal if p.vs_hand == hand and p.usage_pct >= usage_threshold]
+        hitters_this_hand = [(h_recent, pa) for h_recent, h, pa in opposing_lineup_hitters if h == hand]
+        if not sig_pitches or not hitters_this_hand:
+            per_hand_scores[hand] = None
+            continue
+
+        metric_scores = []
+        for p_attr, bench_key in checkable:
+            h_attr = PITCHER_TO_HITTER_METRIC_MAP[p_attr]
+            hitter_vals_weighted = []
+            for h_recent, pa in hitters_this_hand:
+                h_by_type = {h.pitch_type: getattr(h, h_attr) for h in h_recent
+                             if pd.notna(getattr(h, h_attr, None))}
+                if not h_by_type:
+                    continue
+                # Renormalize over only the pitches THIS hitter actually has data
+                # for — dividing by total usage across ALL sig_pitches would
+                # silently dilute the result toward zero whenever a hitter is
+                # missing data on one of the pitcher's pitches, instead of
+                # computing a fair average over what's actually available.
+                available_usage = sum(p.usage_pct for p in sig_pitches if p.pitch_type in h_by_type)
+                if available_usage == 0:
+                    continue
+                pitch_weighted_val = sum(
+                    (p.usage_pct / available_usage) * h_by_type[p.pitch_type]
+                    for p in sig_pitches if p.pitch_type in h_by_type)
+                hitter_vals_weighted.append((pitch_weighted_val, pa))
+            if not hitter_vals_weighted:
+                continue
+            lineup_avg = (sum(v * w for v, w in hitter_vals_weighted)
+                          / sum(w for _, w in hitter_vals_weighted))
+            metric_scores.append(_normalize_benchmark(lineup_avg, bench_key))
+
+        per_hand_scores[hand] = round(sum(metric_scores) / len(metric_scores), 1) if metric_scores else None
+
+    weighted_total, weight_used = 0.0, 0.0
+    for hand in ("L", "R"):
+        s = per_hand_scores.get(hand)
+        share = hand_shares.get(hand, 0.0)
+        if s is not None and share > 0:
+            weighted_total += s * share
+            weight_used += share
+
+    if weight_used == 0:
+        return {"score": None, "label": "Not enough lineup data to verify this prop's metrics.",
+                "metrics_checked": [p for p, _ in checkable]}
+
+    final_score = round(weighted_total / weight_used, 1)
+    if final_score >= 65:
+        label = "🟢 Tonight's real lineup confirms it — the hitters he'll actually face have this tendency"
+    elif final_score >= 50:
+        label = "🟡 Lineup roughly supports it"
+    elif final_score >= 35:
+        label = "🟠 Lineup pushes back somewhat — these specific hitters don't show the same tendency"
+    else:
+        label = "🔴 Lineup CONTRADICTS his own numbers — his usual edge may not hold with these hitters"
+
+    return {"score": final_score, "label": label, "metrics_checked": [p for p, _ in checkable],
+            "hand_breakdown": per_hand_scores}
+
+
+def pitcher_prop_mu_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
+                                    opposing_lineup_hitters: list, prop_type: str,
+                                    usage_threshold: float = 15.0, own_stuff_weight: float = 0.6) -> dict:
+    """
+    The real 'whole lineup vs pitcher' score: blends pitcher_prop_quality_
+    score() (his own stuff, 60% weight by default) with lineup_verification_
+    score() (do tonight's actual hitters have the tendency his stuff
+    depends on, 40%). This is what should drive quality_score for every
+    pitcher prop row now — pitcher_prop_quality_score() alone only ever
+    told half the story.
+
+    Falls back to the pitcher-own-stuff score alone (unchanged from before
+    this existed) whenever lineup verification has nothing to check for
+    this prop_type, or no lineup data is available — never breaks or drops
+    a row over this.
+    """
+    if prop_type == "pitcher_fantasy":
+        parts = {p: pitcher_prop_mu_quality_score(pitcher_arsenal, lineup_hand_weights,
+                                                    opposing_lineup_hitters, p, usage_threshold, own_stuff_weight)
+                 for p in ("strikeouts", "outs", "pitcher_earned_runs")}
+        scores = [p["score"] for p in parts.values() if p["score"] is not None]
+        if not scores:
+            return {"score": None, "label": "Not enough data to score.", "component_scores": {}}
+        final_score = round(sum(scores) / len(scores), 1)
+        return {"score": final_score, "label": _quality_label(final_score),
+                "component_scores": {k: v["score"] for k, v in parts.items()}}
+
+    own = pitcher_prop_quality_score(pitcher_arsenal, lineup_hand_weights, prop_type, usage_threshold)
+    lineup = lineup_verification_score(pitcher_arsenal, opposing_lineup_hitters, prop_type, usage_threshold)
+
+    if own["score"] is None:
+        return own  # nothing to blend with, same failure mode as before
+    if lineup["score"] is None:
+        # No hitter-checkable metrics for this prop, or no lineup data — own-stuff-only, as before this feature.
+        return {"score": own["score"], "label": own["label"] + f" ({lineup['label']})",
+                "own_stuff_score": own["score"], "lineup_verification_score": None}
+
+    blended = round(own_stuff_weight * own["score"] + (1 - own_stuff_weight) * lineup["score"], 1)
+    return {"score": blended, "label": f"{own['label']} | Lineup check: {lineup['label']}",
+            "own_stuff_score": own["score"], "lineup_verification_score": lineup["score"]}
+
+
 DEFAULT_BOOK_STAT_MAP = {
     # Book stat_type string -> this file's internal prop_type. NAMES ARE
     # BEST-EFFORT — never confirmed against a live pull (see module notes on
@@ -3264,6 +3691,8 @@ DEFAULT_BOOK_STAT_MAP = {
     "Hits + Runs + RBIs": "hitter_hits_runs_rbi", "Hits+Runs+RBIs": "hitter_hits_runs_rbi",
     "Fantasy Score": "hitter_fantasy", "Hitter Fantasy Score": "hitter_fantasy",
     "Hitter Fantasy Points": "hitter_fantasy",
+    "Win": "pitcher_win", "Pitcher Win": "pitcher_win",
+    "Stolen Bases": "hitter_stolen_bases",
 }
 
 
@@ -3405,8 +3834,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                           "walks_allowed": 1.5, "hits_allowed": 5.5}
     h_lines_default = hitter_lines or {"hits": 0.5, "singles": 0.5,
                                          "total_bases": 1.5, "home_runs": 0.5}
-    p_official_lines_default = {"pitcher_earned_runs": 2.5, "pitcher_fantasy": 18.5}
-    h_official_lines_default = {"hitter_hits_runs_rbi": 1.5, "hitter_fantasy": 8.5}
+    p_official_lines_default = {"pitcher_earned_runs": 2.5, "pitcher_fantasy": 18.5, "pitcher_win": 0.5}
+    h_official_lines_default = {"hitter_hits_runs_rbi": 1.5, "hitter_fantasy": 8.5, "hitter_stolen_bases": 0.5}
     stat_map = book_stat_map or DEFAULT_BOOK_STAT_MAP
 
     live_lookup = _build_live_line_lookup(live_line_source) if use_live_lines else {}
@@ -3476,13 +3905,49 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
                 opposing_lineup = lineup_check.get(batting_side, [])
                 hand_weights = lineup_hand_composition(opposing_lineup)
+                pitcher_hand = get_pitcher_hand(pid)
+
+                # Pre-pull every opposing hitter's profile ONCE, before scoring
+                # pitcher props — needed so pitcher-prop quality_score can check
+                # whether TONIGHT'S ACTUAL lineup (weighted by real batting-order
+                # expected PA, not a flat average across whoever's in it) has the
+                # tendency his own numbers assume, not just his history vs
+                # hitters in general. Reused below in the hitter-prop loop too —
+                # this replaces a pull that used to happen there, not an extra one.
+                lineup_hitter_profiles = {}
+                opposing_lineup_hitters_for_verification = []
+                for hitter in opposing_lineup:
+                    try:
+                        hbid = hitter["player_id"]
+                        hhand = get_batter_hand(hbid)
+                        hhand = hhand if hhand in ("L", "R") else "R"
+                        hh_recent_raw = build_hitter_profile(
+                            pull_batter_pitches(hbid, hitter_start, today_str), batter_hand=hhand)
+                        if not hh_recent_raw:
+                            continue
+                        if hitter_season_long:
+                            hh_recent = hh_recent_raw
+                        else:
+                            try:
+                                hh_season_profile = build_hitter_profile(
+                                    pull_batter_pitches(hbid, season_start, today_str), batter_hand=hhand)
+                                hh_recent = (blend_profiles(hh_recent_raw, hh_season_profile)
+                                             if hh_season_profile else hh_recent_raw)
+                            except Exception:
+                                hh_recent = hh_recent_raw
+                        expected_pa = hitter.get("expected_pa", 4.0)
+                        lineup_hitter_profiles[hbid] = (hh_recent, hhand)
+                        opposing_lineup_hitters_for_verification.append((hh_recent, hhand, expected_pa))
+                    except Exception:
+                        continue
 
                 p_lines, p_matched = _player_lines_with_live(
                     pitcher_name, p_lines_default, live_lookup, stat_map)
                 probs = pitcher_prop_probabilities(pid, pitcher_start, today_str, p_lines)
                 if "p_over" in probs.columns:
                     for _, prow in probs.iterrows():
-                        prop_quality = pitcher_prop_quality_score(pitcher_recent, hand_weights, prow["stat"])
+                        prop_quality = pitcher_prop_mu_quality_score(
+                            pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, prow["stat"])
                         rows.append({
                             "side": "pitcher", "prop_type": prow["stat"],
                             "player": pitcher_name,
@@ -3506,7 +3971,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         if "p_over" in p_official.columns:
                             for _, prow in p_official.iterrows():
                                 full_stat = "pitcher_" + prow["stat"]
-                                prop_quality = pitcher_prop_quality_score(pitcher_recent, hand_weights, full_stat)
+                                prop_quality = pitcher_prop_mu_quality_score(
+                                    pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, full_stat)
                                 rows.append({
                                     "side": "pitcher", "prop_type": full_stat,
                                     "player": pitcher_name,
@@ -3520,32 +3986,14 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                     except Exception:
                         pass
 
-                pitcher_hand = get_pitcher_hand(pid)
                 for hitter in opposing_lineup:
                     try:
                         bid = hitter["player_id"]
                         hitter_name = hitter["name"]
-                        batter_hand = get_batter_hand(bid)
-                        batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
-
-                        h_recent_raw = build_hitter_profile(pull_batter_pitches(bid, hitter_start, today_str))
-                        if not h_recent_raw:
-                            continue
-
-                        # Same sample-size fix as the pitcher side — only needed
-                        # when using a trimmed recent window (hitter_season_long=
-                        # False). When hitters are already using the full season,
-                        # recent IS season already, nothing to blend toward.
-                        if hitter_season_long:
-                            h_recent = h_recent_raw
-                        else:
-                            try:
-                                h_season_profile = build_hitter_profile(
-                                    pull_batter_pitches(bid, season_start, today_str))
-                                h_recent = (blend_profiles(h_recent_raw, h_season_profile)
-                                            if h_season_profile else h_recent_raw)
-                            except Exception:
-                                h_recent = h_recent_raw
+                        pre_pulled = lineup_hitter_profiles.get(bid)
+                        if pre_pulled is None:
+                            continue  # already failed/empty in the pre-pull above — skip, don't re-pull
+                        h_recent, batter_hand = pre_pulled
 
                         h_lines, h_matched = _player_lines_with_live(
                             hitter_name, h_lines_default, live_lookup, stat_map)
@@ -3634,11 +4082,14 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict) -> pd.DataFrame:
     """
     Mu-based P(over) for hitter props that need OFFICIAL box-score data —
-    H+R+RBI combined and Hitter Fantasy Points — using
+    H+R+RBI combined, Hitter Fantasy Points, and Stolen Bases — using
     pull_official_hitter_game_log() directly (already has hits/runs/rbi/
     singles/doubles/triples/HR/walks/hbp/SB per game, no merge needed).
 
-    lines: subset of {'hits_runs_rbi': float, 'fantasy': float}.
+    lines: subset of {'hits_runs_rbi': float, 'fantasy': float, 'stolen_bases': float}.
+    stolen_bases is a genuine per-game COUNT (unlike 'win' on the pitcher
+    side), so the normal Poisson fit below is statistically correct for it
+    as-is — no special case needed.
     """
     if _poisson is None:
         raise ImportError("pip install scipy --break-system-packages")
@@ -3682,10 +4133,12 @@ def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict)
 def pitcher_official_prop_probabilities(person_id: int, season: int, lines: dict) -> pd.DataFrame:
     """
     Mu-based P(over) for pitcher props that need OFFICIAL data — Earned
-    Runs Allowed and Pitcher Fantasy Points — using
+    Runs Allowed, Pitcher Fantasy Points, and Win — using
     pull_official_pitcher_game_log() directly.
 
-    lines: subset of {'earned_runs': float, 'fantasy': float}.
+    lines: subset of {'earned_runs': float, 'fantasy': float, 'win': 0.5}.
+    'win' uses the raw season win RATE, not a Poisson fit (see below) —
+    pass 0.5 as its line to match how a real Win Yes/No prop works.
     """
     if _poisson is None:
         raise ImportError("pip install scipy --break-system-packages")
@@ -3704,6 +4157,17 @@ def pitcher_official_prop_probabilities(person_id: int, season: int, lines: dict
     rows = []
     for stat, line in lines.items():
         if stat not in log.columns:
+            continue
+        if stat == "win":
+            # 'win' is binary (0/1) per game, not an unbounded count — Poisson
+            # is the wrong distribution for it (it would understate the true
+            # rate). The season win RATE itself already IS the probability;
+            # no distribution fit needed. line is expected as 0.5 (win=1
+            # counts as "over"), matching how a real Win Yes/No prop works.
+            win_rate = log["win"].mean()
+            rows.append({"stat": "win", "line": line, "recent_avg": round(win_rate, 3),
+                        "games_sampled": len(log), "p_over": round(win_rate, 3),
+                        "p_under": round(1 - win_rate, 3)})
             continue
         mean = log[stat].mean()
         p_over = 1 - _poisson.cdf(math.floor(line), mean)
