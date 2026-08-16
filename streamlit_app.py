@@ -265,6 +265,16 @@ bt_window = bt_col5.number_input("Trailing game window (0 = use ALL prior games 
                                   "matching 'hitters use whole season')", value=0, step=5,
                                   key="bt_window")
 
+bt_min_avg_outs = st.slider(
+    "Minimum real average outs/appearance to count a pitcher (filters out relievers)",
+    min_value=0.0, max_value=18.0, value=10.0, step=1.0, key="bt_min_avg_outs",
+    help="The pitcher lines (Outs 15.5, Strikeouts 5.5) are calibrated for STARTERS. A "
+         "reliever averaging 3 outs/appearance will ALWAYS correctly grade UNDER - not a real "
+         "test, just an easy call that inflates the hit rate with noise. 10.0 (~3.1 real "
+         "innings/appearance) is a reasonable real-world cutoff; raise it for a stricter "
+         "true-starters-only sample. Checked against each pitcher's own real season average, "
+         "not a role label - and filtered-out relievers don't eat into 'Max pitchers to test'.")
+
 if st.button("Run season backtest", key="bt_run_btn"):
     teams_list = [t.strip() for t in bt_teams_raw.split(",") if t.strip()] or None
     window = int(bt_window) if bt_window > 0 else None
@@ -275,6 +285,7 @@ if st.button("Run season backtest", key="bt_run_btn"):
                 season=int(bt_season), teams=teams_list,
                 max_pitchers=int(bt_max_pitchers), max_hitters=int(bt_max_hitters),
                 min_edge=float(bt_min_edge), window_games=window,
+                min_avg_outs_per_game=float(bt_min_avg_outs),
             )
             st.session_state.bt_result = result
         except Exception as e:
