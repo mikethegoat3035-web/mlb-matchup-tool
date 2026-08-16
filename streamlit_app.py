@@ -26,7 +26,8 @@ from datetime import datetime
 from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
-    match_book_line_to_player, get_unconfirmed_games_today
+    match_book_line_to_player, get_unconfirmed_games_today,
+    backtest_full_season_mlb, PITCHER_BACKTEST_LINES, HITTER_BACKTEST_LINES,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -224,3 +225,97 @@ if "qm_slate" in st.session_state:
                        file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
                        mime="text/csv", key="dl_best_edges")
     
+
+
+# ---------------------------------------------------------------------------
+# Season Backtest — real walk-forward validation, no manual name list needed
+# ---------------------------------------------------------------------------
+st.header("📊 Season Backtest — does the mu actually predict real outcomes?")
+st.caption("Pulls real players straight from real team rosters (no names to type), and for "
+           "every real game each one played, computes what the model's mu WOULD have said "
+           "using only games strictly BEFORE that one (no look-ahead), then checks it against "
+           "what actually happened. This validates the Poisson mu itself - the foundation "
+           "every prop's probability sits on. It does NOT validate quality_score specifically "
+           "(that needs real historical lineups, which no source here provides for past games) "
+           "- a real, honest limit, not a bug. Makes real network calls per player, so this is "
+           "genuinely slow - start small (a couple of teams, low max counts) to confirm it runs "
+           "before scaling up.")
+
+bt_col1, bt_col2, bt_col3 = st.columns(3)
+bt_season = bt_col1.number_input("Season", value=2026, step=1, key="bt_season")
+bt_max_pitchers = bt_col2.number_input("Max pitchers to test", value=10, step=5, key="bt_max_pitchers")
+bt_max_hitters = bt_col3.number_input("Max hitters to test", value=20, step=5, key="bt_max_hitters")
+
+st.caption(f"Testing these exact lines (same defaults the live scanner uses) — "
+           f"Pitcher: {PITCHER_BACKTEST_LINES} | Hitter: {HITTER_BACKTEST_LINES}")
+
+bt_teams_raw = st.text_input(
+    "Teams to test (comma-separated, e.g. 'yankees, dodgers, braves') - leave blank for ALL 30 "
+    "teams (very slow, only do this once you've confirmed a small run works)",
+    value="yankees, dodgers", key="bt_teams_raw")
+
+bt_col4, bt_col5 = st.columns(2)
+bt_min_edge = bt_col4.slider("Minimum edge to count a graded game (0 = count every prediction, "
+                              "regardless of strength)", min_value=0.0, max_value=0.45, value=0.0,
+                              step=0.05, key="bt_min_edge",
+                              help="Same real question already answered for the props themselves: "
+                                   "does restricting to real-edge-only predictions improve the hit "
+                                   "rate, vs counting every prediction the model makes.")
+bt_window = bt_col5.number_input("Trailing game window (0 = use ALL prior games that season, "
+                                  "matching 'hitters use whole season')", value=0, step=5,
+                                  key="bt_window")
+
+if st.button("Run season backtest", key="bt_run_btn"):
+    teams_list = [t.strip() for t in bt_teams_raw.split(",") if t.strip()] or None
+    window = int(bt_window) if bt_window > 0 else None
+    with st.spinner(f"Walk-forward backtesting real {bt_season} games — this genuinely takes a "
+                     f"while, real network calls happening per player..."):
+        try:
+            result = backtest_full_season_mlb(
+                season=int(bt_season), teams=teams_list,
+                max_pitchers=int(bt_max_pitchers), max_hitters=int(bt_max_hitters),
+                min_edge=float(bt_min_edge), window_games=window,
+            )
+            st.session_state.bt_result = result
+        except Exception as e:
+            st.error(f"Backtest failed: {e}")
+
+if "bt_result" in st.session_state:
+    result = st.session_state.bt_result
+
+    if result["total_graded"] == 0:
+        st.warning("No graded games came back - try a different team, or check the errors "
+                   "expander below for what went wrong.")
+    else:
+        st.success(f"Tested {result['pitchers_tested']} pitchers, {result['hitters_tested']} "
+                  f"hitters — {result['total_graded']} real graded games total.")
+        ov_col1, ov_col2 = st.columns(2)
+        ov_col1.metric("Overall hit rate", f"{result['overall_hit_rate']*100:.1f}%"
+                       if result['overall_hit_rate'] is not None else "N/A")
+        ov_col2.metric("Total graded games", result["total_graded"])
+
+        st.subheader("By prop type")
+        st.caption("Which props the model's mu is actually good at calling vs which ones are "
+                   "closer to a coinflip in real historical data.")
+        if not result["by_prop"].empty:
+            by_prop_display = result["by_prop"].copy()
+            by_prop_display["hit_rate"] = (by_prop_display["hit_rate"] * 100).round(1).astype(str) + "%"
+            st.dataframe(by_prop_display, use_container_width=True, hide_index=True)
+        else:
+            st.info("No per-prop data.")
+
+        with st.expander(f"Per-player breakdown ({len(result['by_player'])} rows)"):
+            if not result["by_player"].empty:
+                by_player_display = result["by_player"].copy()
+                by_player_display["hit_rate"] = (by_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
+                st.dataframe(by_player_display.sort_values("graded", ascending=False),
+                            use_container_width=True, hide_index=True)
+            else:
+                st.info("No per-player data.")
+
+        if result["errors"]:
+            with st.expander(f"⚠️ {len(result['errors'])} error(s) during the run"):
+                for e in result["errors"][:50]:
+                    st.text(e)
+                if len(result["errors"]) > 50:
+                    st.caption(f"...and {len(result['errors']) - 50} more.")
