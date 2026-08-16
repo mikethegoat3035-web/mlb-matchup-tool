@@ -2716,6 +2716,17 @@ def pull_pitcher_game_log(pitcher_id: int, start_dt: str, end_dt: str) -> pd.Dat
             "game_date": game_date, "outs": int(outs), "strikeouts": int(strikeouts),
             "walks_allowed": int(walks), "hits_allowed": int(hits),
         })
+    if not rows:
+        # Real edge case, not rare enough to ignore: a pitcher with ZERO
+        # terminal pitch events in this window (thin/no real sample -
+        # true for plenty of real relievers/September call-ups) makes
+        # pd.DataFrame([]) come back with NO COLUMNS AT ALL, not even
+        # game_date - .sort_values("game_date") on that raises a real
+        # KeyError. Returning a properly-shaped empty frame here means
+        # every caller's existing `if log.empty` check works safely,
+        # instead of everyone needing their own try/except for this one
+        # source function's edge case.
+        return pd.DataFrame(columns=["game_date", "outs", "strikeouts", "walks_allowed", "hits_allowed"])
     return pd.DataFrame(rows).sort_values("game_date")
 
 
@@ -4277,6 +4288,13 @@ def pull_hitter_game_log(batter_id: int, start_dt: str, end_dt: str) -> pd.DataF
             "home_runs": int(home_runs), "walks": int(walks), "strikeouts": int(strikeouts),
             "had_hit": bool(hits > 0),
         })
+    if not rows:
+        # Same real edge case as pull_pitcher_game_log - zero terminal
+        # events in the window (thin/no real sample) makes an empty-list
+        # DataFrame come back with no columns, and .sort_values("game_date")
+        # raises a real KeyError instead of just returning cleanly empty.
+        return pd.DataFrame(columns=["game_date", "hits", "singles", "doubles", "total_bases",
+                                       "home_runs", "walks", "strikeouts", "had_hit"])
     return pd.DataFrame(rows).sort_values("game_date")
 
 
@@ -5923,7 +5941,8 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
                               pitcher_lines: dict = None, hitter_lines: dict = None,
                               min_edge: float = 0.0, min_games_before_pitcher: int = 8,
                               min_games_before_hitter: int = 15, window_games: int = None,
-                              min_avg_outs_per_game: float = 10.0) -> dict:
+                              min_avg_outs_per_game: float = 10.0,
+                              include_official_props: bool = True) -> dict:
     """
     Season-wide walk-forward validation, real players pulled from real
     team rosters (get_team_roster_pitchers/get_team_roster_batters) -
@@ -5960,6 +5979,14 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
     Returns overall + per-prop-type hit rate, mirroring the NFL league-
     wide scan's output shape. This makes real network calls per player -
     genuinely slow on a full run, same tradeoff as the NFL auto-scan.
+
+    include_official_props: also tests Earned Runs, Win, both Fantasy
+    scores, H+R+RBI, and Stolen Bases - real official-box-score props the
+    original version of this function never covered (a real scope gap,
+    not a principled exclusion - see Section 6 above). Win is graded
+    using rolling win RATE, not Poisson, matching the live scanner's own
+    correct design for that one prop. Roughly doubles runtime, same
+    tradeoff as the live scanner's identical toggle.
     """
     p_lines = pitcher_lines or PITCHER_BACKTEST_LINES
     h_lines = hitter_lines or HITTER_BACKTEST_LINES
@@ -6014,6 +6041,50 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
                                          "graded": graded, "hits": hits,
                                          "hit_rate": round(hits / graded, 3) if graded else None})
 
+            if include_official_props:
+                for prop_type, line in PITCHER_OFFICIAL_BACKTEST_LINES.items():
+                    full_prop = "pitcher_" + prop_type
+                    try:
+                        df = backtest_pitcher_official_prop_walk_forward(
+                            p["player_id"], prop_type, line, season,
+                            min_games_before=min_games_before_pitcher, window_games=window_games)
+                    except Exception as e:
+                        errors.append(f"{p['name']} {full_prop}: {e}")
+                        continue
+                    if df.empty:
+                        continue
+                    if min_edge > 0:
+                        df = df[df["edge"] >= min_edge]
+                    if df.empty:
+                        continue
+                    hits = int(df["hit"].sum())
+                    graded = len(df)
+                    prop_totals.setdefault(full_prop, [0, 0])
+                    prop_totals[full_prop][0] += hits
+                    prop_totals[full_prop][1] += graded
+                    per_player_rows.append({"side": "pitcher", "player": p["name"], "prop_type": full_prop,
+                                             "graded": graded, "hits": hits,
+                                             "hit_rate": round(hits / graded, 3) if graded else None})
+                try:
+                    df = backtest_pitcher_win_walk_forward(
+                        p["player_id"], season, min_games_before=min_games_before_pitcher,
+                        window_games=window_games)
+                except Exception as e:
+                    errors.append(f"{p['name']} pitcher_win: {e}")
+                    df = pd.DataFrame()
+                if not df.empty:
+                    if min_edge > 0:
+                        df = df[df["edge"] >= min_edge]
+                    if not df.empty:
+                        hits = int(df["hit"].sum())
+                        graded = len(df)
+                        prop_totals.setdefault("pitcher_win", [0, 0])
+                        prop_totals["pitcher_win"][0] += hits
+                        prop_totals["pitcher_win"][1] += graded
+                        per_player_rows.append({"side": "pitcher", "player": p["name"], "prop_type": "pitcher_win",
+                                                 "graded": graded, "hits": hits,
+                                                 "hit_rate": round(hits / graded, 3) if graded else None})
+
     hitter_count = 0
     for team in team_list:
         if hitter_count >= max_hitters:
@@ -6050,6 +6121,31 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
                                          "graded": graded, "hits": hits,
                                          "hit_rate": round(hits / graded, 3) if graded else None})
 
+            if include_official_props:
+                for prop_type, line in HITTER_OFFICIAL_BACKTEST_LINES.items():
+                    full_prop = "hitter_" + prop_type
+                    try:
+                        df = backtest_hitter_official_prop_walk_forward(
+                            h["player_id"], prop_type, line, season,
+                            min_games_before=min_games_before_hitter, window_games=window_games)
+                    except Exception as e:
+                        errors.append(f"{h['name']} {full_prop}: {e}")
+                        continue
+                    if df.empty:
+                        continue
+                    if min_edge > 0:
+                        df = df[df["edge"] >= min_edge]
+                    if df.empty:
+                        continue
+                    hits = int(df["hit"].sum())
+                    graded = len(df)
+                    prop_totals.setdefault(full_prop, [0, 0])
+                    prop_totals[full_prop][0] += hits
+                    prop_totals[full_prop][1] += graded
+                    per_player_rows.append({"side": "hitter", "player": h["name"], "prop_type": full_prop,
+                                             "graded": graded, "hits": hits,
+                                             "hit_rate": round(hits / graded, 3) if graded else None})
+
     total_hits = sum(v[0] for v in prop_totals.values())
     total_graded = sum(v[1] for v in prop_totals.values())
     by_prop = [{"prop_type": p, "graded": g, "hits": h, "hit_rate": round(h / g, 3) if g else None}
@@ -6063,3 +6159,157 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
         "pitchers_tested": pitcher_count, "hitters_tested": hitter_count,
         "errors": errors,
     }
+
+
+# =============================================================================
+# SECTION 6 — Official-box-score walk-forward backtest (Earned Runs, Win,
+# both Fantasy scores, H+R+RBI, Stolen Bases). Real gap this closes: the
+# original backtest engine only used pull_pitcher_game_log/
+# pull_hitter_game_log (pitch-level Statcast reconstruction), which never
+# had earned_runs/win/rbi/runs/stolen_bases at all - those columns only
+# exist in the OFFICIAL box-score logs (pull_official_pitcher_game_log/
+# pull_official_hitter_game_log), a completely different data source the
+# original walk-forward functions never touched. Not a principled
+# exclusion, just an honest scope gap now fixed.
+# =============================================================================
+
+PITCHER_OFFICIAL_BACKTEST_LINES = {"earned_runs": 2.5, "fantasy": 18.5}
+# "win" deliberately NOT in this lines dict - handled by its own function
+# below (backtest_pitcher_win_walk_forward), since it's a bounded binary
+# outcome, not a Poisson-appropriate count. Matches the live scanner's own
+# real design decision: Win uses the raw rolling win RATE directly, never
+# a Poisson fit (Poisson understates a true binary rate - a real 65% win
+# rate would come back ~42% under Poisson, confirmed and fixed in the live
+# scanner already; this backtest uses that same correct approach).
+HITTER_OFFICIAL_BACKTEST_LINES = {"hits_runs_rbi": 1.5, "fantasy": 8.5, "stolen_bases": 0.5}
+
+
+def _pitcher_official_row_target(row, stat):
+    if stat == "fantasy":
+        return pitcher_fantasy_score({
+            "out": row["outs"], "strikeout": row["strikeouts"],
+            "earned_run": row["earned_runs"], "win": row["win"],
+            "quality_start": row["quality_start"],
+        })
+    return row[stat]
+
+
+def _hitter_official_row_target(row, stat):
+    if stat == "fantasy":
+        return hitter_fantasy_score({
+            "single": row["singles"], "double": row["doubles"], "triple": row["triples"],
+            "home_run": row["home_runs"], "run": row["runs"], "rbi": row["rbi"],
+            "walk": row["walks"], "hbp": row["hbp"], "stolen_base": row["stolen_bases"],
+        })
+    if stat == "hits_runs_rbi":
+        return row["hits"] + row["runs"] + row["rbi"]
+    return row[stat]
+
+
+def backtest_pitcher_official_prop_walk_forward(pitcher_id: int, prop_type: str, line: float,
+                                                   season: int, min_games_before: int = 8,
+                                                   window_games: int = None) -> pd.DataFrame:
+    """Official-box-score walk-forward validation for Earned Runs and
+    Fantasy - same real walk-forward logic as
+    backtest_pitcher_prop_walk_forward, sourced from
+    pull_official_pitcher_game_log (MLB's own scored box stats) instead
+    of pitch-level reconstruction. fantasy is computed per-game via the
+    real pitcher_fantasy_score() weights, not approximated."""
+    if _poisson is None:
+        raise ImportError("pip install scipy --break-system-packages")
+    import math
+
+    log = pull_official_pitcher_game_log(pitcher_id, season)
+    if log.empty or len(log) < min_games_before + 1:
+        return pd.DataFrame()
+
+    log = log.reset_index(drop=True)
+    rows = []
+    for i in range(min_games_before, len(log)):
+        prior = log.iloc[:i] if window_games is None else log.iloc[max(0, i - window_games):i]
+        if len(prior) < min_games_before:
+            continue
+        prior_vals = [_pitcher_official_row_target(r, prop_type) for _, r in prior.iterrows()]
+        mu = sum(prior_vals) / len(prior_vals)
+        p_over = 1 - _poisson.cdf(math.floor(line), mu)
+        actual_value = _pitcher_official_row_target(log.iloc[i], prop_type)
+        predicted_over = p_over >= 0.5
+        actual_over = actual_value > line
+        rows.append({
+            "game_date": log.iloc[i]["game_date"], "games_used": len(prior),
+            "mu": round(mu, 2), "line": line, "p_over": round(p_over, 3),
+            "edge": round(abs(p_over - 0.5), 3),
+            "predicted": "OVER" if predicted_over else "UNDER",
+            "actual_value": actual_value, "actual": "OVER" if actual_over else "UNDER",
+            "hit": predicted_over == actual_over,
+        })
+    return pd.DataFrame(rows)
+
+
+def backtest_hitter_official_prop_walk_forward(batter_id: int, prop_type: str, line: float,
+                                                  season: int, min_games_before: int = 15,
+                                                  window_games: int = None) -> pd.DataFrame:
+    """Hitter mirror of backtest_pitcher_official_prop_walk_forward() -
+    Hits+Runs+RBI, Fantasy, and Stolen Bases, all real Poisson-appropriate
+    counts (unlike Win), sourced from pull_official_hitter_game_log."""
+    if _poisson is None:
+        raise ImportError("pip install scipy --break-system-packages")
+    import math
+
+    log = pull_official_hitter_game_log(batter_id, season)
+    if log.empty or len(log) < min_games_before + 1:
+        return pd.DataFrame()
+
+    log = log.reset_index(drop=True)
+    rows = []
+    for i in range(min_games_before, len(log)):
+        prior = log.iloc[:i] if window_games is None else log.iloc[max(0, i - window_games):i]
+        if len(prior) < min_games_before:
+            continue
+        prior_vals = [_hitter_official_row_target(r, prop_type) for _, r in prior.iterrows()]
+        mu = sum(prior_vals) / len(prior_vals)
+        p_over = 1 - _poisson.cdf(math.floor(line), mu)
+        actual_value = _hitter_official_row_target(log.iloc[i], prop_type)
+        predicted_over = p_over >= 0.5
+        actual_over = actual_value > line
+        rows.append({
+            "game_date": log.iloc[i]["game_date"], "games_used": len(prior),
+            "mu": round(mu, 2), "line": line, "p_over": round(p_over, 3),
+            "edge": round(abs(p_over - 0.5), 3),
+            "predicted": "OVER" if predicted_over else "UNDER",
+            "actual_value": actual_value, "actual": "OVER" if actual_over else "UNDER",
+            "hit": predicted_over == actual_over,
+        })
+    return pd.DataFrame(rows)
+
+
+def backtest_pitcher_win_walk_forward(pitcher_id: int, season: int,
+                                        min_games_before: int = 8, window_games: int = None) -> pd.DataFrame:
+    """Real walk-forward validation for Win specifically - rolling WIN
+    RATE (mean of prior real 0/1 results), NOT Poisson, matching the live
+    scanner's own confirmed-correct design (a Poisson fit understates a
+    bounded binary outcome's true rate). Predicts OVER a 0.5 line when
+    the rolling win rate is above 50%, checks against the real result."""
+    log = pull_official_pitcher_game_log(pitcher_id, season)
+    if log.empty or len(log) < min_games_before + 1:
+        return pd.DataFrame()
+
+    log = log.reset_index(drop=True)
+    rows = []
+    for i in range(min_games_before, len(log)):
+        prior = log.iloc[:i] if window_games is None else log.iloc[max(0, i - window_games):i]
+        if len(prior) < min_games_before:
+            continue
+        win_rate = prior["win"].mean()
+        predicted_over = win_rate > 0.5
+        actual_value = log.iloc[i]["win"]
+        actual_over = actual_value > 0.5
+        rows.append({
+            "game_date": log.iloc[i]["game_date"], "games_used": len(prior),
+            "mu": round(win_rate, 3), "line": 0.5, "p_over": round(win_rate, 3),
+            "edge": round(abs(win_rate - 0.5), 3),
+            "predicted": "OVER" if predicted_over else "UNDER",
+            "actual_value": actual_value, "actual": "OVER" if actual_over else "UNDER",
+            "hit": predicted_over == actual_over,
+        })
+    return pd.DataFrame(rows)
