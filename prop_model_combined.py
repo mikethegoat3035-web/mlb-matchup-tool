@@ -5922,7 +5922,8 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
                               teams: list = None, max_pitchers: int = 20, max_hitters: int = 40,
                               pitcher_lines: dict = None, hitter_lines: dict = None,
                               min_edge: float = 0.0, min_games_before_pitcher: int = 8,
-                              min_games_before_hitter: int = 15, window_games: int = None) -> dict:
+                              min_games_before_hitter: int = 15, window_games: int = None,
+                              min_avg_outs_per_game: float = 10.0) -> dict:
     """
     Season-wide walk-forward validation, real players pulled from real
     team rosters (get_team_roster_pitchers/get_team_roster_batters) -
@@ -5937,9 +5938,24 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
 
     min_edge: optional filter - only counts graded games where p_over was
     at least this far from a coinflip (0.0 = count every graded game,
-    matching "does mu predict at all"; raise this, e.g. to 0.20, to test
-    the SAME "best possible calls only" question already answered for the
-    NFL model - does restricting to real-edge games improve the hit rate).
+    matching "does mu predict at all"; raise this, e.g. to 0.20-0.25, to
+    test the SAME "best possible calls only" question already answered
+    for the NFL model - does restricting to real-edge games improve the
+    hit rate).
+
+    min_avg_outs_per_game: real fix for a sample-quality issue - the
+    pitcher lines (Outs 15.5, Strikeouts 5.5) are calibrated for STARTERS.
+    Pulling a whole roster pulls relievers too, and a reliever averaging
+    3 outs/appearance will ALWAYS correctly grade "UNDER" (his real mu is
+    always far below the line, and his real results are too) - not a
+    meaningful test, just an easy call that inflates the hit rate with
+    noise. Checked against the pitcher's OWN real season-long average
+    outs per appearance (not a role label, so it doesn't depend on
+    guessing who's "officially" a starter) BEFORE he counts toward
+    max_pitchers - a filtered-out reliever doesn't eat into your budget,
+    so you don't need to inflate max_pitchers just to compensate. Default
+    10.0 (~3.1 real innings/appearance) is a reasonable real-world cutoff;
+    raise it (15+) for a stricter true-starters-only sample.
 
     Returns overall + per-prop-type hit rate, mirroring the NFL league-
     wide scan's output shape. This makes real network calls per player -
@@ -5967,6 +5983,13 @@ def backtest_full_season_mlb(season: int, season_start: str = None, season_end: 
         for p in roster:
             if pitcher_count >= max_pitchers:
                 break
+            try:
+                full_log = pull_pitcher_game_log(p["player_id"], s_start, s_end)
+            except Exception as e:
+                errors.append(f"{p['name']} game log pull failed: {e}")
+                continue
+            if full_log.empty or full_log["outs"].mean() < min_avg_outs_per_game:
+                continue  # likely reliever, or too few real appearances - skip, doesn't consume the budget
             pitcher_count += 1
             for prop_type, line in p_lines.items():
                 try:
