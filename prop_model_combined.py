@@ -2357,14 +2357,25 @@ def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
                 "weighted_usage_counted": 0.0}
 
     if prop_type == "hitter_fantasy":
-        parts = [hitter_prop_vulnerability_score(crosswalk_df, p, low_sample_threshold, lineup_protection)
-                 for p in ("hits", "total_bases", "hitter_hits_runs_rbi")]
-        scores = [p["score"] for p in parts if p["score"] is not None]
+        parts = {p: hitter_prop_vulnerability_score(crosswalk_df, p, low_sample_threshold, lineup_protection)
+                 for p in ("hits", "total_bases", "hitter_hits_runs_rbi")}
+        scores = [p["score"] for p in parts.values() if p["score"] is not None]
         if not scores:
-            return {"score": None, "label": "Not enough data to score.", "weighted_usage_counted": 0.0}
+            return {"score": None, "label": "Not enough data to score.", "weighted_usage_counted": 0.0,
+                    "component_scores": {}}
+        # component_scores exposed here now, matching pitcher_fantasy's
+        # existing pattern (see pitcher_prop_mu_quality_score) - previously
+        # this blend only returned the final flattened number, hiding
+        # whether it was contact rate, power, or RBI/runs driving the
+        # score. Equal-weighted average, same as before - real Underdog
+        # point values aren't equal across these three (a HR is worth far
+        # more than a single), which is a legitimate open question, but
+        # not one to guess new weights for without real validation data;
+        # that's what the not-yet-built season backtest is for.
         return {"score": round(sum(scores) / len(scores), 2),
                 "label": "Blended from hits/power/rbi(+lineup-protection) sub-scores (fantasy combines all three).",
-                "weighted_usage_counted": None}
+                "weighted_usage_counted": None,
+                "component_scores": {k: v["score"] for k, v in parts.items()}}
 
     if prop_type == "hitter_hits_runs_rbi":
         matchup = crosswalk_vulnerability_score(crosswalk_df, low_sample_threshold)
@@ -3832,8 +3843,14 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
     p_lines_default = pitcher_lines or {"outs": 15.5, "strikeouts": 5.5,
                                           "walks_allowed": 1.5, "hits_allowed": 5.5}
-    h_lines_default = hitter_lines or {"hits": 0.5, "singles": 0.5,
-                                         "total_bases": 1.5, "home_runs": 0.5}
+    # "hits" and "home_runs" deliberately removed from the standalone scan
+    # rows - 0.5 Hits is almost always priced at a real premium (near-
+    # certain outcome, bad number to bet regardless of true probability),
+    # and Home Runs rarely produces a sample-backed real edge. "hits" is
+    # still used internally as one of the 3 hitter_fantasy blend
+    # ingredients (see hitter_prop_vulnerability_score) - only removed as
+    # its OWN scanned betting line here, not from the fantasy math.
+    h_lines_default = hitter_lines or {"singles": 0.5, "total_bases": 1.5}
     p_official_lines_default = {"pitcher_earned_runs": 2.5, "pitcher_fantasy": 18.5, "pitcher_win": 0.5}
     h_official_lines_default = {"hitter_hits_runs_rbi": 1.5, "hitter_fantasy": 8.5, "hitter_stolen_bases": 0.5}
     stat_map = book_stat_map or DEFAULT_BOOK_STAT_MAP
@@ -3948,6 +3965,21 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                     for _, prow in probs.iterrows():
                         prop_quality = pitcher_prop_mu_quality_score(
                             pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, prow["stat"])
+                        # Same transparency gap fixed on the hitter side, pre-existing
+                        # here too (not new this session) - pitcher_prop_mu_quality_score
+                        # already returns either component_scores (pitcher_fantasy's
+                        # K/Outs/ER breakdown) or own_stuff_score/lineup_verification_score
+                        # (every other prop's "his own stuff" vs "does tonight's real
+                        # lineup back it up" split) - neither ever reached the output row.
+                        if "component_scores" in prop_quality:
+                            comp_str = ", ".join(f"{k}:{v:.0f}" for k, v in prop_quality["component_scores"].items()
+                                                  if v is not None)
+                        elif prop_quality.get("own_stuff_score") is not None:
+                            comp_str = f"Own Stuff:{prop_quality['own_stuff_score']:.0f}"
+                            if prop_quality.get("lineup_verification_score") is not None:
+                                comp_str += f", Lineup Check:{prop_quality['lineup_verification_score']:.0f}"
+                        else:
+                            comp_str = None
                         rows.append({
                             "side": "pitcher", "prop_type": prow["stat"],
                             "player": pitcher_name,
@@ -3955,6 +3987,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             "line": prow["line"], "mu": prow["recent_avg"],
                             "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
                             "quality_score": prop_quality["score"], "quality_label": prop_quality["label"],
+                            "quality_components": comp_str,
                             "line_source": "live" if prow["stat"] in p_matched else "default",
                             "game_pk": game_pk,
                         })
@@ -3973,6 +4006,15 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                 full_stat = "pitcher_" + prow["stat"]
                                 prop_quality = pitcher_prop_mu_quality_score(
                                     pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, full_stat)
+                                if "component_scores" in prop_quality:
+                                    comp_str = ", ".join(f"{k}:{v:.0f}" for k, v in prop_quality["component_scores"].items()
+                                                          if v is not None)
+                                elif prop_quality.get("own_stuff_score") is not None:
+                                    comp_str = f"Own Stuff:{prop_quality['own_stuff_score']:.0f}"
+                                    if prop_quality.get("lineup_verification_score") is not None:
+                                        comp_str += f", Lineup Check:{prop_quality['lineup_verification_score']:.0f}"
+                                else:
+                                    comp_str = None
                                 rows.append({
                                     "side": "pitcher", "prop_type": full_stat,
                                     "player": pitcher_name,
@@ -3980,6 +4022,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                     "line": prow["line"], "mu": prow["recent_avg"],
                                     "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
                                     "quality_score": prop_quality["score"], "quality_label": prop_quality["label"],
+                                    "quality_components": comp_str,
                                     "line_source": "live" if full_stat in p_official_matched else "default",
                                     "game_pk": game_pk,
                                 })
@@ -4017,6 +4060,14 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                 # THIS prop, i.e. good for the hitter's over — quality_score HIGH.
                                 h_quality = (None if vuln["score"] is None
                                              else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
+                                # Surfaces the hitter_fantasy component breakdown added
+                                # this session - previously computed but never reached
+                                # the actual output row, so it was invisible in the scan
+                                # results despite being in the return dict. Blank for
+                                # every other prop_type (vuln.get returns None for those).
+                                comps = vuln.get("component_scores")
+                                comp_str = (", ".join(f"{k}:{v:.0f}" for k, v in comps.items() if v is not None)
+                                            if comps else None)
                                 rows.append({
                                     "side": "hitter", "prop_type": hrow["stat"],
                                     "player": hitter_name, "team": game.get(opp_name_col, "?"),
@@ -4024,6 +4075,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                     "line": hrow["line"], "mu": hrow["recent_avg"],
                                     "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
                                     "quality_score": h_quality, "quality_label": vuln["label"],
+                                    "quality_components": comp_str,
                                     "line_source": "live" if hrow["stat"] in h_matched else "default",
                                     "game_pk": game_pk,
                                 })
@@ -4042,6 +4094,9 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                                                                 lineup_protection=lineup_protection)
                                         h_quality = (None if vuln["score"] is None
                                                      else max(0.0, min(100.0, round(50 - vuln["score"] * 15, 1))))
+                                        comps = vuln.get("component_scores")
+                                        comp_str = (", ".join(f"{k}:{v:.0f}" for k, v in comps.items() if v is not None)
+                                                    if comps else None)
                                         rows.append({
                                             "side": "hitter", "prop_type": full_stat,
                                             "player": hitter_name, "team": game.get(opp_name_col, "?"),
@@ -4049,6 +4104,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                             "line": hrow["line"], "mu": hrow["recent_avg"],
                                             "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
                                             "quality_score": h_quality, "quality_label": vuln["label"],
+                                            "quality_components": comp_str,
                                             "line_source": "live" if full_stat in h_official_matched else "default",
                                             "game_pk": game_pk,
                                         })
