@@ -275,6 +275,10 @@ bt_min_avg_outs = st.slider(
          "true-starters-only sample. Checked against each pitcher's own real season average, "
          "not a role label - and filtered-out relievers don't eat into 'Max pitchers to test'.")
 
+bt_include_official = st.checkbox(
+    "Also test Earned Runs, Win, both Fantasy scores, H+R+RBI, and Stolen Bases "
+    "(official box-score data — roughly doubles scan time)", value=True, key="bt_include_official")
+
 if st.button("Run season backtest", key="bt_run_btn"):
     teams_list = [t.strip() for t in bt_teams_raw.split(",") if t.strip()] or None
     window = int(bt_window) if bt_window > 0 else None
@@ -286,6 +290,7 @@ if st.button("Run season backtest", key="bt_run_btn"):
                 max_pitchers=int(bt_max_pitchers), max_hitters=int(bt_max_hitters),
                 min_edge=float(bt_min_edge), window_games=window,
                 min_avg_outs_per_game=float(bt_min_avg_outs),
+                include_official_props=bt_include_official,
             )
             st.session_state.bt_result = result
         except Exception as e:
