@@ -172,14 +172,14 @@ if "qm_slate" in st.session_state:
         view2 = view2[view2["side"] == side_pick.lower()]
     view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
-    edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score"]
+    edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score", "quality_components"]
     edit_cols = [c for c in edit_cols if c in view2.columns]
     edit_df = view2[edit_cols].reset_index(drop=True)
 
     edited = st.data_editor(
         edit_df,
         column_config={"line": st.column_config.NumberColumn("Line", step=0.5)},
-        disabled=["side", "player", "team", "prop_type", "mu", "quality_score"],
+        disabled=["side", "player", "team", "prop_type", "mu", "quality_score", "quality_components"],
         use_container_width=True,
         key="be_edit_table",
     )
@@ -194,6 +194,7 @@ if "qm_slate" in st.session_state:
             "p_over": p_over, "edge": abs(p_over - 0.5),
             "lean": "OVER" if p_over > 0.5 else "UNDER",
             "quality_score": row["quality_score"],
+            "quality_components": row.get("quality_components"),
         })
     final_df = pd.DataFrame(results).sort_values("edge", ascending=False)
 
