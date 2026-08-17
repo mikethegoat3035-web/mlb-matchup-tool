@@ -3883,6 +3883,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
         return pd.DataFrame([{"note": "No games found for today."}])
     if max_games:
         games = games.head(max_games)
+    dh_labels = build_doubleheader_labels(games)
 
     rows = []
     seen_pitcher_ids = set()
@@ -3993,7 +3994,9 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             comp_str = None
                         rows.append({
                             "side": "pitcher", "prop_type": prow["stat"],
-                            "player": pitcher_name,
+                            "player": (f"{pitcher_name} ({dh_labels.get(game_pk)})"
+                                       if dh_labels.get(game_pk) else pitcher_name),
+                            "game_number": dh_labels.get(game_pk, ""),
                             "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                             "line": prow["line"], "mu": prow["recent_avg"],
                             "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
@@ -4028,7 +4031,9 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                     comp_str = None
                                 rows.append({
                                     "side": "pitcher", "prop_type": full_stat,
-                                    "player": pitcher_name,
+                                    "player": (f"{pitcher_name} ({dh_labels.get(game_pk)})"
+                                               if dh_labels.get(game_pk) else pitcher_name),
+                                    "game_number": dh_labels.get(game_pk, ""),
                                     "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                                     "line": prow["line"], "mu": prow["recent_avg"],
                                     "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
@@ -4081,7 +4086,10 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                             if comps else None)
                                 rows.append({
                                     "side": "hitter", "prop_type": hrow["stat"],
-                                    "player": hitter_name, "team": game.get(opp_name_col, "?"),
+                                    "player": (f"{hitter_name} ({dh_labels.get(game_pk)})"
+                                               if dh_labels.get(game_pk) else hitter_name),
+                                    "game_number": dh_labels.get(game_pk, ""),
+                                    "team": game.get(opp_name_col, "?"),
                                     "opponent": game.get(own_name_col, "?"),
                                     "line": hrow["line"], "mu": hrow["recent_avg"],
                                     "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
@@ -4110,7 +4118,10 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                                     if comps else None)
                                         rows.append({
                                             "side": "hitter", "prop_type": full_stat,
-                                            "player": hitter_name, "team": game.get(opp_name_col, "?"),
+                                            "player": (f"{hitter_name} ({dh_labels.get(game_pk)})"
+                                                       if dh_labels.get(game_pk) else hitter_name),
+                                            "game_number": dh_labels.get(game_pk, ""),
+                                            "team": game.get(opp_name_col, "?"),
                                             "opponent": game.get(own_name_col, "?"),
                                             "line": hrow["line"], "mu": hrow["recent_avg"],
                                             "p_over": hrow["p_over"], "games_sampled": hrow["games_sampled"],
@@ -5704,128 +5715,6 @@ def merge_book_lines_into_slate(slate_df: pd.DataFrame, book_lines: pd.DataFrame
     slate_df["book_line"] = slate_df.apply(
         lambda r: lookup.get((r["player"], r["prop_type"]), pd.NA), axis=1)
     return slate_df
-
-
-if __name__ == "__main__":
-    from datetime import datetime, timedelta
-
-    print("=" * 60)
-    print("MLB MATCHUP TOOL")
-    print("=" * 60)
-
-    p_last = input("Pitcher last name: ").strip()
-    p_first = input("Pitcher first name: ").strip()
-    team_query = input("Opponent team (e.g. 'Yankees'), or leave blank to paste lineup manually: ").strip()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    recent_start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-    season_start = "2026-03-27"
-
-    print(f"\nLooking up {p_first} {p_last}...")
-    pid = get_pitcher_id(p_last, p_first)
-    print("Pulling pitcher data (this can take a minute)...")
-    pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, recent_start, today))
-    pitcher_season = build_arsenal_profile(pull_pitcher_pitches(pid, season_start, today))
-
-    print(f"\n{p_first} {p_last}'s arsenal (last 30 days):")
-    print(f"{'Pitch':<6}{'Hand':<6}{'N':<6}{'Usage%':<8}{'Zone%':<8}{'Chase%':<8}"
-          f"{'Whiff%':<8}{'CSW%':<8}")
-    for p in sorted(pitcher_recent, key=lambda x: -x.usage_pct):
-        print(f"{p.pitch_type:<6}{p.vs_hand:<6}{p.n_pitches:<6}{p.usage_pct:<8}"
-              f"{p.zone_pct:<8}{p.chase_pct:<8}{p.whiff_pct:<8}{p.csw_pct:<8}")
-
-    print(f"\nProp lean for {p_first} {p_last} (heuristic, not a calibrated prediction —")
-    print("this part doesn't need a confirmed lineup, it's pitcher-only data):")
-    print(pitcher_prop_lean(pitcher_recent))
-
-    # --- Try automatic team/lineup lookup first ---
-    candidates_by_hand = {"L": [], "R": []}
-    used_manual = False
-
-    if team_query:
-        try:
-            print(f"\nLooking up today's game for a team matching '{team_query}'...")
-            game_info = find_todays_game_by_team(team_query)
-            game_pk = game_info["game_pk"]
-            # Which side is the PITCHER'S team on? We don't know for sure from
-            # team_query alone (that's the OPPONENT) — the pitcher's side is
-            # whichever side team_query is NOT on.
-            pitching_side = "away" if game_info["team_side"] == "home" else "home"
-
-            print("Checking if the lineup is confirmed yet...")
-            lineup_check = pull_confirmed_lineup(game_pk)
-            if lineup_check["lineup_status"] != "confirmed":
-                print("\nLineup not confirmed yet — this usually posts 2-4 hours before")
-                print("first pitch. Pitcher-only props above are still valid; check back")
-                print("closer to game time for hitter matchups, or paste a lineup manually below.")
-                team_query = ""  # fall through to manual paste option
-            else:
-                print("Lineup confirmed — pulling and scoring all batters automatically...")
-                rankings = run_lineup_matchup_report(game_pk, pitching_side, season_start)
-                print("\n" + "=" * 60)
-                print(f"HITTER RANKINGS vs {p_first} {p_last} (auto-pulled lineup)")
-                print("=" * 60)
-                print(rankings.to_string(index=False))
-                used_manual = None  # signal: fully automatic path succeeded
-        except Exception as e:
-            print(f"\nAuto-lookup failed ({e}) — falling back to manual lineup paste.")
-            team_query = ""
-
-    # --- Manual paste fallback (or if no team was given) ---
-    if used_manual is not None and not team_query:
-        print("\nPaste the expected lineup — one hitter per line, format:")
-        print("  LastName,FirstName,Hand   (Hand is L or R)")
-        print("Example:  Judge,Aaron,R")
-        print("Type each line and press Enter. Press Enter on a BLANK line when done.")
-        print("(Or just press Enter now to skip hitter matchups entirely.)\n")
-
-        lineup_input = []
-        while True:
-            line = input().strip()
-            if not line:
-                break
-            parts = [x.strip() for x in line.split(",")]
-            if len(parts) != 3:
-                print(f"  (skipped '{line}' — needs exactly LastName,FirstName,Hand)")
-                continue
-            lineup_input.append(parts)
-
-        if lineup_input:
-            print(f"\nPulling data for {len(lineup_input)} hitters — this will take a few minutes...")
-            for last, first, hand in lineup_input:
-                try:
-                    print(f"  {first} {last}...")
-                    bid = get_batter_id(last, first)
-                    h_recent = build_hitter_profile(pull_batter_pitches(bid, recent_start, today))
-                    h_season = build_hitter_profile(pull_batter_pitches(bid, season_start, today))
-                    recent_n = sum(p.n_pitches for p in h_recent) or 1
-                    recent_xwoba = (sum(p.xwoba * p.n_pitches for p in h_recent if pd.notna(p.xwoba)) / recent_n
-                                    if h_recent else 0.320)
-                    season_xwoba = (sum(p.xwoba for p in h_season if pd.notna(p.xwoba)) / max(len(h_season), 1)
-                                    if h_season else 0.320)
-                    candidates_by_hand[hand].append(HitterCandidate(
-                        name=f"{first} {last}", hitter_recent=h_recent, hitter_season=h_season,
-                        recent_n_overall=recent_n, recent_xwoba_overall=recent_xwoba,
-                        season_xwoba_overall=season_xwoba,
-                    ))
-                except Exception as e:
-                    print(f"    (skipped {first} {last} — {e})")
-
-            print("\n" + "=" * 60)
-            print(f"HITTER RANKINGS vs {p_first} {p_last} (manual lineup)")
-            print("=" * 60)
-            for hand, candidates in candidates_by_hand.items():
-                if not candidates:
-                    continue
-                print(f"\n--- {'Left-handed' if hand == 'L' else 'Right-handed'} hitters ---")
-                rankings = screen_hitters(pitcher_recent, pitcher_season, candidates, batter_hand=hand)
-                print(rankings.to_string(index=False))
-
-    print("\nNote: matchup_xba and est_hit_probability are shrunk, exposure-weighted")
-    print("estimates — not yet backtested against real outcomes for this pitcher/hitters.")
-    print("Run the calibration_check() workflow (Section 4) before trusting this over")
-    print("a real sportsbook/Underdog line.")
-
 
 # =============================================================================
 # SECTION 5 — WALK-FORWARD BACKTEST (validates the Poisson mu itself, not
