@@ -5058,6 +5058,39 @@ def pull_todays_games(date: str = None) -> pd.DataFrame:
     return pd.DataFrame(games)
 
 
+def build_doubleheader_labels(games_df: pd.DataFrame) -> dict:
+    """
+    Maps game_pk -> a human label like "Game 1" / "Game 2" for a real
+    doubleheader, "" for a normal single game that day. Built from the
+    fields MLB-StatsAPI's schedule() documents returning - 'doubleheader'
+    ('Y' for a traditional split doubleheader, 'S' for a single-admission
+    straight doubleheader, 'N' otherwise) and 'game_num' (1 or 2).
+
+    Honesty note: this environment has no live network access, so this
+    hasn't been run against a real doubleheader date to confirm those
+    exact field names/values come back as documented. If labels don't
+    show up correctly the first time this runs on a real doubleheader
+    day, check games_df.columns directly (print or inspect a raw row)
+    and adjust the field names here - the logic itself (map game_pk to
+    a "Game N" label) is straightforward once the real field names are
+    confirmed live.
+    """
+    labels = {}
+    if games_df is None or games_df.empty:
+        return labels
+    for _, g in games_df.iterrows():
+        game_pk = g.get("game_id")
+        if game_pk is None:
+            continue
+        dh_flag = g.get("doubleheader")
+        game_num = g.get("game_num")
+        if dh_flag in ("Y", "S") and str(game_num) in ("1", "2"):
+            labels[game_pk] = f"Game {game_num}"
+        else:
+            labels[game_pk] = ""
+    return labels
+
+
 def get_unconfirmed_games_today(date: str = None) -> pd.DataFrame:
     """
     NEW: checks today's full MLB schedule and returns which games do NOT
@@ -5080,6 +5113,7 @@ def get_unconfirmed_games_today(date: str = None) -> pd.DataFrame:
     games = pull_todays_games(date=date)
     if games.empty:
         return pd.DataFrame()
+    dh_labels = build_doubleheader_labels(games)
 
     pending_rows = []
     for _, game in games.iterrows():
@@ -5097,6 +5131,7 @@ def get_unconfirmed_games_today(date: str = None) -> pd.DataFrame:
                 "home_team": game.get("home_name", "?"),
                 "away_team": game.get("away_name", "?"),
                 "game_time": game.get("game_datetime", "?"),
+                "game_number": dh_labels.get(game_pk, ""),
                 "lineup_status": status,
                 "game_pk": game_pk,
             })
