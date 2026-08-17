@@ -87,7 +87,7 @@ if "pending_games" in st.session_state:
         st.success("All of today's games have confirmed lineups. Nothing pending.")
     else:
         st.warning(f"{len(pending)} game(s) still missing a confirmed lineup:")
-        display_cols = ["away_team", "home_team", "game_time", "lineup_status"]
+        display_cols = ["away_team", "home_team", "game_number", "game_time", "lineup_status"]
         display_cols = [c for c in display_cols if c in pending.columns]
         st.dataframe(pending[display_cols], use_container_width=True, hide_index=True)
         st.caption("Rescan closer to first pitch for these specific games once their "
