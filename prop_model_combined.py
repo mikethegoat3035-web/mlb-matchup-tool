@@ -6757,8 +6757,14 @@ def backtest_quality_score_multi_pitcher(season: int, prop_type: str, teams: lis
     }
 
 
-HITTER_BACKTEST_PROPS = ["hits", "total_bases", "singles", "home_runs",
+HITTER_BACKTEST_PROPS = ["total_bases", "singles", "home_runs",
                           "hitter_hits_runs_rbi", "hitter_fantasy"]
+# 'hits' deliberately excluded as a STANDALONE testable/scannable prop -
+# real book pricing on it is consistently bad value (same real reasoning
+# that already pulled it from the live scan's standalone props earlier
+# this session). Still genuinely used as a real INPUT COMPONENT feeding
+# hitter_hits_runs_rbi and hitter_fantasy above - this only removes it as
+# something tested/offered on its own.
 PITCHER_BACKTEST_PROPS = ["strikeouts", "outs", "walks_allowed", "hits_allowed",
                            "pitcher_earned_runs", "pitcher_fantasy"]
 
