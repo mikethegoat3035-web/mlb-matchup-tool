@@ -28,6 +28,10 @@ from prop_model_combined import (
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
     match_book_line_to_player, get_unconfirmed_games_today,
     backtest_full_season_mlb, PITCHER_BACKTEST_LINES, HITTER_BACKTEST_LINES,
+    backtest_hitter_prop_quality_walk_forward, get_batter_id,
+    backtest_quality_score_multi_hitter,
+    backtest_pitcher_prop_quality_walk_forward, backtest_quality_score_multi_pitcher,
+    get_pitcher_id,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -235,11 +239,11 @@ st.caption("Pulls real players straight from real team rosters (no names to type
            "every real game each one played, computes what the model's mu WOULD have said "
            "using only games strictly BEFORE that one (no look-ahead), then checks it against "
            "what actually happened. This validates the Poisson mu itself - the foundation "
-           "every prop's probability sits on. It does NOT validate quality_score specifically "
-           "(that needs real historical lineups, which no source here provides for past games) "
-           "- a real, honest limit, not a bug. Makes real network calls per player, so this is "
-           "genuinely slow - start small (a couple of teams, low max counts) to confirm it runs "
-           "before scaling up.")
+           "every prop's probability sits on. It does NOT validate quality_score - the "
+           "'Quality-Score Backtest' section below does that specifically, separately, since "
+           "it needs a genuinely different (slower) real approach. Makes real network calls "
+           "per player, so this is genuinely slow - start small (a couple of teams, low max "
+           "counts) to confirm it runs before scaling up.")
 
 bt_col1, bt_col2, bt_col3 = st.columns(3)
 bt_season = bt_col1.number_input("Season", value=2026, step=1, key="bt_season")
@@ -335,3 +339,267 @@ if "bt_result" in st.session_state:
                     st.text(e)
                 if len(result["errors"]) > 50:
                     st.caption(f"...and {len(result['errors']) - 50} more.")
+
+
+# ---------------------------------------------------------------------------
+# Quality-Score Backtest — the REAL test of tonight's zone work
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("🎯 Quality-Score Backtest — does the zone/matchup work actually help?")
+st.caption(
+    "Genuinely different from the Season Backtest above, and genuinely slower — for EACH "
+    "real historical game tested, this pulls the batter's own real pitches AND the real "
+    "OPPOSING PITCHER's real pitches from before that specific game (walk-forward, no "
+    "look-ahead on either side), builds the real crosswalk with the same zone/attack-zone "
+    "data now wired into quality_score, and checks whether his actual result deviated from "
+    "his own raw average in the direction quality_score predicted. No external line needed - "
+    "same real logic that already proved out on the NFL side. This is the honest way to find "
+    "out whether tonight's changes actually help, rather than assuming they do. Real network "
+    "calls x2 per test game, so start with ONE player and a small number of test games."
+)
+
+qb_col1, qb_col2 = st.columns(2)
+qb_first_name = qb_col1.text_input("Batter first name", value="", key="qb_first_name")
+qb_last_name = qb_col2.text_input("Batter last name", value="", key="qb_last_name")
+qb_prop = st.selectbox("Prop to test", ["hits", "total_bases", "singles", "home_runs"], key="qb_prop")
+
+qb_col3, qb_col4, qb_col5 = st.columns(3)
+qb_season_start = qb_col3.text_input("Season start (YYYY-MM-DD)", value="2026-03-27", key="qb_season_start")
+qb_season_end = qb_col4.text_input("Season end / today (YYYY-MM-DD)", value="2026-08-17", key="qb_season_end")
+qb_max_games = qb_col5.number_input("Max test games (keep LOW - each one is 2 real network pulls)",
+                                     min_value=1, max_value=30, value=10, step=1, key="qb_max_games")
+
+qb_line = st.number_input("Line (only used to label OVER/UNDER context in the display - the "
+                           "real hit/miss test doesn't need it)", min_value=0.0, value=1.5,
+                           step=0.5, key="qb_line")
+
+if st.button("Run Quality-Score Backtest", type="primary", key="qb_run_btn"):
+    if not qb_first_name.strip() or not qb_last_name.strip():
+        st.warning("Enter both a first and last name first.")
+    else:
+        with st.spinner("Walk-forward testing quality_score - genuinely slow, real pulls on "
+                         "both sides per game..."):
+            try:
+                qb_player_id = get_batter_id(qb_last_name.strip(), qb_first_name.strip())
+                qb_result = backtest_hitter_prop_quality_walk_forward(
+                    batter_id=int(qb_player_id), prop_type=qb_prop, line=float(qb_line),
+                    season_start=qb_season_start, season_end=qb_season_end,
+                    max_test_games=int(qb_max_games),
+                )
+                st.session_state.qb_result = qb_result
+            except ValueError as e:
+                st.error(f"Couldn't find that player: {e}")
+            except Exception as e:
+                st.error(f"Quality-score backtest failed: {e}")
+
+if "qb_result" in st.session_state:
+    qb_res = st.session_state.qb_result
+    if qb_res.empty:
+        st.warning("No graded games came back — try a different player, a wider season window, "
+                   "or check that this player has enough real games in the range.")
+    elif "error" in qb_res.columns and qb_res["error"].notna().any() and "hit" not in qb_res.columns:
+        st.error("Every test game errored out — see the raw output below.")
+        st.dataframe(qb_res, use_container_width=True)
+    else:
+        graded = qb_res[qb_res["hit"].notna()] if "hit" in qb_res.columns else pd.DataFrame()
+        if graded.empty:
+            st.warning("No graded games — every test point either errored or had no usable "
+                       "quality_score. See raw output below.")
+        else:
+            hit_rate = graded["hit"].mean()
+            st.success(f"{len(graded)} real graded games — {int(graded['hit'].sum())}/{len(graded)} "
+                      f"hit ({hit_rate*100:.0f}%). 50% is the real coinflip baseline.")
+            st.dataframe(graded, use_container_width=True, hide_index=True)
+        if "error" in qb_res.columns and qb_res["error"].notna().any():
+            with st.expander(f"{qb_res['error'].notna().sum()} game(s) errored during the run"):
+                st.dataframe(qb_res[qb_res["error"].notna()], use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Quality-Score Backtest — multi-hitter version
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("🎯 Quality-Score Backtest — multiple real hitters, real rosters")
+st.caption(
+    "Same real test as above, but pulls hitters straight from real team rosters - no names to "
+    "type. Capped MUCH lower than the Season Backtest above on purpose: this needs a fresh "
+    "real pull of the opposing pitcher for EVERY test game, not one pull reused across a "
+    "whole season. 10 hitters x 5 games is already ~50-60 real network calls. Confirm the "
+    "single-player version above works cleanly before running this - and start small here too."
+)
+
+mq_col1, mq_col2, mq_col3 = st.columns(3)
+mq_season = mq_col1.number_input("Season", value=2026, step=1, key="mq_season")
+mq_prop = mq_col2.selectbox("Prop to test", ["hits", "total_bases", "singles", "home_runs"], key="mq_prop")
+mq_max_hitters = mq_col3.number_input("Max hitters (keep LOW)", min_value=1, max_value=30,
+                                       value=10, step=1, key="mq_max_hitters")
+
+mq_col4, mq_col5 = st.columns(2)
+mq_games_per_hitter = mq_col4.number_input("Test games per hitter (keep LOW)", min_value=1,
+                                            max_value=15, value=5, step=1, key="mq_games_per_hitter")
+mq_teams_raw = mq_col5.text_input("Teams (comma-separated, blank = all 30 - NOT recommended "
+                                   "at this cost)", value="yankees, dodgers", key="mq_teams_raw")
+
+if st.button("Run Multi-Hitter Quality-Score Backtest", type="primary", key="mq_run_btn"):
+    mq_teams_list = [t.strip() for t in mq_teams_raw.split(",") if t.strip()] or None
+    est_calls = int(mq_max_hitters) * int(mq_games_per_hitter) + int(mq_max_hitters)
+    with st.spinner(f"Walk-forward testing real quality_score across real hitters - roughly "
+                     f"{est_calls} real network calls, this will genuinely take a while..."):
+        try:
+            mq_result = backtest_quality_score_multi_hitter(
+                season=int(mq_season), prop_type=mq_prop, teams=mq_teams_list,
+                max_hitters=int(mq_max_hitters), max_test_games_per_hitter=int(mq_games_per_hitter),
+            )
+            st.session_state.mq_result = mq_result
+        except Exception as e:
+            st.error(f"Multi-hitter quality-score backtest failed: {e}")
+
+if "mq_result" in st.session_state:
+    mq_res = st.session_state.mq_result
+    if mq_res["total_graded"] == 0:
+        st.warning("No graded games came back - try different teams, or check the errors "
+                   "expander below.")
+    else:
+        st.success(f"Tested {mq_res['hitters_tested']} real hitters — {mq_res['total_graded']} "
+                  f"real graded games total.")
+        st.metric("Overall hit rate", f"{mq_res['overall_hit_rate']*100:.1f}%"
+                  if mq_res['overall_hit_rate'] is not None else "N/A")
+        st.caption("50% is the real coinflip baseline — meaningfully above that across a real "
+                   "sample is genuine evidence the zone/matchup work is adding something real.")
+        if not mq_res["by_player"].empty:
+            by_player_display = mq_res["by_player"].copy()
+            by_player_display["hit_rate"] = (by_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
+            st.dataframe(by_player_display.sort_values("graded", ascending=False),
+                        use_container_width=True, hide_index=True)
+        if mq_res["errors"]:
+            with st.expander(f"⚠️ {len(mq_res['errors'])} error(s) during the run"):
+                for e in mq_res["errors"][:50]:
+                    st.text(e)
+
+
+# ---------------------------------------------------------------------------
+# Quality-Score Backtest — PITCHER side (new)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("⚾ Quality-Score Backtest — Pitcher props")
+st.caption(
+    "Same real walk-forward idea, pitcher side. Real, honest scope limit: this tests his own "
+    "stuff quality (now including real zone execution) predicting his own results — it does "
+    "NOT include the live scan's lineup-verification half (checking whether tonight's real "
+    "opponents match his stuff's tendency), since no real source here provides a confirmed "
+    "historical lineup for a past game. A real, meaningful test of half the live picture, not "
+    "the whole thing. pitcher_earned_runs isn't testable here — no reliable real per-game "
+    "source for it."
+)
+
+pb_col1, pb_col2 = st.columns(2)
+pb_first_name = pb_col1.text_input("Pitcher first name", value="", key="pb_first_name")
+pb_last_name = pb_col2.text_input("Pitcher last name", value="", key="pb_last_name")
+pb_prop = st.selectbox("Prop to test", ["strikeouts", "outs", "walks_allowed", "hits_allowed"], key="pb_prop")
+
+pb_col3, pb_col4, pb_col5 = st.columns(3)
+pb_season_start = pb_col3.text_input("Season start (YYYY-MM-DD)", value="2026-03-27", key="pb_season_start")
+pb_season_end = pb_col4.text_input("Season end / today (YYYY-MM-DD)", value="2026-08-17", key="pb_season_end")
+pb_max_games = pb_col5.number_input("Max test games (keep LOW)", min_value=1, max_value=30,
+                                     value=10, step=1, key="pb_max_games")
+
+if st.button("Run Pitcher Quality-Score Backtest", type="primary", key="pb_run_btn"):
+    if not pb_first_name.strip() or not pb_last_name.strip():
+        st.warning("Enter both a first and last name first.")
+    else:
+        with st.spinner("Walk-forward testing pitcher quality_score - real pulls, genuinely slow..."):
+            try:
+                pb_pitcher_id = get_pitcher_id(pb_last_name.strip(), pb_first_name.strip())
+                pb_result = backtest_pitcher_prop_quality_walk_forward(
+                    pitcher_id=int(pb_pitcher_id), prop_type=pb_prop,
+                    season_start=pb_season_start, season_end=pb_season_end,
+                    max_test_games=int(pb_max_games),
+                )
+                st.session_state.pb_result = pb_result
+            except ValueError as e:
+                st.error(f"Couldn't find that pitcher: {e}")
+            except Exception as e:
+                st.error(f"Pitcher quality-score backtest failed: {e}")
+
+if "pb_result" in st.session_state:
+    pb_res = st.session_state.pb_result
+    if pb_res.empty:
+        st.warning("No graded games came back — try a different pitcher or a wider season window.")
+    elif "error" in pb_res.columns and pb_res["error"].notna().any() and "hit" not in pb_res.columns:
+        st.error("Every test game errored out — see the raw output below.")
+        st.dataframe(pb_res, use_container_width=True)
+    else:
+        graded = pb_res[pb_res["hit"].notna()] if "hit" in pb_res.columns else pd.DataFrame()
+        if graded.empty:
+            st.warning("No graded games — see raw output below.")
+        else:
+            hit_rate = graded["hit"].mean()
+            st.success(f"{len(graded)} real graded games — {int(graded['hit'].sum())}/{len(graded)} "
+                      f"hit ({hit_rate*100:.0f}%). 50% is the real coinflip baseline.")
+            st.dataframe(graded, use_container_width=True, hide_index=True)
+        if "error" in pb_res.columns and pb_res["error"].notna().any():
+            with st.expander(f"{pb_res['error'].notna().sum()} game(s) errored during the run"):
+                st.dataframe(pb_res[pb_res["error"].notna()], use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Quality-Score Backtest — multi-pitcher version
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("⚾ Quality-Score Backtest — multiple real pitchers, real rosters")
+st.caption(
+    "Same real cost structure as the multi-hitter version — capped low on purpose. Filters "
+    "out relievers automatically (real avg outs/appearance check) so a 1-inning arm doesn't "
+    "inflate results with an easy, meaningless UNDER read."
+)
+
+mp_col1, mp_col2, mp_col3 = st.columns(3)
+mp_season = mp_col1.number_input("Season", value=2026, step=1, key="mp_season")
+mp_prop = mp_col2.selectbox("Prop to test", ["strikeouts", "outs", "walks_allowed", "hits_allowed"], key="mp_prop")
+mp_max_pitchers = mp_col3.number_input("Max pitchers (keep LOW)", min_value=1, max_value=30,
+                                        value=10, step=1, key="mp_max_pitchers")
+
+mp_col4, mp_col5 = st.columns(2)
+mp_games_per_pitcher = mp_col4.number_input("Test games per pitcher (keep LOW)", min_value=1,
+                                             max_value=15, value=5, step=1, key="mp_games_per_pitcher")
+mp_teams_raw = mp_col5.text_input("Teams (comma-separated, blank = all 30 - NOT recommended "
+                                   "at this cost)", value="yankees, dodgers", key="mp_teams_raw")
+
+if st.button("Run Multi-Pitcher Quality-Score Backtest", type="primary", key="mp_run_btn"):
+    mp_teams_list = [t.strip() for t in mp_teams_raw.split(",") if t.strip()] or None
+    est_calls = int(mp_max_pitchers) * int(mp_games_per_pitcher) + int(mp_max_pitchers)
+    with st.spinner(f"Walk-forward testing real pitchers - roughly {est_calls} real network "
+                     f"calls, this will genuinely take a while..."):
+        try:
+            mp_result = backtest_quality_score_multi_pitcher(
+                season=int(mp_season), prop_type=mp_prop, teams=mp_teams_list,
+                max_pitchers=int(mp_max_pitchers), max_test_games_per_pitcher=int(mp_games_per_pitcher),
+            )
+            st.session_state.mp_result = mp_result
+        except Exception as e:
+            st.error(f"Multi-pitcher quality-score backtest failed: {e}")
+
+if "mp_result" in st.session_state:
+    mp_res = st.session_state.mp_result
+    if mp_res["total_graded"] == 0:
+        st.warning("No graded games came back - try different teams, or check the errors "
+                   "expander below.")
+    else:
+        st.success(f"Tested {mp_res['pitchers_tested']} real pitchers — {mp_res['total_graded']} "
+                  f"real graded games total.")
+        st.metric("Overall hit rate", f"{mp_res['overall_hit_rate']*100:.1f}%"
+                  if mp_res['overall_hit_rate'] is not None else "N/A")
+        st.caption("50% is the real coinflip baseline — meaningfully above that across a real "
+                   "sample is genuine evidence the pitcher-side zone work is adding something real.")
+        if not mp_res["by_player"].empty:
+            by_player_display = mp_res["by_player"].copy()
+            by_player_display["hit_rate"] = (by_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
+            st.dataframe(by_player_display.sort_values("graded", ascending=False),
+                        use_container_width=True, hide_index=True)
+        if mp_res["errors"]:
+            with st.expander(f"⚠️ {len(mp_res['errors'])} error(s) during the run"):
+                for e in mp_res["errors"][:50]:
+                    st.text(e)
+
+
+
