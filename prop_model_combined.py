@@ -2302,6 +2302,15 @@ class HitterLocationProfile:
     whiff_pct: float
     xwoba: float
     hardhit_pct: float
+    # Same self-referential design as HitterZoneProfile - his OWN
+    # location-only reading vs his OWN overall (all-locations) reading
+    # for that hand. Added specifically to test the real hypothesis that
+    # a BROADER signal (hand+zone, collapsed across every pitch type he's
+    # seen) might separate real outcomes better than the pitch-specific
+    # version - bigger real sample per cell, less exposure to one
+    # specific pitch type's small-sample noise.
+    whiff_pct_delta: float = float("nan")
+    xwoba_delta: float = float("nan")
 
 
 def build_hitter_location_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[HitterLocationProfile]:
@@ -2322,6 +2331,26 @@ def build_hitter_location_profile(pitches: pd.DataFrame, min_pitches: int = 20) 
     again here, not the loosened one needed for the thinner slice.
     """
     pitches = add_attack_zones(pitches)
+    # Real per-hand baseline (all locations combined), computed once, for
+    # the self-referential deltas below - same pattern already validated
+    # on the pitch-specific version.
+    overall = {}
+    for p_hand, grp in pitches.groupby("p_throws"):
+        if len(grp) < min_pitches:
+            continue
+        swings = grp["description"].isin([
+            "swinging_strike", "swinging_strike_blocked", "foul",
+            "foul_tip", "hit_into_play",
+        ])
+        whiffs = grp["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+        overall_whiff = round((whiffs.sum() / max(swings.sum(), 1)) * 100, 1) if swings.sum() > 0 else float("nan")
+        terminal = grp[grp["events"].notna()]
+        overall_xwoba = (terminal.apply(
+            lambda r: r["estimated_woba_using_speedangle"]
+            if pd.notna(r["estimated_woba_using_speedangle"]) else r["woba_value"], axis=1).mean()
+            if len(terminal) > 0 else float("nan"))
+        overall[p_hand] = (overall_whiff, overall_xwoba)
+
     profiles = []
     for (p_hand, zone), grp in pitches.groupby(["p_throws", "attack_zone"]):
         n = len(grp)
@@ -2346,9 +2375,16 @@ def build_hitter_location_profile(pitches: pd.DataFrame, min_pitches: int = 20) 
         hardhit_pct = (round((in_play["launch_speed"] >= 95).mean() * 100, 1)
                        if len(in_play) > 0 and "launch_speed" in in_play else float("nan"))
 
+        base_whiff, base_xwoba = overall.get(p_hand, (float("nan"), float("nan")))
+        whiff_delta = (round(whiff_pct - base_whiff, 1)
+                       if pd.notna(whiff_pct) and pd.notna(base_whiff) else float("nan"))
+        xwoba_delta = (round(xwoba - base_xwoba, 3)
+                       if pd.notna(xwoba) and pd.notna(base_xwoba) else float("nan"))
+
         profiles.append(HitterLocationProfile(
             vs_pitcher_hand=p_hand, attack_zone=zone, n_pitches=n,
             swing_pct=swing_pct, whiff_pct=whiff_pct, xwoba=xwoba, hardhit_pct=hardhit_pct,
+            whiff_pct_delta=whiff_delta, xwoba_delta=xwoba_delta,
         ))
     return profiles
 
@@ -2665,12 +2701,53 @@ HITTER_PROP_VULN_METRICS = {
     # whiff blend as the best available proxy until that's built.
 }
 
+# Real, direct test of a real hypothesis: does the BROADER location-only
+# signal (hand+zone, collapsed across every pitch type, bigger real
+# sample per cell) separate real outcomes better than the pitch-specific
+# zone signal above? Same metric sets, only the zone-delta columns
+# swapped for their location-only equivalents. hardhit-delta isn't built
+# for the location-only profile yet, so total_bases/home_runs run with
+# one fewer real signal here than in the pitch-specific version — a real,
+# honest scope limit, not hidden.
+HITTER_PROP_VULN_METRICS_LOCATION_ONLY = {
+    "hits":       [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
+                    ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),
+                    ("hitter_location_only_whiff_delta", 0, 8.0, -1),
+                    ("hitter_location_only_xwoba_delta", 0, 0.06, 1)],
+    "singles":    [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
+                    ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),
+                    ("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.05, -1),
+                    ("hitter_location_only_whiff_delta", 0, 8.0, -1),
+                    ("hitter_location_only_xwoba_delta", 0, 0.06, 1)],
+    "total_bases": [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
+                      ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
+                      ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1),
+                      ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1),
+                      ("hitter_location_only_xwoba_delta", 0, 0.06, 1)],
+    "home_runs":  [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
+                    ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
+                    ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1),
+                    ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1),
+                    ("hitter_location_only_xwoba_delta", 0, 0.06, 1)],
+    "strikeouts": [("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),
+                    ("hitter_location_only_whiff_delta", 0, 8.0, -1)],
+}
+
 
 def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
                                      low_sample_threshold: int = 20,
-                                     lineup_protection: dict = None) -> dict:
+                                     lineup_protection: dict = None,
+                                     use_location_only: bool = False) -> dict:
     """
     Per-prop version of crosswalk_vulnerability_score().
+
+    use_location_only: real, direct test switch - when True, uses
+    HITTER_PROP_VULN_METRICS_LOCATION_ONLY (the broader hand+zone signal)
+    instead of the normal pitch-specific zone signal. False (default)
+    changes nothing about existing behavior.
 
     lineup_protection: optional output of lineup_protection_context(),
     computed ONCE per hitter by the caller (pulling season game logs for
@@ -2698,7 +2775,8 @@ def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
                 "weighted_usage_counted": 0.0}
 
     if prop_type == "hitter_fantasy":
-        parts = {p: hitter_prop_vulnerability_score(crosswalk_df, p, low_sample_threshold, lineup_protection)
+        parts = {p: hitter_prop_vulnerability_score(crosswalk_df, p, low_sample_threshold, lineup_protection,
+                                                     use_location_only)
                  for p in ("hits", "total_bases", "hitter_hits_runs_rbi")}
         scores = [p["score"] for p in parts.values() if p["score"] is not None]
         if not scores:
@@ -2733,7 +2811,8 @@ def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
         return {"score": blended, "label": f"{matchup['label']} | Lineup: {lineup_protection['label']}",
                 "weighted_usage_counted": matchup.get("weighted_usage_counted")}
 
-    metrics = HITTER_PROP_VULN_METRICS.get(prop_type)
+    metrics_source = HITTER_PROP_VULN_METRICS_LOCATION_ONLY if use_location_only else HITTER_PROP_VULN_METRICS
+    metrics = metrics_source.get(prop_type)
     if metrics is None:
         return crosswalk_vulnerability_score(crosswalk_df, low_sample_threshold)  # generic fallback
 
@@ -4556,8 +4635,16 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             def _location_xwoba(row):
                                 lp = location_by_zone.get((pitcher_hand, row.get("pitcher_primary_zone")))
                                 return lp.xwoba if lp else None
+                            def _location_whiff_delta(row):
+                                lp = location_by_zone.get((pitcher_hand, row.get("pitcher_primary_zone")))
+                                return lp.whiff_pct_delta if lp else None
+                            def _location_xwoba_delta(row):
+                                lp = location_by_zone.get((pitcher_hand, row.get("pitcher_primary_zone")))
+                                return lp.xwoba_delta if lp else None
                             crosswalk["hitter_location_only_whiff_pct"] = crosswalk.apply(_location_whiff, axis=1)
                             crosswalk["hitter_location_only_xwoba"] = crosswalk.apply(_location_xwoba, axis=1)
+                            crosswalk["hitter_location_only_whiff_delta"] = crosswalk.apply(_location_whiff_delta, axis=1)
+                            crosswalk["hitter_location_only_xwoba_delta"] = crosswalk.apply(_location_xwoba_delta, axis=1)
 
                         # Computed ONCE per hitter — reused across every prop row for him — since
                         # it needs two extra season-log pulls (the hitters batting immediately
@@ -6546,8 +6633,15 @@ def backtest_hitter_prop_quality_walk_forward(batter_id: int, prop_type: str, li
                                                 min_games_before: int = 15,
                                                 max_test_games: int = 10,
                                                 pitcher_lookback_days: int = 45,
-                                                top_n: int = 10) -> pd.DataFrame:
+                                                top_n: int = 10,
+                                                use_location_only: bool = False) -> pd.DataFrame:
     """
+    use_location_only: real, direct A/B test switch - passed straight
+    through to hitter_prop_vulnerability_score(). See that function's
+    docstring and HITTER_PROP_VULN_METRICS_LOCATION_ONLY for what this
+    actually changes (broader hand+zone signal vs the normal pitch-
+    specific one).
+
     The REAL test the mu-only walk-forward backtest above can't do: does
     quality_score (now including the zone/attack-zone work) actually
     predict something real, or is it just noise dressed up as signal.
@@ -6660,7 +6754,8 @@ def backtest_hitter_prop_quality_walk_forward(batter_id: int, prop_type: str, li
                 pitcher_arsenal, hitter_profile, batter_hand, opp_hand,
                 pitcher_zone_breakdown=pitcher_zone_breakdown,
                 hitter_zone_profile=hitter_zone_profile)
-            quality = hitter_prop_vulnerability_score(crosswalk, prop_type, low_sample_threshold=20)
+            quality = hitter_prop_vulnerability_score(crosswalk, prop_type, low_sample_threshold=20,
+                                                        use_location_only=use_location_only)
         except Exception as e:
             rows.append({"game_date": game_date, "error": str(e)})
             continue
@@ -6883,8 +6978,13 @@ def backtest_quality_score_all_props(side: str, season: int, teams: list = None,
 def backtest_quality_score_multi_hitter(season: int, prop_type: str, teams: list = None,
                                           max_hitters: int = 10, max_test_games_per_hitter: int = 5,
                                           min_games_before: int = 15,
-                                          season_start: str = None, season_end: str = None) -> dict:
+                                          season_start: str = None, season_end: str = None,
+                                          use_location_only: bool = False) -> dict:
     """
+    use_location_only: real A/B test switch, passed straight through to
+    backtest_hitter_prop_quality_walk_forward() / hitter_prop_
+    vulnerability_score(). See HITTER_PROP_VULN_METRICS_LOCATION_ONLY.
+
     Multi-player version of backtest_hitter_prop_quality_walk_forward(),
     pulling real hitters straight from real team rosters (no names to
     type) - same "no manual list" spirit as backtest_full_season_mlb().
@@ -6958,6 +7058,7 @@ def backtest_quality_score_multi_hitter(season: int, prop_type: str, teams: list
                     season_start=s_start, season_end=s_end,
                     min_games_before=min_games_before,
                     max_test_games=max_test_games_per_hitter,
+                    use_location_only=use_location_only,
                 )
             except Exception as e:
                 errors.append(f"{batter['name']}: {e}")
@@ -7378,4 +7479,3 @@ def backtest_pitcher_win_walk_forward(pitcher_id: int, season: int,
             "hit": predicted_over == actual_over,
         })
     return pd.DataFrame(rows)
-                                            
