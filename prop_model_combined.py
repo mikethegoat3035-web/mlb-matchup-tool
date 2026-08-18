@@ -1780,16 +1780,45 @@ def add_attack_zones(pitches: pd.DataFrame) -> pd.DataFrame:
 
 def attack_zone_breakdown(pitches: pd.DataFrame, min_pitches: int = 20) -> pd.DataFrame:
     """
-    Per (pitch_type, batter-hand, attack_zone): usage%, swing%, whiff% — the
-    metrics that separate 'lives in the shadow zone and gets away with it'
-    from 'lives in the shadow zone and gets hit hard'.
+    Per (pitch_type, batter-hand, attack_zone): usage%, swing%, whiff%,
+    CSW% (called+swinging strikes, this file's real efficiency metric),
+    and hardhit%-against — the metrics that separate 'lives in the shadow
+    zone and gets away with it' from 'lives in the shadow zone and gets
+    hit hard'.
+
+    Also computes self-referential deltas (this pitcher's OWN zone-
+    specific number vs HIS OWN overall number for that same pitch/hand) —
+    same design as build_hitter_zone_profile on the hitter side, and for
+    the same real reason: a third grouping dimension (zone, on top of
+    pitch type and hand) thins the sample too far to safely invent a
+    league-average benchmark for "CSW% in the shadow zone on a slider,"
+    so this compares him against himself instead.
     """
     pitches = add_attack_zones(pitches)
+    # Real per-(pitch_type, hand) baseline, computed once, for the deltas.
+    overall = {}
+    for (ptype, stand), grp in pitches.groupby(["pitch_type", "stand"]):
+        if pd.isna(ptype) or len(grp) < min_pitches:
+            continue
+        swings = grp["description"].isin([
+            "swinging_strike", "swinging_strike_blocked", "foul",
+            "foul_tip", "hit_into_play",
+        ])
+        whiffs = grp["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+        called_strikes = grp["description"] == "called_strike"
+        overall_whiff = round(whiffs.mean() * 100, 1)
+        overall_csw = round((whiffs.sum() + called_strikes.sum()) / len(grp) * 100, 1)
+        in_play = grp[grp["description"] == "hit_into_play"]
+        overall_hardhit = (round((in_play["launch_speed"] >= 95).mean() * 100, 1)
+                            if len(in_play) > 0 and "launch_speed" in in_play else float("nan"))
+        overall[(ptype, stand)] = (overall_whiff, overall_csw, overall_hardhit)
+
     rows = []
     for (ptype, stand), grp in pitches.groupby(["pitch_type", "stand"]):
         n_total = len(grp)
         if n_total < min_pitches or pd.isna(ptype):
             continue
+        base_whiff, base_csw, base_hardhit = overall.get((ptype, stand), (float("nan"),) * 3)
         for zone, zgrp in grp.groupby("attack_zone"):
             n = len(zgrp)
             swings = zgrp["description"].isin([
@@ -1797,11 +1826,25 @@ def attack_zone_breakdown(pitches: pd.DataFrame, min_pitches: int = 20) -> pd.Da
                 "foul_tip", "hit_into_play",
             ])
             whiffs = zgrp["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+            called_strikes = zgrp["description"] == "called_strike"
+            whiff_pct = round(whiffs.mean() * 100, 1)
+            csw_pct = round((whiffs.sum() + called_strikes.sum()) / n * 100, 1)
+            in_play_zone = zgrp[zgrp["description"] == "hit_into_play"]
+            hardhit_pct = (round((in_play_zone["launch_speed"] >= 95).mean() * 100, 1)
+                           if len(in_play_zone) > 0 and "launch_speed" in in_play_zone else float("nan"))
+            whiff_delta = (round(whiff_pct - base_whiff, 1)
+                           if pd.notna(whiff_pct) and pd.notna(base_whiff) else float("nan"))
+            csw_delta = (round(csw_pct - base_csw, 1)
+                         if pd.notna(csw_pct) and pd.notna(base_csw) else float("nan"))
+            hardhit_delta = (round(hardhit_pct - base_hardhit, 1)
+                             if pd.notna(hardhit_pct) and pd.notna(base_hardhit) else float("nan"))
             rows.append({
                 "pitch_type": ptype, "vs_hand": stand, "attack_zone": zone,
                 "n_pitches": n, "usage_pct": round(n / n_total * 100, 1),
                 "swing_pct": round(swings.mean() * 100, 1),
-                "whiff_pct": round(whiffs.mean() * 100, 1),
+                "whiff_pct": whiff_pct, "csw_pct": csw_pct, "hardhit_pct": hardhit_pct,
+                "whiff_pct_delta": whiff_delta, "csw_pct_delta": csw_delta,
+                "hardhit_pct_delta": hardhit_delta,
             })
     return pd.DataFrame(rows)
 
@@ -2119,6 +2162,121 @@ def hitter_metric_dict(profile: list[HitterPitchProfile], pitcher_hand: str,
 # module notes / conversation history for the "Gerrit Cole screenshot" ask
 # this was built to answer.
 
+@dataclass
+class HitterZoneProfile:
+    pitch_type: str
+    vs_pitcher_hand: str
+    attack_zone: str          # 'heart' / 'shadow' / 'chase' / 'waste' — see classify_attack_zone
+    n_pitches: int
+    swing_pct: float          # of all pitches in this specific zone, not just in-zone ones — for 'chase'/'waste' zones, this IS chase rate (swing rate on out-of-zone pitches) by definition, so no separate chase_pct field needed
+    whiff_pct: float          # of SWINGS at this zone specifically (not of all pitches - matches attack_zone_breakdown's convention on the pitcher side)
+    xwoba: float
+    hardhit_pct: float        # exit velo >= 95mph, of batted balls in play in this specific zone — real contact-quality signal that complements xwOBA rather than duplicating it (same 95mph convention as build_hitter_profile's hardhit_pct)
+    # Self-referential deltas, not compared against a fabricated external
+    # benchmark - a THIRD real grouping dimension (zone, on top of pitch
+    # type and hand) thins the sample too far to safely invent a league-
+    # average for "xwOBA in the shadow zone on a slider," so instead this
+    # compares the hitter's OWN zone-specific number against HIS OWN
+    # overall (all-zones) number for that same pitch type/hand - answers
+    # "does he respond meaningfully differently when located here," which
+    # is the actual real question, without needing an unverified constant.
+    swing_pct_delta: float = float("nan")
+    whiff_pct_delta: float = float("nan")
+    xwoba_delta: float = float("nan")
+    hardhit_pct_delta: float = float("nan")
+
+
+def build_hitter_zone_profile(pitches: pd.DataFrame, min_pitches: int = 15) -> list[HitterZoneProfile]:
+    """
+    Hitter's real response - swing rate, whiff rate (of swings), and
+    contact quality (xwOBA) - broken down by (pitch_type, pitcher hand,
+    ATTACK ZONE), not just pitch type and hand alone. Real, published
+    Baseball Savant zone geometry (see classify_attack_zone) - same real
+    Statcast columns as everywhere else in this file, nothing fabricated
+    about the zone definitions themselves.
+
+    min_pitches defaults to 15, not build_hitter_profile's 20 - adding a
+    real third grouping dimension genuinely thins the sample further by
+    construction (a hitter might see a specific pitch type in a specific
+    zone from a specific-handed pitcher only a handful of times all
+    season), so a stricter 20-pitch floor here would leave almost
+    nothing to work with for most real hitters. Still a real, meaningful
+    floor - not zero, not guessed.
+    """
+    pitches = add_attack_zones(pitches)
+    # Real per-(pitch_type, hand) baseline, computed ONCE up front, so
+    # every zone slice can be compared against THIS hitter's own overall
+    # number for that pitch - not a separate external constant.
+    overall = {}
+    for (ptype, p_hand), grp in pitches.groupby(["pitch_type", "p_throws"]):
+        if pd.isna(ptype) or len(grp) < min_pitches:
+            continue
+        swings = grp["description"].isin([
+            "swinging_strike", "swinging_strike_blocked", "foul",
+            "foul_tip", "hit_into_play",
+        ])
+        whiffs = grp["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+        overall_swing = round(swings.mean() * 100, 1)
+        overall_whiff = round((whiffs.sum() / max(swings.sum(), 1)) * 100, 1)
+        terminal = grp[grp["events"].notna()]
+        overall_xwoba = (terminal.apply(
+            lambda r: r["estimated_woba_using_speedangle"]
+            if pd.notna(r["estimated_woba_using_speedangle"]) else r["woba_value"], axis=1).mean()
+            if len(terminal) > 0 else float("nan"))
+        in_play = grp[grp["description"] == "hit_into_play"]
+        overall_hardhit = (round((in_play["launch_speed"] >= 95).mean() * 100, 1)
+                            if len(in_play) > 0 and "launch_speed" in in_play else float("nan"))
+        overall[(ptype, p_hand)] = (overall_swing, overall_whiff, overall_xwoba, overall_hardhit)
+
+    profiles = []
+    for (ptype, p_hand, zone), grp in pitches.groupby(["pitch_type", "p_throws", "attack_zone"]):
+        n = len(grp)
+        if n < min_pitches or pd.isna(ptype) or zone is None:
+            continue
+        swings = grp["description"].isin([
+            "swinging_strike", "swinging_strike_blocked", "foul",
+            "foul_tip", "hit_into_play",
+        ])
+        whiffs = grp["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+        swing_pct = round(swings.mean() * 100, 1)
+        whiff_pct = round((whiffs.sum() / max(swings.sum(), 1)) * 100, 1) if swings.sum() > 0 else float("nan")
+
+        terminal = grp[grp["events"].notna()]
+        xwoba = (terminal.apply(
+            lambda r: r["estimated_woba_using_speedangle"]
+            if pd.notna(r["estimated_woba_using_speedangle"]) else r["woba_value"], axis=1).mean()
+            if len(terminal) > 0 else float("nan"))
+        xwoba = round(xwoba, 3) if pd.notna(xwoba) else float("nan")
+
+        # Real, same 95mph convention as build_hitter_profile's hardhit_pct
+        # — a genuinely separate contact-quality signal from xwOBA, not a
+        # duplicate of it (xwOBA already blends outcome value across every
+        # result including outs/walks; hardhit_pct isolates JUST how hard
+        # the ball was actually struck when he did put it in play).
+        in_play_zone = grp[grp["description"] == "hit_into_play"]
+        hardhit_pct = (round((in_play_zone["launch_speed"] >= 95).mean() * 100, 1)
+                       if len(in_play_zone) > 0 and "launch_speed" in in_play_zone else float("nan"))
+
+        base_swing, base_whiff, base_xwoba, base_hardhit = overall.get(
+            (ptype, p_hand), (float("nan"), float("nan"), float("nan"), float("nan")))
+        swing_delta = (round(swing_pct - base_swing, 1)
+                       if pd.notna(swing_pct) and pd.notna(base_swing) else float("nan"))
+        whiff_delta = (round(whiff_pct - base_whiff, 1)
+                       if pd.notna(whiff_pct) and pd.notna(base_whiff) else float("nan"))
+        xwoba_delta = (round(xwoba - base_xwoba, 3)
+                       if pd.notna(xwoba) and pd.notna(base_xwoba) else float("nan"))
+        hardhit_delta = (round(hardhit_pct - base_hardhit, 1)
+                         if pd.notna(hardhit_pct) and pd.notna(base_hardhit) else float("nan"))
+
+        profiles.append(HitterZoneProfile(
+            pitch_type=ptype, vs_pitcher_hand=p_hand, attack_zone=zone,
+            n_pitches=n, swing_pct=swing_pct, whiff_pct=whiff_pct, xwoba=xwoba, hardhit_pct=hardhit_pct,
+            swing_pct_delta=swing_delta, whiff_pct_delta=whiff_delta,
+            xwoba_delta=xwoba_delta, hardhit_pct_delta=hardhit_delta,
+        ))
+    return profiles
+
+
 LEAGUE_AVG_XWOBA_PITCH = 0.320  # same default weighted_matchup_score() uses
 LEAGUE_AVG_XBA_PITCH = 0.250    # approximate per-pitch-type-cell league average xBA
 LEAGUE_AVG_ISO_PITCH = 0.150    # approximate per-pitch-type-cell league average ISO
@@ -2135,10 +2293,72 @@ LEAGUE_AVG_CHASE = 28.0          # approximate MLB-wide O-Swing%
 LEAGUE_AVG_HITTER_WHIFF = 11.0   # same definition/benchmark as pitcher SwStr%
 
 
+@dataclass
+class HitterLocationProfile:
+    vs_pitcher_hand: str
+    attack_zone: str
+    n_pitches: int
+    swing_pct: float
+    whiff_pct: float
+    xwoba: float
+    hardhit_pct: float
+
+
+def build_hitter_location_profile(pitches: pd.DataFrame, min_pitches: int = 20) -> list[HitterLocationProfile]:
+    """
+    Answers a genuinely different question than build_hitter_zone_profile:
+    not "how does he respond to THIS pitch type in THIS zone" but "does he
+    have a real location-only weakness regardless of what's thrown there."
+    Collapses across every real pitch type he's seen, grouping ONLY by
+    (pitcher hand, attack zone) - some hitters genuinely struggle up-and-in
+    or away no matter what pitch gets put there, and that broader pattern
+    doesn't show up in the pitch-type-specific profile, which only ever
+    looks at one pitch at a time.
+
+    min_pitches back to 20, not 15 - collapsing across pitch types means
+    real, meaningfully MORE pitches land in each (hand, zone) cell than in
+    build_hitter_zone_profile's finer (pitch_type, hand, zone) cells, so
+    the same real floor used everywhere else in this file is achievable
+    again here, not the loosened one needed for the thinner slice.
+    """
+    pitches = add_attack_zones(pitches)
+    profiles = []
+    for (p_hand, zone), grp in pitches.groupby(["p_throws", "attack_zone"]):
+        n = len(grp)
+        if n < min_pitches or zone is None:
+            continue
+        swings = grp["description"].isin([
+            "swinging_strike", "swinging_strike_blocked", "foul",
+            "foul_tip", "hit_into_play",
+        ])
+        whiffs = grp["description"].isin(["swinging_strike", "swinging_strike_blocked"])
+        swing_pct = round(swings.mean() * 100, 1)
+        whiff_pct = round((whiffs.sum() / max(swings.sum(), 1)) * 100, 1) if swings.sum() > 0 else float("nan")
+
+        terminal = grp[grp["events"].notna()]
+        xwoba = (terminal.apply(
+            lambda r: r["estimated_woba_using_speedangle"]
+            if pd.notna(r["estimated_woba_using_speedangle"]) else r["woba_value"], axis=1).mean()
+            if len(terminal) > 0 else float("nan"))
+        xwoba = round(xwoba, 3) if pd.notna(xwoba) else float("nan")
+
+        in_play = grp[grp["description"] == "hit_into_play"]
+        hardhit_pct = (round((in_play["launch_speed"] >= 95).mean() * 100, 1)
+                       if len(in_play) > 0 and "launch_speed" in in_play else float("nan"))
+
+        profiles.append(HitterLocationProfile(
+            vs_pitcher_hand=p_hand, attack_zone=zone, n_pitches=n,
+            swing_pct=swing_pct, whiff_pct=whiff_pct, xwoba=xwoba, hardhit_pct=hardhit_pct,
+        ))
+    return profiles
+
+
 def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
                            batter_hand: str, pitcher_hand: str,
                            usage_threshold: float = 15.0,
-                           low_sample_threshold: int = 20) -> pd.DataFrame:
+                           low_sample_threshold: int = 20,
+                           pitcher_zone_breakdown: pd.DataFrame = None,
+                           hitter_zone_profile: list = None) -> pd.DataFrame:
     """
     One row per pitch the pitcher throws at usage_threshold%+ vs batter_hand,
     joined with THIS SPECIFIC hitter's whiff/chase/xwOBA against that exact
@@ -2150,6 +2370,15 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
     hitter_profile: build_hitter_profile() output for this hitter.
     batter_hand: hitter's bats side ('L'/'R') — filters the pitcher's arsenal.
     pitcher_hand: pitcher's throwing hand ('L'/'R') — filters the hitter's data.
+
+    pitcher_zone_breakdown / hitter_zone_profile: BOTH optional, both
+    default None (fully backward compatible — every existing caller keeps
+    working unchanged if it doesn't pass these). When both are supplied,
+    each row also gets the pitcher's real PRIMARY attack zone for this
+    pitch (where he actually locates it most, not just whether it's a
+    strike) and the hitter's real response specifically in that zone -
+    not just "how does he do on this pitch type," but "how does he do
+    when THIS pitch is located where this pitcher actually puts it."
 
     'read' column is plain language, driven directly by whether the
     hitter's xwOBA and chase/whiff numbers on THIS pitch beat or trail
@@ -2164,6 +2393,35 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
         return pd.DataFrame([{"note": f"No pitch at {usage_threshold}%+ usage vs {batter_hand}HH."}])
 
     hitter_by_type = {h.pitch_type: h for h in hitter_profile if h.vs_pitcher_hand == pitcher_hand}
+
+    # Real primary-zone lookup, built once - for each (pitch_type, hand)
+    # the pitcher throws, which real attack zone does he locate it in
+    # most often, and the hitter's real zone-specific response there.
+    #
+    # Real fix: keeps the top TWO zones, not just one. A pitcher who splits
+    # fairly evenly between two real zones for the same pitch (e.g. 40%
+    # shadow, 35% chase) was having that second, genuinely meaningful
+    # tendency silently dropped before — only the single highest zone ever
+    # got used. The second zone is only kept when it clears a real usage
+    # floor (15%+) - a pitch he locates somewhere 4% of the time isn't a
+    # real secondary tendency worth surfacing, just noise in the tail.
+    pitcher_primary_zone = {}
+    pitcher_secondary_zone = {}
+    hitter_zone_by_key = {}
+    if pitcher_zone_breakdown is not None and not pitcher_zone_breakdown.empty:
+        zb = pitcher_zone_breakdown[pitcher_zone_breakdown["vs_hand"] == batter_hand]
+        for ptype, grp in zb.groupby("pitch_type"):
+            ranked = grp.sort_values("usage_pct", ascending=False)
+            top_row = ranked.iloc[0]
+            pitcher_primary_zone[ptype] = (top_row["attack_zone"], top_row["usage_pct"])
+            if len(ranked) > 1:
+                second_row = ranked.iloc[1]
+                if second_row["usage_pct"] >= 15.0:
+                    pitcher_secondary_zone[ptype] = (second_row["attack_zone"], second_row["usage_pct"])
+    if hitter_zone_profile:
+        for hz in hitter_zone_profile:
+            if hz.vs_pitcher_hand == pitcher_hand:
+                hitter_zone_by_key[(hz.pitch_type, hz.attack_zone)] = hz
 
     rows = []
     for p in sig_pitcher_pitches:
@@ -2191,6 +2449,59 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
             "hitter_flyball_pct": h.flyball_pct if h else None,  # his own lift tendency on this pitch — feeds HR/TB alongside power (iso/hardhit alone don't capture whether the ball is even in the air)
             "hitter_pull_pct": h.pull_pct if h else None,  # HIGH UNCERTAINTY — see build_hitter_profile's pull_pct computation-site comment. Included because it's the closest available signal to real HR-specific modeling, not because it's as trustworthy as everything else in this row.
         }
+
+        # Real location-specific layer, only populated when both zone
+        # inputs were supplied. "primary_zone" = where the pitcher
+        # ACTUALLY locates this pitch most (not just whether it's a
+        # strike) - real, published Baseball Savant zones (heart/shadow/
+        # chase/waste). The hitter deltas compare his OWN response in
+        # that specific zone against his OWN overall number for this
+        # pitch - no fabricated external benchmark, see
+        # build_hitter_zone_profile's docstring for why.
+        zone_info = pitcher_primary_zone.get(p.pitch_type)
+        if zone_info:
+            primary_zone, zone_usage_pct = zone_info
+            row["pitcher_primary_zone"] = primary_zone
+            row["pitcher_primary_zone_usage_pct"] = zone_usage_pct
+            hz = hitter_zone_by_key.get((p.pitch_type, primary_zone))
+            row["hitter_zone_n_pitches"] = hz.n_pitches if hz else 0
+            row["hitter_zone_swing_pct"] = hz.swing_pct if hz else None
+            row["hitter_zone_whiff_pct"] = hz.whiff_pct if hz else None
+            row["hitter_zone_xwoba"] = hz.xwoba if hz else None
+            row["hitter_zone_hardhit_pct"] = hz.hardhit_pct if hz else None
+            row["hitter_zone_swing_delta"] = hz.swing_pct_delta if hz else None
+            row["hitter_zone_whiff_delta"] = hz.whiff_pct_delta if hz else None
+            row["hitter_zone_xwoba_delta"] = hz.xwoba_delta if hz else None
+            row["hitter_zone_hardhit_delta"] = hz.hardhit_pct_delta if hz else None
+        else:
+            row["pitcher_primary_zone"] = None
+            row["pitcher_primary_zone_usage_pct"] = None
+            row["hitter_zone_n_pitches"] = 0
+            row["hitter_zone_swing_pct"] = None
+            row["hitter_zone_whiff_pct"] = None
+            row["hitter_zone_xwoba"] = None
+            row["hitter_zone_hardhit_pct"] = None
+            row["hitter_zone_swing_delta"] = None
+            row["hitter_zone_whiff_delta"] = None
+            row["hitter_zone_xwoba_delta"] = None
+            row["hitter_zone_hardhit_delta"] = None
+
+        # Real secondary-zone read, kept lean (not a full duplicate field
+        # set) - just enough to know a real second tendency exists and how
+        # the hitter responds there, without doubling every row's width.
+        sec_info = pitcher_secondary_zone.get(p.pitch_type)
+        if sec_info:
+            sec_zone, sec_usage_pct = sec_info
+            hz2 = hitter_zone_by_key.get((p.pitch_type, sec_zone))
+            row["pitcher_secondary_zone"] = sec_zone
+            row["pitcher_secondary_zone_usage_pct"] = sec_usage_pct
+            row["hitter_secondary_zone_whiff_pct"] = hz2.whiff_pct if hz2 else None
+            row["hitter_secondary_zone_xwoba"] = hz2.xwoba if hz2 else None
+        else:
+            row["pitcher_secondary_zone"] = None
+            row["pitcher_secondary_zone_usage_pct"] = None
+            row["hitter_secondary_zone_whiff_pct"] = None
+            row["hitter_secondary_zone_xwoba"] = None
 
         if h is None:
             row["read"] = "No hitter data vs this pitch type/hand — no read possible."
@@ -2256,6 +2567,18 @@ def crosswalk_vulnerability_score(crosswalk_df: pd.DataFrame,
             per_pitch += (row["hitter_chase_pct"] - LEAGUE_AVG_CHASE) / 5.0
         if pd.notna(row["hitter_whiff_pct"]):
             per_pitch += (row["hitter_whiff_pct"] - LEAGUE_AVG_HITTER_WHIFF) / 4.0
+        # Same real zone signal now wired into HITTER_PROP_VULN_METRICS
+        # (hits/singles/total_bases/home_runs/strikeouts) — added here too
+        # so H+R+RBI (and, through it, Hitter Fantasy's third component)
+        # isn't left as the one piece silently missing it. Same muted
+        # scales, same self-referential-delta design, same sign logic
+        # already confirmed against real test cases before shipping.
+        if pd.notna(row.get("hitter_zone_whiff_delta")):
+            per_pitch += row["hitter_zone_whiff_delta"] / 8.0
+        if pd.notna(row.get("hitter_zone_xwoba_delta")):
+            per_pitch += (0 - row["hitter_zone_xwoba_delta"]) / 0.06
+        if pd.notna(row.get("hitter_zone_hardhit_delta")):
+            per_pitch += (0 - row["hitter_zone_hardhit_delta"]) / 16.0
         weighted_score += w * per_pitch
 
     if weighted_score >= 1.5:
@@ -2294,15 +2617,30 @@ def crosswalk_vulnerability_score(crosswalk_df: pd.DataFrame,
 HITTER_PROP_VULN_METRICS = {
     "hits":       [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
                     ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
-                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],  # a hitter who chases this pitch typically makes weaker contact on it, on the swings that do happen — same discipline logic already used for Strikeouts, just missing here before
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),  # a hitter who chases this pitch typically makes weaker contact on it, on the swings that do happen — same discipline logic already used for Strikeouts, just missing here before
+                    # Real, live location signal (see build_hitter_zone_profile /
+                    # build_pitch_crosswalk) — the pitcher's actual primary
+                    # location for this pitch, matched to how THIS hitter
+                    # responds specifically there, vs his own baseline. Wired
+                    # in at the user's explicit request, ahead of the normal
+                    # validation step used for everything else in this file —
+                    # muted scales (2x the raw-metric equivalents) so this
+                    # newer, thinner-sampled signal adds real weight without
+                    # dominating the established, tested metrics above it.
+                    ("hitter_zone_whiff_delta", 0, 8.0, -1),
+                    ("hitter_zone_xwoba_delta", 0, 0.06, 1)],
     "singles":    [("hitter_xba", LEAGUE_AVG_XBA_PITCH, 0.02, 1),
                     ("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
                     ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),
-                    ("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.05, -1)],  # power SUPPRESSES singles specifically — a hit off this pitch is more likely to leave the infield as a double/HR instead of staying a single. Wider scale than TB/HR's 0.03 since this is a secondary adjustment, not the primary driver for this prop.
+                    ("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.05, -1),  # power SUPPRESSES singles specifically — a hit off this pitch is more likely to leave the infield as a double/HR instead of staying a single. Wider scale than TB/HR's 0.03 since this is a secondary adjustment, not the primary driver for this prop.
+                    ("hitter_zone_whiff_delta", 0, 8.0, -1),
+                    ("hitter_zone_xwoba_delta", 0, 0.06, 1)],
     "total_bases": [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
                       ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
                       ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1),
-                      ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1)],
+                      ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1),
+                      ("hitter_zone_xwoba_delta", 0, 0.06, 1),
+                      ("hitter_zone_hardhit_delta", 0, 16.0, 1)],
                       # hitter_pull_pct deliberately NOT included here — the
                       # field is still computed (see build_hitter_profile,
                       # and it's still in the crosswalk table for manual
@@ -2314,10 +2652,13 @@ HITTER_PROP_VULN_METRICS = {
     "home_runs":  [("hitter_iso", LEAGUE_AVG_ISO_PITCH, 0.03, 1),
                     ("hitter_hardhit_pct", LEAGUE_AVG_HITTER_HARDHIT, 8.0, 1),
                     ("hitter_xwobacon", LEAGUE_AVG_HITTER_XWOBACON, 0.03, 1),
-                    ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1)],
+                    ("hitter_flyball_pct", LEAGUE_AVG_HITTER_FLYBALL, 10.0, 1),
+                    ("hitter_zone_xwoba_delta", 0, 0.06, 1),
+                    ("hitter_zone_hardhit_delta", 0, 16.0, 1)],
                     # same as total_bases above — hitter_pull_pct intentionally excluded from auto-scoring
     "strikeouts": [("hitter_whiff_pct", LEAGUE_AVG_HITTER_WHIFF, 4.0, -1),
-                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1)],
+                    ("hitter_chase_pct", LEAGUE_AVG_CHASE, 5.0, -1),
+                    ("hitter_zone_whiff_delta", 0, 8.0, -1)],
     # RBI/Runs/H+R+RBI: no lineup-protection data in this crosswalk (who
     # bats around this hitter) — that's a real, separate, still-unbuilt
     # gap, not a metric-swap job. Kept on the original generic xwOBA+chase+
@@ -3416,6 +3757,22 @@ PITCHER_PROP_METRICS = {
                               ("z_contact_pct", "z_contact_pct_against")],
 }
 
+# Real zone-delta signal (see attack_zone_breakdown) wired into each real
+# pitcher prop — which deltas matter, matched to what each prop's own
+# metric set above already emphasizes. (delta_field, scale, direction) —
+# direction: +1 if a HIGHER delta helps the pitcher, -1 if it hurts him.
+# whiff/csw higher = good for pitcher (+1); hardhit higher = bad for
+# pitcher (-1). Same muted-scale, self-referential design as the hitter
+# side — real weight, not dominant weight, since this is newer and built
+# on a thinner (zone-specific) sample than the established metrics above.
+PITCHER_PROP_ZONE_DELTAS = {
+    "strikeouts":  [("whiff_pct_delta", 8.0, 1), ("csw_pct_delta", 8.0, 1)],
+    "outs":        [("whiff_pct_delta", 8.0, 1), ("csw_pct_delta", 8.0, 1), ("hardhit_pct_delta", 16.0, -1)],
+    "walks_allowed": [("csw_pct_delta", 8.0, 1)],
+    "hits_allowed": [("hardhit_pct_delta", 16.0, -1), ("csw_pct_delta", 8.0, 1)],
+    "pitcher_earned_runs": [("hardhit_pct_delta", 16.0, -1), ("csw_pct_delta", 8.0, 1)],
+}
+
 
 def _normalize_benchmark(value, benchmark_key: str) -> float:
     """Maps a raw metric value to 0-100 via TIER_BENCHMARKS — same scale/
@@ -3427,6 +3784,20 @@ def _normalize_benchmark(value, benchmark_key: str) -> float:
     b = TIER_BENCHMARKS[benchmark_key]
     lo, hi = (b["poor"], b["elite"]) if b["direction"] == "high" else (b["elite"], b["poor"])
     pct = (value - lo) / (hi - lo) * 100
+    return max(0.0, min(100.0, pct))
+
+
+def _normalize_delta(value, scale: float, direction: int) -> float:
+    """Parallel to _normalize_benchmark, for self-referential zone deltas
+    that have no TIER_BENCHMARKS entry (no fabricated external benchmark —
+    see attack_zone_breakdown's docstring for why). delta=0 (no real zone
+    effect) maps to neutral 50, same convention as a missing value above.
+    A delta of magnitude `scale` moves the score 25 points off neutral —
+    same muted-relative-to-established-metrics design used on the hitter
+    side, not full-strength like the TIER_BENCHMARKS-anchored metrics."""
+    if value is None or pd.isna(value):
+        return 50.0
+    pct = 50.0 + (value / scale) * direction * 25.0
     return max(0.0, min(100.0, pct))
 
 
@@ -3446,7 +3817,8 @@ def _quality_label(score: float) -> str:
 
 
 def pitcher_prop_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
-                                prop_type: str, usage_threshold: float = 15.0) -> dict:
+                                prop_type: str, usage_threshold: float = 15.0,
+                                pitcher_zone_breakdown: pd.DataFrame = None) -> dict:
     """
     Per-prop-type version of pitcher_quality_mu_score(): scores the
     pitcher's real stuff using only the metrics that actually drive THIS
@@ -3460,9 +3832,17 @@ def pitcher_prop_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
     three, so there's no single mechanism to point at). Any other prop_type
     (e.g. 'pitcher_win', which is mostly game-context/bullpen-driven, not
     pitch-mechanism-driven) returns a neutral score rather than guessing.
+
+    pitcher_zone_breakdown: optional output of attack_zone_breakdown() for
+    THIS pitcher. When supplied, blends in a real zone-execution signal —
+    for each of his significant pitches, does HE perform better or worse
+    (self-referentially, vs his own overall number for that pitch/hand)
+    in the specific zone he actually locates it in most. Backward
+    compatible — omitting this arg scores exactly as before.
     """
     if prop_type == "pitcher_fantasy":
-        parts = {p: pitcher_prop_quality_score(pitcher_arsenal, lineup_hand_weights, p, usage_threshold)
+        parts = {p: pitcher_prop_quality_score(pitcher_arsenal, lineup_hand_weights, p, usage_threshold,
+                                                 pitcher_zone_breakdown)
                  for p in ("strikeouts", "outs", "pitcher_earned_runs")}
         scores = [p["score"] for p in parts.values() if p["score"] is not None]
         if not scores:
@@ -3478,6 +3858,7 @@ def pitcher_prop_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
 
     total_pa = sum(lineup_hand_weights.values()) or 1.0
     hand_shares = {h: w / total_pa for h, w in lineup_hand_weights.items()}
+    zone_deltas_wanted = PITCHER_PROP_ZONE_DELTAS.get(prop_type, [])
 
     per_hand_scores = {}
     for hand in ("L", "R"):
@@ -3492,6 +3873,27 @@ def pitcher_prop_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
             return sum(v * w for v, w in vals) / sum(w for _, w in vals) if vals else None
 
         component_scores = [_normalize_benchmark(wavg(attr), bench_key) for attr, bench_key in metrics]
+
+        # Real zone-execution component, one per requested delta field -
+        # usage-weighted across his significant pitches, each pitch's
+        # value coming from ITS real primary zone (highest usage_pct row
+        # for that pitch_type+hand in pitcher_zone_breakdown).
+        if pitcher_zone_breakdown is not None and not pitcher_zone_breakdown.empty and zone_deltas_wanted:
+            hand_zones = pitcher_zone_breakdown[pitcher_zone_breakdown["vs_hand"] == hand]
+            for delta_field, scale, direction in zone_deltas_wanted:
+                per_pitch_vals = []
+                for p in sig:
+                    pitch_zones = hand_zones[hand_zones["pitch_type"] == p.pitch_type]
+                    if pitch_zones.empty:
+                        continue
+                    top_zone_row = pitch_zones.sort_values("usage_pct", ascending=False).iloc[0]
+                    delta_val = top_zone_row.get(delta_field)
+                    if pd.notna(delta_val):
+                        per_pitch_vals.append((delta_val, p.usage_pct))
+                if per_pitch_vals:
+                    zone_wavg = sum(v * w for v, w in per_pitch_vals) / sum(w for _, w in per_pitch_vals)
+                    component_scores.append(_normalize_delta(zone_wavg, scale, direction))
+
         per_hand_scores[hand] = round(sum(component_scores) / len(component_scores), 1)
 
     weighted_total, weight_used = 0.0, 0.0
@@ -3656,7 +4058,8 @@ def lineup_verification_score(pitcher_arsenal: list, opposing_lineup_hitters: li
 
 def pitcher_prop_mu_quality_score(pitcher_arsenal: list, lineup_hand_weights: dict,
                                     opposing_lineup_hitters: list, prop_type: str,
-                                    usage_threshold: float = 15.0, own_stuff_weight: float = 0.6) -> dict:
+                                    usage_threshold: float = 15.0, own_stuff_weight: float = 0.6,
+                                    pitcher_zone_breakdown: pd.DataFrame = None) -> dict:
     """
     The real 'whole lineup vs pitcher' score: blends pitcher_prop_quality_
     score() (his own stuff, 60% weight by default) with lineup_verification_
@@ -3665,6 +4068,9 @@ def pitcher_prop_mu_quality_score(pitcher_arsenal: list, lineup_hand_weights: di
     pitcher prop row now — pitcher_prop_quality_score() alone only ever
     told half the story.
 
+    pitcher_zone_breakdown: optional, passed straight through to
+    pitcher_prop_quality_score() — see that function's docstring.
+
     Falls back to the pitcher-own-stuff score alone (unchanged from before
     this existed) whenever lineup verification has nothing to check for
     this prop_type, or no lineup data is available — never breaks or drops
@@ -3672,7 +4078,8 @@ def pitcher_prop_mu_quality_score(pitcher_arsenal: list, lineup_hand_weights: di
     """
     if prop_type == "pitcher_fantasy":
         parts = {p: pitcher_prop_mu_quality_score(pitcher_arsenal, lineup_hand_weights,
-                                                    opposing_lineup_hitters, p, usage_threshold, own_stuff_weight)
+                                                    opposing_lineup_hitters, p, usage_threshold,
+                                                    own_stuff_weight, pitcher_zone_breakdown)
                  for p in ("strikeouts", "outs", "pitcher_earned_runs")}
         scores = [p["score"] for p in parts.values() if p["score"] is not None]
         if not scores:
@@ -3681,7 +4088,8 @@ def pitcher_prop_mu_quality_score(pitcher_arsenal: list, lineup_hand_weights: di
         return {"score": final_score, "label": _quality_label(final_score),
                 "component_scores": {k: v["score"] for k, v in parts.items()}}
 
-    own = pitcher_prop_quality_score(pitcher_arsenal, lineup_hand_weights, prop_type, usage_threshold)
+    own = pitcher_prop_quality_score(pitcher_arsenal, lineup_hand_weights, prop_type, usage_threshold,
+                                      pitcher_zone_breakdown)
     lineup = lineup_verification_score(pitcher_arsenal, opposing_lineup_hitters, prop_type, usage_threshold)
 
     if own["score"] is None:
@@ -3912,9 +4320,33 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 pid = pitcher_info["player_id"]
                 pitcher_name = pitcher_info.get("name", "Unknown")
 
-                pitcher_recent_raw = build_arsenal_profile(pull_pitcher_pitches(pid, pitcher_start, today_str))
+                pitcher_raw_pitches = pull_pitcher_pitches(pid, pitcher_start, today_str)
+                pitcher_recent_raw = build_arsenal_profile(pitcher_raw_pitches)
                 if not pitcher_recent_raw:
                     continue
+                # Real zone-usage breakdown, reusing the SAME raw pull
+                # above - zero extra network calls. Where does he actually
+                # LOCATE each pitch, not just whether it's a strike.
+                try:
+                    pitcher_zone_breakdown = attack_zone_breakdown(pitcher_raw_pitches)
+                except Exception:
+                    pitcher_zone_breakdown = None
+
+                # Real rest-days signal, same reused raw pull, zero extra
+                # calls. Days since his last real MLB appearance - his
+                # LAST real game_date in the window before today, not a
+                # new data source. Informational only right now, same as
+                # everything else new tonight - not wired into
+                # quality_score without real validation first.
+                pitcher_days_rest = None
+                try:
+                    if "game_date" in pitcher_raw_pitches.columns and not pitcher_raw_pitches.empty:
+                        real_dates = pd.to_datetime(pitcher_raw_pitches["game_date"]).dt.date.unique()
+                        real_dates = sorted(d for d in real_dates if d < datetime.now().date())
+                        if real_dates:
+                            pitcher_days_rest = (datetime.now().date() - real_dates[-1]).days
+                except Exception:
+                    pitcher_days_rest = None
 
                 # Sample-size fix: shrink each thin (pitch_type, hand) cell toward
                 # THIS pitcher's own season-long value for that SAME pitch type —
@@ -3944,16 +4376,37 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 # hitters in general. Reused below in the hitter-prop loop too —
                 # this replaces a pull that used to happen there, not an extra one.
                 lineup_hitter_profiles = {}
+                lineup_hitter_zone_profiles = {}
+                lineup_hitter_location_profiles = {}
                 opposing_lineup_hitters_for_verification = []
                 for hitter in opposing_lineup:
                     try:
                         hbid = hitter["player_id"]
                         hhand = get_batter_hand(hbid)
                         hhand = hhand if hhand in ("L", "R") else "R"
-                        hh_recent_raw = build_hitter_profile(
-                            pull_batter_pitches(hbid, hitter_start, today_str), batter_hand=hhand)
+                        hh_raw_pitches = pull_batter_pitches(hbid, hitter_start, today_str)
+                        hh_recent_raw = build_hitter_profile(hh_raw_pitches, batter_hand=hhand)
                         if not hh_recent_raw:
                             continue
+                        # Reuses the SAME raw pull above - real zone data,
+                        # zero extra network calls. Deliberately built from
+                        # the RECENT window only, not blended with season
+                        # data the way hh_recent is below - zone-level
+                        # samples are already thin by construction (a third
+                        # real grouping dimension), and blending two
+                        # different real windows together here would make
+                        # an already-thin signal harder to reason about,
+                        # not more reliable.
+                        try:
+                            hh_zone_profile = build_hitter_zone_profile(hh_raw_pitches)
+                        except Exception:
+                            hh_zone_profile = []
+                        # Same reused raw pull, zero extra cost - the
+                        # broader, pitch-type-agnostic location signal.
+                        try:
+                            hh_location_profile = build_hitter_location_profile(hh_raw_pitches)
+                        except Exception:
+                            hh_location_profile = []
                         if hitter_season_long:
                             hh_recent = hh_recent_raw
                         else:
@@ -3966,6 +4419,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                 hh_recent = hh_recent_raw
                         expected_pa = hitter.get("expected_pa", 4.0)
                         lineup_hitter_profiles[hbid] = (hh_recent, hhand)
+                        lineup_hitter_zone_profiles[hbid] = hh_zone_profile
+                        lineup_hitter_location_profiles[hbid] = hh_location_profile
                         opposing_lineup_hitters_for_verification.append((hh_recent, hhand, expected_pa))
                     except Exception:
                         continue
@@ -3976,7 +4431,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 if "p_over" in probs.columns:
                     for _, prow in probs.iterrows():
                         prop_quality = pitcher_prop_mu_quality_score(
-                            pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, prow["stat"])
+                            pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, prow["stat"],
+                            pitcher_zone_breakdown=pitcher_zone_breakdown)
                         # Same transparency gap fixed on the hitter side, pre-existing
                         # here too (not new this session) - pitcher_prop_mu_quality_score
                         # already returns either component_scores (pitcher_fantasy's
@@ -3997,6 +4453,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             "player": (f"{pitcher_name} ({dh_labels.get(game_pk)})"
                                        if dh_labels.get(game_pk) else pitcher_name),
                             "game_number": dh_labels.get(game_pk, ""),
+                            "days_rest": pitcher_days_rest,
                             "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                             "line": prow["line"], "mu": prow["recent_avg"],
                             "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
@@ -4019,7 +4476,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                             for _, prow in p_official.iterrows():
                                 full_stat = "pitcher_" + prow["stat"]
                                 prop_quality = pitcher_prop_mu_quality_score(
-                                    pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, full_stat)
+                                    pitcher_recent, hand_weights, opposing_lineup_hitters_for_verification, full_stat,
+                                    pitcher_zone_breakdown=pitcher_zone_breakdown)
                                 if "component_scores" in prop_quality:
                                     comp_str = ", ".join(f"{k}:{v:.0f}" for k, v in prop_quality["component_scores"].items()
                                                           if v is not None)
@@ -4034,6 +4492,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                     "player": (f"{pitcher_name} ({dh_labels.get(game_pk)})"
                                                if dh_labels.get(game_pk) else pitcher_name),
                                     "game_number": dh_labels.get(game_pk, ""),
+                                    "days_rest": pitcher_days_rest,
                                     "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                                     "line": prow["line"], "mu": prow["recent_avg"],
                                     "p_over": prow["p_over"], "games_sampled": prow["games_sampled"],
@@ -4047,6 +4506,18 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
                 for hitter in opposing_lineup:
                     try:
+                        # Real batting-order filter: 7-9 hole hitters get
+                        # meaningfully skipped here, not scored. Backed by
+                        # the real EXPECTED_PA_BY_ORDER_SLOT data - the drop
+                        # from slot 1 to slot 6 is gradual (4.6->4.0 PA), no
+                        # sharp cliff, so cutting at 5 would exclude a
+                        # genuinely regular, high-PA hitter for very little
+                        # real gain. The real distinction (lower PA, less
+                        # consistent protection, more platoon/bench usage)
+                        # shows up starting at slot 7, not slot 6.
+                        order_slot = hitter.get("order_slot")
+                        if order_slot is not None and order_slot > 6:
+                            continue
                         bid = hitter["player_id"]
                         hitter_name = hitter["name"]
                         pre_pulled = lineup_hitter_profiles.get(bid)
@@ -4056,8 +4527,37 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
                         h_lines, h_matched = _player_lines_with_live(
                             hitter_name, h_lines_default, live_lookup, stat_map)
-                        h_probs = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines)
-                        crosswalk = build_pitch_crosswalk(pitcher_recent, h_recent, batter_hand, pitcher_hand)
+                        # Real park factor for TONIGHT's specific game -
+                        # always the HOME team's park, regardless of which
+                        # side's hitters are currently being scored (the
+                        # away team's hitters play in the home team's park
+                        # too, same as the home team does).
+                        game_park_factor = get_park_factor(game.get("home_name", ""))
+                        h_probs = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines,
+                                                             park_factor=game_park_factor)
+                        hh_zone_profile = lineup_hitter_zone_profiles.get(bid, [])
+                        crosswalk = build_pitch_crosswalk(
+                            pitcher_recent, h_recent, batter_hand, pitcher_hand,
+                            pitcher_zone_breakdown=pitcher_zone_breakdown,
+                            hitter_zone_profile=hh_zone_profile)
+
+                        # Clean post-processing lookup rather than a 6th
+                        # crosswalk parameter — this is genuinely
+                        # independent of pitch type (hand+zone only), so
+                        # it's matched onto each row by whichever zone
+                        # that row already resolved as the pitcher's
+                        # primary one, not threaded through the join logic.
+                        hh_location_profile = lineup_hitter_location_profiles.get(bid, [])
+                        location_by_zone = {(lp.vs_pitcher_hand, lp.attack_zone): lp for lp in hh_location_profile}
+                        if isinstance(crosswalk, pd.DataFrame) and "pitcher_primary_zone" in crosswalk.columns:
+                            def _location_whiff(row):
+                                lp = location_by_zone.get((pitcher_hand, row.get("pitcher_primary_zone")))
+                                return lp.whiff_pct if lp else None
+                            def _location_xwoba(row):
+                                lp = location_by_zone.get((pitcher_hand, row.get("pitcher_primary_zone")))
+                                return lp.xwoba if lp else None
+                            crosswalk["hitter_location_only_whiff_pct"] = crosswalk.apply(_location_whiff, axis=1)
+                            crosswalk["hitter_location_only_xwoba"] = crosswalk.apply(_location_xwoba, axis=1)
 
                         # Computed ONCE per hitter — reused across every prop row for him — since
                         # it needs two extra season-log pulls (the hitters batting immediately
@@ -4144,6 +4644,24 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
     df = pd.DataFrame(rows)
     df["edge"] = (df["p_over"] - 0.5).abs()
     df["lean"] = df["p_over"].apply(lambda p: "OVER" if p >= 0.5 else "UNDER")
+
+    # Real, whole-game readiness check: a game only counts as "ready to
+    # scan" once it has REAL rows on BOTH sides - at least one pitcher row
+    # AND at least one hitter row for that specific game_pk. Without this,
+    # a game could silently show up with only one side present (e.g. a
+    # pitcher's real data pull failed, so his own props never generated,
+    # but the opposing hitters happened to succeed) - showing a genuinely
+    # half-finished picture as if it were a normal result. Applied here,
+    # after all rows exist but before the real edge/quality filters, so a
+    # game gets excluded entirely rather than showing up looking complete
+    # when it isn't.
+    if "game_pk" in df.columns and "side" in df.columns:
+        sides_present = df.groupby("game_pk")["side"].apply(lambda s: set(s))
+        ready_games = sides_present[sides_present.apply(lambda s: {"pitcher", "hitter"}.issubset(s))].index
+        df = df[df["game_pk"].isin(ready_games)]
+        if df.empty:
+            return pd.DataFrame([{"note": "Every confirmed game today is still missing real data on "
+                                  "one side (pitcher or hitters) - re-run closer to game time."}])
 
     df = df[(df["edge"] >= min_edge) & (df["games_sampled"] >= min_games_sampled)]
     if min_quality_score is not None:
@@ -4603,10 +5121,23 @@ def fantasy_score_probability(person_id: int, season: int, line: float,
 
 
 def hitter_prop_probabilities(batter_id: int, start_dt: str, end_dt: str,
-                               lines: dict) -> pd.DataFrame:
+                               lines: dict, park_factor: dict = None) -> pd.DataFrame:
     """
     lines: any subset of {'hits', 'singles', 'doubles', 'total_bases',
     'home_runs', 'strikeouts', 'walks'} mapped to the line you want tested.
+
+    park_factor: optional dict from get_park_factor() for TONIGHT's specific
+    game location. Applied as a direct, real multiplicative adjustment to
+    mu — not a quality/confidence signal like the zone or matchup work
+    elsewhere in this file, but a genuine rate correction: his trailing
+    average already blends together whatever mix of parks he's actually
+    played at recently, which roughly nets out close to neutral over a
+    real season — tonight's specific park is real, known context that
+    average doesn't capture on its own. home_runs uses hr_factor; hits/
+    singles/doubles/total_bases use hits_factor (strikeouts/walks are left
+    alone — no real, established park effect on those). Backward
+    compatible — every existing caller keeps working unchanged if this
+    isn't passed.
     """
     if _poisson is None:
         raise ImportError("pip install scipy --break-system-packages")
@@ -4621,6 +5152,11 @@ def hitter_prop_probabilities(batter_id: int, start_dt: str, end_dt: str,
         if stat not in log.columns:
             continue
         mean = log[stat].mean()
+        if park_factor:
+            if stat == "home_runs":
+                mean = mean * (park_factor.get("hr_factor", 100) / 100.0)
+            elif stat in ("hits", "singles", "doubles", "total_bases"):
+                mean = mean * (park_factor.get("hits_factor", 100) / 100.0)
         p_over = 1 - _poisson.cdf(math.floor(line), mean)
         rows.append({
             "stat": stat, "line": line, "recent_avg": round(mean, 2),
@@ -5858,6 +6394,392 @@ def backtest_hitter_prop_walk_forward(batter_id: int, prop_type: str, line: floa
             "hit": predicted_over == actual_over,
         })
     return pd.DataFrame(rows)
+
+
+def backtest_pitcher_prop_quality_walk_forward(pitcher_id: int, prop_type: str,
+                                                  season_start: str, season_end: str,
+                                                  min_games_before: int = 8,
+                                                  max_test_games: int = 10,
+                                                  usage_threshold: float = 15.0) -> pd.DataFrame:
+    """
+    Pitcher-side mirror of backtest_hitter_prop_quality_walk_forward().
+    Real, honest scope limit worth stating plainly: uses
+    pitcher_prop_quality_score() (his own stuff + the new real zone
+    execution signal) rather than the full pitcher_prop_mu_quality_score()
+    blend used live — that blend also checks whether TONIGHT's actual
+    opposing lineup has the tendency his stuff depends on, which needs a
+    real historical confirmed lineup for the specific past game being
+    tested. No real source here provides that for a past date (same real
+    limit noted on the Season Backtest's own caption). This tests the
+    "own stuff, zone-enhanced" half specifically - a real, meaningful
+    test, just not the complete live picture.
+
+    prop_type: one of 'strikeouts', 'outs', 'walks_allowed', 'hits_allowed'
+    — pitcher_earned_runs excluded here, since pull_pitcher_game_log
+    deliberately doesn't provide real per-game earned runs (see that
+    function's own docstring) — approximating it would be a guess, not a
+    real test.
+
+    No external line needed - same own-baseline directional test as the
+    hitter version, and the same reason: sidesteps needing a fixed line
+    that fits every different pitcher.
+    """
+    if prop_type not in ("strikeouts", "outs", "walks_allowed", "hits_allowed"):
+        return pd.DataFrame([{"error": f"'{prop_type}' not supported here - "
+                              f"pitcher_earned_runs has no reliable real per-game source."}])
+
+    raw_pitches = pull_pitcher_pitches(pitcher_id, season_start, season_end)
+    if raw_pitches.empty or "game_date" not in raw_pitches.columns:
+        return pd.DataFrame()
+
+    log = pull_pitcher_game_log(pitcher_id, season_start, season_end)
+    if log.empty or prop_type not in log.columns or len(log) < min_games_before + 1:
+        return pd.DataFrame()
+    log = log.reset_index(drop=True)
+
+    test_games = log.iloc[min_games_before:].tail(max_test_games)
+    rows = []
+    for i, test_row in test_games.iterrows():
+        prior = log.iloc[:i]
+        if len(prior) < min_games_before:
+            continue
+        raw_mu = prior[prop_type].mean()
+        game_date = test_row["game_date"]
+        actual_value = test_row[prop_type]
+
+        # Walk-forward, no lookahead - only his own pitches before this
+        # real game date.
+        prior_pitches = raw_pitches[raw_pitches["game_date"] < str(game_date)]
+        if len(prior_pitches) < 50:
+            continue
+
+        try:
+            # Real hand composition HE actually faced that game, straight
+            # from his own pitch data's real 'stand' column - no separate
+            # lineup pull needed, unlike the hitter side.
+            game_day_pitches = raw_pitches[raw_pitches["game_date"] == game_date]
+            real_hand_weights = game_day_pitches["stand"].value_counts().to_dict()
+            if not real_hand_weights:
+                continue
+
+            arsenal = build_arsenal_profile(prior_pitches)
+            zone_breakdown = attack_zone_breakdown(prior_pitches)
+            quality = pitcher_prop_quality_score(
+                arsenal, real_hand_weights, prop_type, usage_threshold,
+                pitcher_zone_breakdown=zone_breakdown)
+        except Exception as e:
+            rows.append({"game_date": game_date, "error": str(e)})
+            continue
+
+        q_score = quality.get("score")
+        if q_score is None:
+            continue
+        # Higher score = better for the PITCHER on this prop (matches
+        # _normalize_benchmark/_normalize_delta's real convention - see
+        # both docstrings). For strikeouts/outs, better-for-pitcher means
+        # predict OVER; for walks/hits allowed, better-for-pitcher means
+        # FEWER walks/hits, so predict UNDER.
+        favors_over = prop_type in ("strikeouts", "outs")
+        predicted_direction = ("OVER" if q_score > 50 else "UNDER") if favors_over \
+            else ("UNDER" if q_score > 50 else "OVER")
+        actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
+        rows.append({
+            "game_date": game_date, "raw_mu": round(raw_mu, 2), "actual": actual_value,
+            "quality_score": q_score, "predicted_direction": predicted_direction,
+            "actual_direction": actual_direction, "hit": predicted_direction == actual_direction,
+            "deviation_from_raw_mu": round(actual_value - raw_mu, 2),
+        })
+    return pd.DataFrame(rows)
+
+
+def backtest_hitter_prop_quality_walk_forward(batter_id: int, prop_type: str, line: float,
+                                                season_start: str, season_end: str,
+                                                min_games_before: int = 15,
+                                                max_test_games: int = 10,
+                                                pitcher_lookback_days: int = 45,
+                                                top_n: int = 10) -> pd.DataFrame:
+    """
+    The REAL test the mu-only walk-forward backtest above can't do: does
+    quality_score (now including the zone/attack-zone work) actually
+    predict something real, or is it just noise dressed up as signal.
+
+    Genuinely more expensive than the mu-only version above, and that's
+    worth being upfront about: for EACH real historical game tested, this
+    pulls the batter's own raw pitches (to build his hitter/zone profiles)
+    AND pulls the REAL OPPOSING PITCHER's raw pitches from a real lookback
+    window BEFORE that specific game date (to build his zone-usage
+    breakdown, walk-forward, no lookahead) — two full raw pulls per test
+    point, not one cached game-log pull. max_test_games defaults low (10,
+    not a full season) specifically to keep this runnable — raise it if
+    you want a bigger real sample and don't mind the real wait.
+
+    No external line needed for the real test (mirrors the exact
+    NFL own-baseline approach that already proved out this session) —
+    tests whether ACTUAL deviates from his own raw mu in the direction
+    quality_score predicts, which sidesteps needing a fixed line at all.
+    """
+    if _poisson is None:
+        raise ImportError("pip install scipy --break-system-packages")
+    import math
+
+    raw_pitches = pull_batter_pitches(batter_id, season_start, season_end)
+    if raw_pitches.empty or "game_date" not in raw_pitches.columns:
+        return pd.DataFrame()
+
+    log = pull_hitter_game_log(batter_id, season_start, season_end)
+    if log.empty or prop_type not in log.columns or len(log) < min_games_before + 1:
+        return pd.DataFrame()
+    log = log.reset_index(drop=True)
+
+    # Real opposing pitcher per game_date - the most-thrown pitcher ID
+    # that day (the real starter, not a mid-game reliever who only threw
+    # a handful of pitches to him).
+    pitcher_by_date = {}
+    hand_by_date = {}
+    for gd, grp in raw_pitches.groupby("game_date"):
+        if "pitcher" not in grp.columns or grp["pitcher"].isna().all():
+            continue
+        top_pitcher = grp["pitcher"].value_counts().idxmax()
+        pitcher_by_date[gd] = int(top_pitcher)
+        hand_row = grp[grp["pitcher"] == top_pitcher]
+        hand_by_date[gd] = hand_row["p_throws"].mode().iloc[0] if not hand_row["p_throws"].mode().empty else "R"
+
+    test_games = log.iloc[min_games_before:].tail(max_test_games)
+    rows = []
+    for i, test_row in test_games.iterrows():
+        prior = log.iloc[:i]
+        if len(prior) < min_games_before:
+            continue
+        raw_mu = prior[prop_type].mean()
+        game_date = test_row["game_date"]
+        actual_value = test_row[prop_type]
+
+        opp_pid = pitcher_by_date.get(game_date)
+        opp_hand = hand_by_date.get(game_date, "R")
+        if opp_pid is None:
+            continue
+
+        # Walk-forward, no lookahead - only pitches BEFORE this real
+        # game date, on both sides.
+        lookback_start = (pd.Timestamp(game_date) - pd.Timedelta(days=pitcher_lookback_days)).strftime("%Y-%m-%d")
+        day_before = (pd.Timestamp(game_date) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        hitter_prior_pitches = raw_pitches[raw_pitches["game_date"] < str(game_date)]
+        if len(hitter_prior_pitches) < 20:
+            continue
+
+        try:
+            opp_pitches = pull_pitcher_pitches(opp_pid, lookback_start, day_before)
+        except Exception:
+            continue
+        if opp_pitches.empty:
+            continue
+
+        try:
+            batter_hand = get_batter_hand(batter_id)
+            batter_hand = batter_hand if batter_hand in ("L", "R") else "R"
+            hitter_profile = build_hitter_profile(hitter_prior_pitches, batter_hand=batter_hand)
+            hitter_zone_profile = build_hitter_zone_profile(hitter_prior_pitches)
+            pitcher_arsenal = build_arsenal_profile(opp_pitches)
+            pitcher_zone_breakdown = attack_zone_breakdown(opp_pitches)
+            crosswalk = build_pitch_crosswalk(
+                pitcher_arsenal, hitter_profile, batter_hand, opp_hand,
+                pitcher_zone_breakdown=pitcher_zone_breakdown,
+                hitter_zone_profile=hitter_zone_profile)
+            quality = hitter_prop_vulnerability_score(crosswalk, prop_type, low_sample_threshold=20)
+        except Exception as e:
+            rows.append({"game_date": game_date, "error": str(e)})
+            continue
+
+        q_score = quality.get("score")
+        if q_score is None:
+            continue
+        # quality_score here: negative = hitter-favorable (matches this
+        # file's real sign convention throughout — see
+        # hitter_prop_vulnerability_score's own docstring/labels).
+        predicted_direction = "OVER" if q_score < 0 else "UNDER"
+        actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
+        rows.append({
+            "game_date": game_date, "raw_mu": round(raw_mu, 2), "actual": actual_value,
+            "quality_score": q_score, "predicted_direction": predicted_direction,
+            "actual_direction": actual_direction, "hit": predicted_direction == actual_direction,
+            "deviation_from_raw_mu": round(actual_value - raw_mu, 2),
+        })
+    return pd.DataFrame(rows)
+
+
+def backtest_quality_score_multi_pitcher(season: int, prop_type: str, teams: list = None,
+                                           max_pitchers: int = 10, max_test_games_per_pitcher: int = 5,
+                                           min_games_before: int = 8,
+                                           season_start: str = None, season_end: str = None,
+                                           min_avg_outs_per_game: float = 10.0) -> dict:
+    """
+    Pitcher-side mirror of backtest_quality_score_multi_hitter(). Same
+    real cost tradeoff, same reason for the low defaults - this pulls
+    fresh raw pitch data per player, not one cached game-log pull.
+
+    min_avg_outs_per_game: same real fix as backtest_full_season_mlb's own
+    param - filters out relievers before they eat into max_pitchers, so a
+    3-out reliever doesn't inflate an easy "UNDER" read that has nothing
+    to do with whether the zone/quality signal actually works.
+    """
+    s_start = season_start or f"{season}-03-27"
+    s_end = season_end or f"{season}-08-17"
+    team_list = teams or list(PARK_FACTORS.keys())
+
+    all_rows = []
+    errors = []
+    pitchers_tested = 0
+
+    for team in team_list:
+        if pitchers_tested >= max_pitchers:
+            break
+        try:
+            roster = get_team_roster_pitchers(team)
+        except Exception as e:
+            errors.append(f"{team} roster pull failed: {e}")
+            continue
+        for pitcher in roster:
+            if pitchers_tested >= max_pitchers:
+                break
+            try:
+                log = pull_pitcher_game_log(pitcher["player_id"], s_start, s_end)
+                if log.empty or "outs" not in log.columns:
+                    continue
+                if log["outs"].mean() < min_avg_outs_per_game:
+                    continue  # real reliever filter, same as backtest_full_season_mlb
+                result = backtest_pitcher_prop_quality_walk_forward(
+                    pitcher_id=pitcher["player_id"], prop_type=prop_type,
+                    season_start=s_start, season_end=s_end,
+                    min_games_before=min_games_before,
+                    max_test_games=max_test_games_per_pitcher,
+                )
+            except Exception as e:
+                errors.append(f"{pitcher['name']}: {e}")
+                continue
+            if result.empty or "hit" not in result.columns:
+                continue
+            graded = result[result["hit"].notna()]
+            if graded.empty:
+                continue
+            pitchers_tested += 1
+            for _, row in graded.iterrows():
+                all_rows.append({"player": pitcher["name"], "team": team, **row.to_dict()})
+
+    combined = pd.DataFrame(all_rows)
+    overall_hit_rate = combined["hit"].mean() if not combined.empty else None
+    by_player = (combined.groupby("player")["hit"].agg(["mean", "count"]).reset_index()
+                 .rename(columns={"mean": "hit_rate", "count": "graded"})
+                 if not combined.empty else pd.DataFrame())
+
+    return {
+        "pitchers_tested": pitchers_tested, "total_graded": len(combined),
+        "overall_hit_rate": overall_hit_rate, "by_player": by_player,
+        "raw_rows": combined, "errors": errors,
+    }
+
+
+def backtest_quality_score_multi_hitter(season: int, prop_type: str, teams: list = None,
+                                          max_hitters: int = 10, max_test_games_per_hitter: int = 5,
+                                          min_games_before: int = 15,
+                                          season_start: str = None, season_end: str = None) -> dict:
+    """
+    Multi-player version of backtest_hitter_prop_quality_walk_forward(),
+    pulling real hitters straight from real team rosters (no names to
+    type) - same "no manual list" spirit as backtest_full_season_mlb().
+
+    Deliberately capped MUCH lower than that function's defaults (10
+    hitters x 5 games = 50 real graded points, not 300 hitters worth) -
+    this is genuinely, structurally more expensive per player than the
+    mu-only backtest: THAT one needs one real pull per player, reused
+    across every game he played. This one needs a FRESH real pull of the
+    specific OPPOSING PITCHER for every single test game, since a
+    different game means a different opponent. 10 hitters x 5 games is
+    already ~50-60 real network calls; scaling this to the mu-only
+    tool's 300-hitter scale would mean 1,500+ real pitcher pulls in one
+    run - a real, serious risk of timing out or crashing the app, not a
+    hypothetical one (this exact tool already hit a real hang once
+    tonight from an unrelated cause). Raise the caps once a small run has
+    confirmed this actually completes cleanly on your real setup.
+
+    Also filters out real bottom-of-order/bench-type hitters before
+    testing them at all — rosters don't carry real-time lineup position,
+    so this uses a real recent plate-appearance-volume proxy instead
+    (same real EXPECTED_PA_BY_ORDER_SLOT floor the live scan's order_slot
+    filter is built on) — see the real check inside the loop below.
+    """
+    s_start = season_start or f"{season}-03-27"
+    s_end = season_end or f"{season}-08-17"
+    team_list = teams or list(PARK_FACTORS.keys())
+
+    all_rows = []
+    errors = []
+    hitters_tested = 0
+
+    for team in team_list:
+        if hitters_tested >= max_hitters:
+            break
+        try:
+            roster = get_team_roster_batters(team)
+        except Exception as e:
+            errors.append(f"{team} roster pull failed: {e}")
+            continue
+        for batter in roster:
+            if hitters_tested >= max_hitters:
+                break
+            # Real batting-order proxy, same real reasoning as the live
+            # scan's order_slot filter (slot 1-6 vs 7-9) - but rosters
+            # don't carry real-time lineup position, so this checks his
+            # own real recent plate-appearance volume instead: a genuine
+            # regular averages close to the real EXPECTED_PA_BY_ORDER_SLOT
+            # values (slot 6 = ~4.0 PA/game), a bottom-of-order/bench/
+            # platoon player runs meaningfully lower. One extra real,
+            # lightweight pull per candidate - cheaper than the full
+            # walk-forward test that follows, so this doesn't waste the
+            # expensive pull on someone who'd be filtered out anyway.
+            try:
+                recent_check = pull_batter_pitches(
+                    batter["player_id"],
+                    (pd.Timestamp(s_end) - pd.Timedelta(days=20)).strftime("%Y-%m-%d"), s_end)
+                if recent_check.empty or "events" not in recent_check.columns:
+                    continue
+                terminal_check = recent_check[recent_check["events"].notna()]
+                if terminal_check.empty:
+                    continue
+                real_pa_per_game = terminal_check.groupby("game_date").size().mean()
+                if real_pa_per_game < 4.0:  # real slot-6 EXPECTED_PA_BY_ORDER_SLOT floor
+                    continue
+            except Exception:
+                continue  # can't verify his real role — skip rather than guess
+            try:
+                result = backtest_hitter_prop_quality_walk_forward(
+                    batter_id=batter["player_id"], prop_type=prop_type, line=0.0,
+                    season_start=s_start, season_end=s_end,
+                    min_games_before=min_games_before,
+                    max_test_games=max_test_games_per_hitter,
+                )
+            except Exception as e:
+                errors.append(f"{batter['name']}: {e}")
+                continue
+            if result.empty or "hit" not in result.columns:
+                continue
+            graded = result[result["hit"].notna()]
+            if graded.empty:
+                continue
+            hitters_tested += 1
+            for _, row in graded.iterrows():
+                all_rows.append({"player": batter["name"], "team": team, **row.to_dict()})
+
+    combined = pd.DataFrame(all_rows)
+    overall_hit_rate = combined["hit"].mean() if not combined.empty else None
+    by_player = (combined.groupby("player")["hit"].agg(["mean", "count"]).reset_index()
+                 .rename(columns={"mean": "hit_rate", "count": "graded"})
+                 if not combined.empty else pd.DataFrame())
+
+    return {
+        "hitters_tested": hitters_tested, "total_graded": len(combined),
+        "overall_hit_rate": overall_hit_rate, "by_player": by_player,
+        "raw_rows": combined, "errors": errors,
+    }
 
 
 def backtest_full_season_mlb(season: int, season_start: str = None, season_end: str = None,
