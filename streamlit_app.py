@@ -31,7 +31,7 @@ from prop_model_combined import (
     backtest_hitter_prop_quality_walk_forward, get_batter_id,
     backtest_quality_score_multi_hitter,
     backtest_pitcher_prop_quality_walk_forward, backtest_quality_score_multi_pitcher,
-    get_pitcher_id,
+    get_pitcher_id, backtest_quality_score_all_props,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -367,24 +367,32 @@ sb_season = sb_col1.number_input("Season", value=2026, step=1, key="sb_season")
 sb_teams_raw = sb_col2.text_input("Teams (comma-separated, blank = all 30 - NOT recommended at "
                                    "this cost)", value="yankees, dodgers", key="sb_teams_raw")
 
-sb_col3, sb_col4 = st.columns(2)
-sb_hitter_prop = sb_col3.selectbox(
-    "Hitter prop to test",
-    ["hits", "total_bases", "singles", "home_runs", "hitter_hits_runs_rbi", "hitter_fantasy"],
-    key="sb_hitter_prop",
-    help="H+R+RBI and Fantasy use real official box-score data (runs/RBI) instead of the "
-         "pitch-derived log the other 4 use. Real, honest limit: live scoring for these two "
-         "also blends in real lineup-protection context (who's on base before/after him) that "
-         "this backtest can't reconstruct for a past game — this tests the matchup-crosswalk "
-         "half specifically, not the full live picture.")
-sb_pitcher_prop = sb_col4.selectbox(
-    "Pitcher prop to test",
-    ["strikeouts", "outs", "walks_allowed", "hits_allowed", "pitcher_earned_runs", "pitcher_fantasy"],
-    key="sb_pitcher_prop",
-    help="Earned Runs and Fantasy now use the real official box-score log instead of the "
-         "pitch-derived one, since that one deliberately excludes real earned runs. Same real "
-         "scope limit as before: this tests his own stuff quality, not the live scan's lineup-"
-         "verification half.")
+sb_all_props = st.checkbox(
+    "Test ALL real props automatically (6 per side), not just one",
+    value=False, key="sb_all_props",
+    help="Runs the full backtest once per real prop, combining into one table per side with "
+         "real OVER/UNDER hit rates for each prop. Roughly 6x the cost of testing one prop - "
+         "keep players/games LOW when this is checked.")
+
+if not sb_all_props:
+    sb_col3, sb_col4 = st.columns(2)
+    sb_hitter_prop = sb_col3.selectbox(
+        "Hitter prop to test",
+        ["hits", "total_bases", "singles", "home_runs", "hitter_hits_runs_rbi", "hitter_fantasy"],
+        key="sb_hitter_prop",
+        help="H+R+RBI and Fantasy use real official box-score data (runs/RBI) instead of the "
+             "pitch-derived log the other 4 use. Real, honest limit: live scoring for these two "
+             "also blends in real lineup-protection context (who's on base before/after him) that "
+             "this backtest can't reconstruct for a past game — this tests the matchup-crosswalk "
+             "half specifically, not the full live picture.")
+    sb_pitcher_prop = sb_col4.selectbox(
+        "Pitcher prop to test",
+        ["strikeouts", "outs", "walks_allowed", "hits_allowed", "pitcher_earned_runs", "pitcher_fantasy"],
+        key="sb_pitcher_prop",
+        help="Earned Runs and Fantasy now use the real official box-score log instead of the "
+             "pitch-derived one, since that one deliberately excludes real earned runs. Same real "
+             "scope limit as before: this tests his own stuff quality, not the live scan's lineup-"
+             "verification half.")
 
 sb_col5, sb_col6 = st.columns(2)
 sb_max_hitters = sb_col5.number_input("Max hitters (keep LOW)", min_value=1, max_value=30,
@@ -402,85 +410,133 @@ if st.button("Run Scan Both Sides", type="primary", key="sb_run_btn"):
     sb_teams_list = [t.strip() for t in sb_teams_raw.split(",") if t.strip()] or None
     est_calls = (int(sb_max_hitters) * int(sb_games_per_hitter) + int(sb_max_hitters)
                  + int(sb_max_pitchers) * int(sb_games_per_pitcher) + int(sb_max_pitchers))
+    if sb_all_props:
+        est_calls *= 6
     with st.spinner(f"Walk-forward testing real hitters AND pitchers — roughly {est_calls} real "
                      f"network calls total, this will genuinely take a while..."):
-        try:
-            st.session_state.sb_hitter_result = backtest_quality_score_multi_hitter(
-                season=int(sb_season), prop_type=sb_hitter_prop, teams=sb_teams_list,
-                max_hitters=int(sb_max_hitters), max_test_games_per_hitter=int(sb_games_per_hitter),
-            )
-        except Exception as e:
-            st.error(f"Hitter-side scan failed: {e}")
-            st.session_state.sb_hitter_result = None
-        try:
-            st.session_state.sb_pitcher_result = backtest_quality_score_multi_pitcher(
-                season=int(sb_season), prop_type=sb_pitcher_prop, teams=sb_teams_list,
-                max_pitchers=int(sb_max_pitchers), max_test_games_per_pitcher=int(sb_games_per_pitcher),
-            )
-        except Exception as e:
-            st.error(f"Pitcher-side scan failed: {e}")
-            st.session_state.sb_pitcher_result = None
+        if sb_all_props:
+            try:
+                st.session_state.sb_hitter_result = backtest_quality_score_all_props(
+                    side="hitter", season=int(sb_season), teams=sb_teams_list,
+                    max_players=int(sb_max_hitters), max_test_games_per_player=int(sb_games_per_hitter),
+                )
+            except Exception as e:
+                st.error(f"Hitter-side all-props scan failed: {e}")
+                st.session_state.sb_hitter_result = None
+            try:
+                st.session_state.sb_pitcher_result = backtest_quality_score_all_props(
+                    side="pitcher", season=int(sb_season), teams=sb_teams_list,
+                    max_players=int(sb_max_pitchers), max_test_games_per_player=int(sb_games_per_pitcher),
+                )
+            except Exception as e:
+                st.error(f"Pitcher-side all-props scan failed: {e}")
+                st.session_state.sb_pitcher_result = None
+        else:
+            try:
+                st.session_state.sb_hitter_result = backtest_quality_score_multi_hitter(
+                    season=int(sb_season), prop_type=sb_hitter_prop, teams=sb_teams_list,
+                    max_hitters=int(sb_max_hitters), max_test_games_per_hitter=int(sb_games_per_hitter),
+                )
+            except Exception as e:
+                st.error(f"Hitter-side scan failed: {e}")
+                st.session_state.sb_hitter_result = None
+            try:
+                st.session_state.sb_pitcher_result = backtest_quality_score_multi_pitcher(
+                    season=int(sb_season), prop_type=sb_pitcher_prop, teams=sb_teams_list,
+                    max_pitchers=int(sb_max_pitchers), max_test_games_per_pitcher=int(sb_games_per_pitcher),
+                )
+            except Exception as e:
+                st.error(f"Pitcher-side scan failed: {e}")
+                st.session_state.sb_pitcher_result = None
 
 if st.session_state.get("sb_hitter_result") is not None or st.session_state.get("sb_pitcher_result") is not None:
     sb_hit_res = st.session_state.get("sb_hitter_result")
     sb_pit_res = st.session_state.get("sb_pitcher_result")
 
-    st.subheader("Hitter results")
-    if sb_hit_res is None or sb_hit_res["total_graded"] == 0:
-        st.warning("No graded hitter games came back.")
-    else:
-        st.success(f"Tested {sb_hit_res['hitters_tested']} real hitters — "
-                  f"{sb_hit_res['total_graded']} real graded games total.")
-        st.metric("Hitter overall hit rate", f"{sb_hit_res['overall_hit_rate']*100:.1f}%"
-                  if sb_hit_res['overall_hit_rate'] is not None else "N/A")
-        hit_db = sb_hit_res.get("direction_breakdown", {})
-        if hit_db:
-            db_cols = st.columns(len(hit_db))
-            for i, (direction, stats) in enumerate(hit_db.items()):
-                db_cols[i].metric(f"{direction} predicted ({stats['count']})",
-                                  f"{stats['hit_rate']*100:.0f}%")
-            st.caption("If one direction is predicted almost exclusively AND its hit rate is "
-                       "well below 50%, that's a real, systematic bias — not just a bad-luck "
-                       "sample. Roughly even counts with hit rates near 50% on both sides "
-                       "points at noise instead.")
-        if not sb_hit_res["by_player"].empty:
-            hit_display = sb_hit_res["by_player"].copy()
-            hit_display["hit_rate"] = (hit_display["hit_rate"] * 100).round(1).astype(str) + "%"
-            st.dataframe(hit_display.sort_values("graded", ascending=False),
-                        use_container_width=True, hide_index=True)
-        if sb_hit_res["errors"]:
-            with st.expander(f"⚠️ {len(sb_hit_res['errors'])} hitter-side error(s)"):
-                for e in sb_hit_res["errors"][:50]:
-                    st.text(e)
+    if sb_all_props:
+        st.subheader("Hitter results — every real prop")
+        if sb_hit_res is None or sb_hit_res.empty:
+            st.warning("No graded hitter results came back.")
+        else:
+            hit_display = sb_hit_res.copy()
+            for col in ["overall_hit_rate", "over_hit_rate", "under_hit_rate"]:
+                if col in hit_display.columns:
+                    hit_display[col] = hit_display[col].apply(
+                        lambda v: f"{v*100:.0f}%" if v is not None and pd.notna(v) else "N/A")
+            st.dataframe(hit_display, use_container_width=True, hide_index=True)
+            st.caption("50% is the real coinflip baseline on overall/over/under hit rates. A "
+                       "prop with a real, large graded sample and a rate meaningfully above 50% "
+                       "is genuine evidence that specific prop is working — treat each prop on "
+                       "its own, don't average across the table.")
 
-    st.subheader("Pitcher results")
-    if sb_pit_res is None or sb_pit_res["total_graded"] == 0:
-        st.warning("No graded pitcher games came back.")
-    else:
-        st.success(f"Tested {sb_pit_res['pitchers_tested']} real pitchers — "
-                  f"{sb_pit_res['total_graded']} real graded games total.")
-        st.metric("Pitcher overall hit rate", f"{sb_pit_res['overall_hit_rate']*100:.1f}%"
-                  if sb_pit_res['overall_hit_rate'] is not None else "N/A")
-        pit_db = sb_pit_res.get("direction_breakdown", {})
-        if pit_db:
-            db_cols2 = st.columns(len(pit_db))
-            for i, (direction, stats) in enumerate(pit_db.items()):
-                db_cols2[i].metric(f"{direction} predicted ({stats['count']})",
-                                   f"{stats['hit_rate']*100:.0f}%")
-            st.caption("Same real check as the hitter side — a heavily skewed direction with a "
-                       "poor hit rate on that side specifically points at a systematic bias.")
-        if not sb_pit_res["by_player"].empty:
-            pit_display = sb_pit_res["by_player"].copy()
-            pit_display["hit_rate"] = (pit_display["hit_rate"] * 100).round(1).astype(str) + "%"
-            st.dataframe(pit_display.sort_values("graded", ascending=False),
-                        use_container_width=True, hide_index=True)
-        if sb_pit_res["errors"]:
-            with st.expander(f"⚠️ {len(sb_pit_res['errors'])} pitcher-side error(s)"):
-                for e in sb_pit_res["errors"][:50]:
-                    st.text(e)
+        st.subheader("Pitcher results — every real prop")
+        if sb_pit_res is None or sb_pit_res.empty:
+            st.warning("No graded pitcher results came back.")
+        else:
+            pit_display = sb_pit_res.copy()
+            for col in ["overall_hit_rate", "over_hit_rate", "under_hit_rate"]:
+                if col in pit_display.columns:
+                    pit_display[col] = pit_display[col].apply(
+                        lambda v: f"{v*100:.0f}%" if v is not None and pd.notna(v) else "N/A")
+            st.dataframe(pit_display, use_container_width=True, hide_index=True)
 
-    st.caption("50% is the real coinflip baseline on both tables — meaningfully above that "
-               "across a real sample is genuine evidence the zone/matchup work is adding "
-               "something real, on whichever side shows it.")
+    else:
+        st.subheader("Hitter results")
+        if sb_hit_res is None or sb_hit_res["total_graded"] == 0:
+            st.warning("No graded hitter games came back.")
+        else:
+            st.success(f"Tested {sb_hit_res['hitters_tested']} real hitters — "
+                      f"{sb_hit_res['total_graded']} real graded games total.")
+            st.metric("Hitter overall hit rate", f"{sb_hit_res['overall_hit_rate']*100:.1f}%"
+                      if sb_hit_res['overall_hit_rate'] is not None else "N/A")
+            hit_db = sb_hit_res.get("direction_breakdown", {})
+            if hit_db:
+                db_cols = st.columns(len(hit_db))
+                for i, (direction, stats) in enumerate(hit_db.items()):
+                    db_cols[i].metric(f"{direction} predicted ({stats['count']})",
+                                      f"{stats['hit_rate']*100:.0f}%")
+                st.caption("If one direction is predicted almost exclusively AND its hit rate is "
+                           "well below 50%, that's a real, systematic bias — not just a bad-luck "
+                           "sample. Roughly even counts with hit rates near 50% on both sides "
+                           "points at noise instead.")
+            if not sb_hit_res["by_player"].empty:
+                hit_player_display = sb_hit_res["by_player"].copy()
+                hit_player_display["hit_rate"] = (hit_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
+                st.dataframe(hit_player_display.sort_values("graded", ascending=False),
+                            use_container_width=True, hide_index=True)
+            if sb_hit_res["errors"]:
+                with st.expander(f"⚠️ {len(sb_hit_res['errors'])} hitter-side error(s)"):
+                    for e in sb_hit_res["errors"][:50]:
+                        st.text(e)
+
+        st.subheader("Pitcher results")
+        if sb_pit_res is None or sb_pit_res["total_graded"] == 0:
+            st.warning("No graded pitcher games came back.")
+        else:
+            st.success(f"Tested {sb_pit_res['pitchers_tested']} real pitchers — "
+                      f"{sb_pit_res['total_graded']} real graded games total.")
+            st.metric("Pitcher overall hit rate", f"{sb_pit_res['overall_hit_rate']*100:.1f}%"
+                      if sb_pit_res['overall_hit_rate'] is not None else "N/A")
+            pit_db = sb_pit_res.get("direction_breakdown", {})
+            if pit_db:
+                db_cols2 = st.columns(len(pit_db))
+                for i, (direction, stats) in enumerate(pit_db.items()):
+                    db_cols2[i].metric(f"{direction} predicted ({stats['count']})",
+                                       f"{stats['hit_rate']*100:.0f}%")
+                st.caption("Same real check as the hitter side — a heavily skewed direction with a "
+                           "poor hit rate on that side specifically points at a systematic bias.")
+            if not sb_pit_res["by_player"].empty:
+                pit_player_display = sb_pit_res["by_player"].copy()
+                pit_player_display["hit_rate"] = (pit_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
+                st.dataframe(pit_player_display.sort_values("graded", ascending=False),
+                            use_container_width=True, hide_index=True)
+            if sb_pit_res["errors"]:
+                with st.expander(f"⚠️ {len(sb_pit_res['errors'])} pitcher-side error(s)"):
+                    for e in sb_pit_res["errors"][:50]:
+                        st.text(e)
+
+    st.caption("50% is the real coinflip baseline — meaningfully above that across a real "
+               "sample is genuine evidence the zone/matchup work is adding something real.")
+
 
 
