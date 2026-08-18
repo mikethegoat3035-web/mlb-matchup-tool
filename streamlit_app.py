@@ -378,13 +378,16 @@ if not sb_all_props:
     sb_col3, sb_col4 = st.columns(2)
     sb_hitter_prop = sb_col3.selectbox(
         "Hitter prop to test",
-        ["hits", "total_bases", "singles", "home_runs", "hitter_hits_runs_rbi", "hitter_fantasy"],
+        ["total_bases", "singles", "home_runs", "hitter_hits_runs_rbi", "hitter_fantasy"],
         key="sb_hitter_prop",
-        help="H+R+RBI and Fantasy use real official box-score data (runs/RBI) instead of the "
-             "pitch-derived log the other 4 use. Real, honest limit: live scoring for these two "
-             "also blends in real lineup-protection context (who's on base before/after him) that "
-             "this backtest can't reconstruct for a past game — this tests the matchup-crosswalk "
-             "half specifically, not the full live picture.")
+        help="'Hits' isn't offered standalone here on purpose - real book pricing on it is "
+             "consistently bad value, same reason it's not in the live scan either. It's still "
+             "genuinely used as a real component feeding H+R+RBI and Fantasy below. H+R+RBI and "
+             "Fantasy use real official box-score data (runs/RBI) instead of the pitch-derived "
+             "log the others use. Real, honest limit: live scoring for these two also blends in "
+             "real lineup-protection context (who's on base before/after him) that this backtest "
+             "can't reconstruct for a past game — this tests the matchup-crosswalk half "
+             "specifically, not the full live picture.")
     sb_pitcher_prop = sb_col4.selectbox(
         "Pitcher prop to test",
         ["strikeouts", "outs", "walks_allowed", "hits_allowed", "pitcher_earned_runs", "pitcher_fantasy"],
