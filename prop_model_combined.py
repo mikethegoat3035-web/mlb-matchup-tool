@@ -5716,22 +5716,35 @@ def pull_confirmed_lineup(game_pk: int) -> dict:
             "sportId": 1, "gamePk": game_pk, "hydrate": "lineups,probablePitcher",
         })
         game = raw.get("dates", [{}])[0].get("games", [{}])[0]
+        home_ready, away_ready = False, False
         for side in ("home", "away"):
             lineup_raw = game.get("lineups", {}).get(f"{side}Players", [])
-            if lineup_raw:
+            # Real fix for a real, confirmed bug: require a genuine FULL
+            # 9-player lineup, not just "some non-empty list." MLB's API
+            # can return partial/preliminary player data well before a
+            # real lineup posts - treating ANY non-empty result as
+            # "confirmed" produced real false positives (games showing
+            # confirmed hours before they should). 9 real, sequential
+            # entries is a much stronger, honest signal.
+            if len(lineup_raw) >= 9:
                 lineup = [{
                     "player_id": p.get("id"), "name": p.get("fullName"),
                     "order_slot": i + 1, "expected_pa": EXPECTED_PA_BY_ORDER_SLOT.get(i + 1, 4.0),
                 } for i, p in enumerate(lineup_raw)]
                 result[side] = lineup
-                result["lineup_status"] = "confirmed"
-        if result["lineup_status"] == "confirmed":
+                if side == "home":
+                    home_ready = True
+                else:
+                    away_ready = True
+        if home_ready and away_ready:
+            result["lineup_status"] = "confirmed"
             return result
     except (KeyError, IndexError, AttributeError):
         pass  # fall through to boxscore approach below
 
     # Attempt 2: parse full boxscore (fallback — see original implementation)
     box = statsapi.boxscore_data(game_pk)
+    home_ready, away_ready = False, False
     for side in ("home", "away"):
         team_players = box.get(f"{side}", {}).get("players", {}) if isinstance(box.get(side), dict) else {}
         lineup = []
@@ -5744,9 +5757,16 @@ def pull_confirmed_lineup(game_pk: int) -> dict:
                     "order_slot": int(str(order)[0]),
                     "expected_pa": EXPECTED_PA_BY_ORDER_SLOT.get(int(str(order)[0]), 4.0),
                 })
-        if lineup:
+        # Same real fix - require a genuine full lineup here too, not
+        # just "found at least one player with a battingOrder value."
+        if len(lineup) >= 9:
             result[side] = sorted(lineup, key=lambda x: x["order_slot"])
-            result["lineup_status"] = "confirmed"
+            if side == "home":
+                home_ready = True
+            else:
+                away_ready = True
+    if home_ready and away_ready:
+        result["lineup_status"] = "confirmed"
 
     return result
 
