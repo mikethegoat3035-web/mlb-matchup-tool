@@ -6414,25 +6414,40 @@ def backtest_pitcher_prop_quality_walk_forward(pitcher_id: int, prop_type: str,
     "own stuff, zone-enhanced" half specifically - a real, meaningful
     test, just not the complete live picture.
 
-    prop_type: one of 'strikeouts', 'outs', 'walks_allowed', 'hits_allowed'
-    — pitcher_earned_runs excluded here, since pull_pitcher_game_log
-    deliberately doesn't provide real per-game earned runs (see that
-    function's own docstring) — approximating it would be a guess, not a
-    real test.
+    prop_type: one of 'strikeouts', 'outs', 'walks_allowed', 'hits_allowed',
+    'pitcher_earned_runs', 'pitcher_fantasy'. The last two now use the real
+    official box-score log (pull_official_pitcher_game_log — same real fix
+    just applied on the hitter side for H+R+RBI/Fantasy) instead of the
+    pitch-derived log, since that one deliberately excludes real earned
+    runs (see its own docstring). This one real official pull happens to
+    already carry outs/K/BB/H/ER/win/quality_start together, so no merge
+    with the pitch-derived log is needed for these two.
 
     No external line needed - same own-baseline directional test as the
     hitter version, and the same reason: sidesteps needing a fixed line
     that fits every different pitcher.
     """
-    if prop_type not in ("strikeouts", "outs", "walks_allowed", "hits_allowed"):
-        return pd.DataFrame([{"error": f"'{prop_type}' not supported here - "
-                              f"pitcher_earned_runs has no reliable real per-game source."}])
+    uses_official = prop_type in ("pitcher_earned_runs", "pitcher_fantasy")
+    if prop_type not in ("strikeouts", "outs", "walks_allowed", "hits_allowed") and not uses_official:
+        return pd.DataFrame([{"error": f"'{prop_type}' not supported here."}])
 
     raw_pitches = pull_pitcher_pitches(pitcher_id, season_start, season_end)
     if raw_pitches.empty or "game_date" not in raw_pitches.columns:
         return pd.DataFrame()
 
-    log = pull_pitcher_game_log(pitcher_id, season_start, season_end)
+    if uses_official:
+        season_int = int(str(season_start)[:4])
+        log = pull_official_pitcher_game_log(pitcher_id, season_int)
+        if log.empty:
+            return pd.DataFrame()
+        log = log.copy()
+        log["pitcher_earned_runs"] = log["earned_runs"]
+        log["pitcher_fantasy"] = log.apply(lambda r: pitcher_fantasy_score({
+            "out": r["outs"], "strikeout": r["strikeouts"], "earned_run": r["earned_runs"],
+            "win": r["win"], "quality_start": r["quality_start"],
+        }), axis=1)
+    else:
+        log = pull_pitcher_game_log(pitcher_id, season_start, season_end)
     if log.empty or prop_type not in log.columns or len(log) < min_games_before + 1:
         return pd.DataFrame()
     log = log.reset_index(drop=True)
@@ -6479,7 +6494,7 @@ def backtest_pitcher_prop_quality_walk_forward(pitcher_id: int, prop_type: str,
         # both docstrings). For strikeouts/outs, better-for-pitcher means
         # predict OVER; for walks/hits allowed, better-for-pitcher means
         # FEWER walks/hits, so predict UNDER.
-        favors_over = prop_type in ("strikeouts", "outs")
+        favors_over = prop_type in ("strikeouts", "outs", "pitcher_fantasy")
         predicted_direction = ("OVER" if q_score > 50 else "UNDER") if favors_over \
             else ("UNDER" if q_score > 50 else "OVER")
         actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
@@ -6517,6 +6532,19 @@ def backtest_hitter_prop_quality_walk_forward(batter_id: int, prop_type: str, li
     NFL own-baseline approach that already proved out this session) —
     tests whether ACTUAL deviates from his own raw mu in the direction
     quality_score predicts, which sidesteps needing a fixed line at all.
+
+    'hitter_hits_runs_rbi' and 'hitter_fantasy' are supported too, using
+    the real official box-score log (pull_official_hitter_game_log) for
+    actual runs/RBI instead of the pitch-derived log. Real, honest scope
+    limit worth stating plainly: live scoring for these two also blends
+    in a real lineup-protection signal (who's on base before him, who
+    drives him in after him) that this backtest does NOT include — no
+    real source here reconstructs a confirmed historical lineup for a
+    past game (same limit the pitcher-side backtest already has for its
+    own lineup-verification half). hitter_prop_vulnerability_score()
+    safely falls back to its crosswalk-only 60% when lineup data isn't
+    supplied, so this tests that real half specifically, not the whole
+    live picture.
     """
     if _poisson is None:
         raise ImportError("pip install scipy --break-system-packages")
@@ -6526,7 +6554,20 @@ def backtest_hitter_prop_quality_walk_forward(batter_id: int, prop_type: str, li
     if raw_pitches.empty or "game_date" not in raw_pitches.columns:
         return pd.DataFrame()
 
-    log = pull_hitter_game_log(batter_id, season_start, season_end)
+    if prop_type in ("hitter_hits_runs_rbi", "hitter_fantasy"):
+        season_int = int(str(season_start)[:4])
+        log = pull_official_hitter_game_log(batter_id, season_int)
+        if log.empty:
+            return pd.DataFrame()
+        log = log.copy()
+        log["hitter_hits_runs_rbi"] = log["hits"] + log["runs"] + log["rbi"]
+        log["hitter_fantasy"] = log.apply(lambda r: hitter_fantasy_score({
+            "single": r["singles"], "double": r["doubles"], "triple": r["triples"],
+            "home_run": r["home_runs"], "run": r["runs"], "rbi": r["rbi"],
+            "walk": r["walks"], "hbp": r["hbp"], "stolen_base": r["stolen_bases"],
+        }), axis=1)
+    else:
+        log = pull_hitter_game_log(batter_id, season_start, season_end)
     if log.empty or prop_type not in log.columns or len(log) < min_games_before + 1:
         return pd.DataFrame()
     log = log.reset_index(drop=True)
