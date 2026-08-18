@@ -4646,22 +4646,29 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
     df["lean"] = df["p_over"].apply(lambda p: "OVER" if p >= 0.5 else "UNDER")
 
     # Real, whole-game readiness check: a game only counts as "ready to
-    # scan" once it has REAL rows on BOTH sides - at least one pitcher row
-    # AND at least one hitter row for that specific game_pk. Without this,
-    # a game could silently show up with only one side present (e.g. a
-    # pitcher's real data pull failed, so his own props never generated,
-    # but the opposing hitters happened to succeed) - showing a genuinely
-    # half-finished picture as if it were a normal result. Applied here,
-    # after all rows exist but before the real edge/quality filters, so a
-    # game gets excluded entirely rather than showing up looking complete
-    # when it isn't.
-    if "game_pk" in df.columns and "side" in df.columns:
-        sides_present = df.groupby("game_pk")["side"].apply(lambda s: set(s))
-        ready_games = sides_present[sides_present.apply(lambda s: {"pitcher", "hitter"}.issubset(s))].index
+    # scan" once BOTH real teams have BOTH a pitcher row AND hitter rows -
+    # not just "some pitcher row and some hitter row exist somewhere in
+    # this game." A real, confirmed gap in the earlier version: a game
+    # has two independent halves (home pitcher vs away hitters, away
+    # pitcher vs home hitters) - if one half's pitcher pull failed while
+    # the OTHER half fully succeeded, the old check saw "a pitcher row
+    # exists (from the working half) AND a hitter row exists (also from
+    # the working half)" and incorrectly called the whole game ready,
+    # even though one team's own pitcher and the opposing team's hitters
+    # were both still completely missing. Now requires 2 distinct real
+    # teams on the pitcher side AND 2 distinct real teams on the hitter
+    # side before a game counts as genuinely complete.
+    if "game_pk" in df.columns and "side" in df.columns and "team" in df.columns:
+        def _game_is_complete(grp):
+            pitcher_teams = set(grp.loc[grp["side"] == "pitcher", "team"])
+            hitter_teams = set(grp.loc[grp["side"] == "hitter", "team"])
+            return len(pitcher_teams) >= 2 and len(hitter_teams) >= 2
+        ready_mask = df.groupby("game_pk").apply(_game_is_complete)
+        ready_games = ready_mask[ready_mask].index
         df = df[df["game_pk"].isin(ready_games)]
         if df.empty:
             return pd.DataFrame([{"note": "Every confirmed game today is still missing real data on "
-                                  "one side (pitcher or hitters) - re-run closer to game time."}])
+                                  "at least one team's pitcher or hitters - re-run closer to game time."}])
 
     df = df[(df["edge"] >= min_edge) & (df["games_sampled"] >= min_games_sampled)]
     if min_quality_score is not None:
@@ -6753,6 +6760,7 @@ def backtest_quality_score_multi_pitcher(season: int, prop_type: str, teams: lis
         "pitchers_tested": pitchers_tested, "total_graded": len(combined),
         "overall_hit_rate": overall_hit_rate, "by_player": by_player,
         "direction_breakdown": direction_breakdown,
+        "signal_separation": compute_signal_separation_diagnostic(combined),
         "raw_rows": combined, "errors": errors,
     }
 
@@ -6767,6 +6775,47 @@ HITTER_BACKTEST_PROPS = ["total_bases", "singles", "home_runs",
 # something tested/offered on its own.
 PITCHER_BACKTEST_PROPS = ["strikeouts", "outs", "walks_allowed", "hits_allowed",
                            "pitcher_earned_runs", "pitcher_fantasy"]
+
+
+def compute_signal_separation_diagnostic(raw_rows: pd.DataFrame) -> dict:
+    """
+    Real, discreteness-robust test of whether the quality signal carries
+    genuine predictive value — built specifically because the binary
+    hit-rate test was proven this session to be structurally biased for
+    rare/low-count counting stats (median and mid-p corrections both
+    failed real numerical verification, see conversation history).
+
+    Instead of counting whether actual crossed a threshold, compares the
+    real AVERAGE deviation from own baseline (actual - raw_mu) between
+    OVER-predicted and UNDER-predicted real games. If real signal exists,
+    OVER-predicted games should average a MEANINGFULLY HIGHER real
+    deviation than UNDER-predicted games — this holds regardless of the
+    discreteness problem, since averaging across many real games smooths
+    out the exact-tie artifacts that broke the binary test.
+
+    raw_rows: the 'raw_rows' DataFrame already returned by
+    backtest_quality_score_multi_hitter/_pitcher (or the combined output
+    of backtest_quality_score_all_props) — needs 'predicted_direction'
+    and 'deviation_from_raw_mu' columns, both already present in that
+    real output, no new data collection required.
+    """
+    if raw_rows is None or raw_rows.empty:
+        return {"error": "No real graded rows to test."}
+    if "predicted_direction" not in raw_rows.columns or "deviation_from_raw_mu" not in raw_rows.columns:
+        return {"error": "Missing required real columns (predicted_direction / deviation_from_raw_mu)."}
+
+    over_group = raw_rows[raw_rows["predicted_direction"] == "OVER"]
+    under_group = raw_rows[raw_rows["predicted_direction"] == "UNDER"]
+
+    over_avg = over_group["deviation_from_raw_mu"].mean() if len(over_group) else None
+    under_avg = under_group["deviation_from_raw_mu"].mean() if len(under_group) else None
+    separation = (over_avg - under_avg) if (over_avg is not None and under_avg is not None) else None
+
+    return {
+        "over_n": len(over_group), "over_avg_deviation": over_avg,
+        "under_n": len(under_group), "under_avg_deviation": under_avg,
+        "separation": separation,
+    }
 
 
 def backtest_quality_score_all_props(side: str, season: int, teams: list = None,
@@ -6816,6 +6865,7 @@ def backtest_quality_score_all_props(side: str, season: int, teams: list = None,
         db = result.get("direction_breakdown", {})
         over_stats = db.get("OVER", {"count": 0, "hit_rate": None})
         under_stats = db.get("UNDER", {"count": 0, "hit_rate": None})
+        sep = result.get("signal_separation", {})
         rows.append({
             "prop": prop,
             "players_tested": result.get("hitters_tested", result.get("pitchers_tested", 0)),
@@ -6825,6 +6875,7 @@ def backtest_quality_score_all_props(side: str, season: int, teams: list = None,
             "over_hit_rate": over_stats["hit_rate"],
             "under_count": under_stats["count"],
             "under_hit_rate": under_stats["hit_rate"],
+            "signal_separation": sep.get("separation"),
         })
     return pd.DataFrame(rows)
 
@@ -6945,6 +6996,7 @@ def backtest_quality_score_multi_hitter(season: int, prop_type: str, teams: list
         "hitters_tested": hitters_tested, "total_graded": len(combined),
         "overall_hit_rate": overall_hit_rate, "by_player": by_player,
         "direction_breakdown": direction_breakdown,
+        "signal_separation": compute_signal_separation_diagnostic(combined),
         "raw_rows": combined, "errors": errors,
     }
 
