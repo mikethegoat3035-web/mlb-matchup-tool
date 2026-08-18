@@ -466,11 +466,19 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                 if col in hit_display.columns:
                     hit_display[col] = hit_display[col].apply(
                         lambda v: f"{v*100:.0f}%" if v is not None and pd.notna(v) else "N/A")
+            if "signal_separation" in hit_display.columns:
+                hit_display["signal_separation"] = hit_display["signal_separation"].apply(
+                    lambda v: f"{v:+.3f}" if v is not None and pd.notna(v) else "N/A")
             st.dataframe(hit_display, use_container_width=True, hide_index=True)
-            st.caption("50% is the real coinflip baseline on overall/over/under hit rates. A "
-                       "prop with a real, large graded sample and a rate meaningfully above 50% "
-                       "is genuine evidence that specific prop is working — treat each prop on "
-                       "its own, don't average across the table.")
+            st.caption(
+                "50% is the real coinflip baseline on overall/over/under hit rates — but those "
+                "are known to be structurally biased for rare, low-count props (see conversation "
+                "history). 'signal_separation' is the real, discreteness-robust check instead: "
+                "the difference in average real outcome between OVER-predicted and UNDER-"
+                "predicted games. A clearly POSITIVE number there is real evidence of a genuine "
+                "signal for that prop, even where the raw hit rate looks weak. Treat each prop "
+                "on its own, don't average across the table."
+            )
 
         st.subheader("Pitcher results — every real prop")
         if sb_pit_res is None or sb_pit_res.empty:
@@ -481,6 +489,9 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                 if col in pit_display.columns:
                     pit_display[col] = pit_display[col].apply(
                         lambda v: f"{v*100:.0f}%" if v is not None and pd.notna(v) else "N/A")
+            if "signal_separation" in pit_display.columns:
+                pit_display["signal_separation"] = pit_display["signal_separation"].apply(
+                    lambda v: f"{v:+.3f}" if v is not None and pd.notna(v) else "N/A")
             st.dataframe(pit_display, use_container_width=True, hide_index=True)
 
     else:
@@ -502,6 +513,20 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                            "well below 50%, that's a real, systematic bias — not just a bad-luck "
                            "sample. Roughly even counts with hit rates near 50% on both sides "
                            "points at noise instead.")
+            hit_sep = sb_hit_res.get("signal_separation", {})
+            if hit_sep.get("separation") is not None:
+                st.metric("Signal separation (real, discreteness-robust test)",
+                          f"{hit_sep['separation']:+.3f}")
+                st.caption(
+                    f"OVER-predicted games averaged {hit_sep['over_avg_deviation']:+.3f} vs "
+                    f"raw baseline (n={hit_sep['over_n']}); UNDER-predicted averaged "
+                    f"{hit_sep['under_avg_deviation']:+.3f} (n={hit_sep['under_n']}). This "
+                    "compares real AVERAGE outcomes between the two groups instead of counting "
+                    "threshold crossings — built specifically because the hit-rate test above is "
+                    "known to be structurally biased for rare, low-count props (see conversation). "
+                    "A clearly POSITIVE number here is real evidence the signal separates good "
+                    "days from bad ones, even where the raw hit rate above looks weak."
+                )
             if not sb_hit_res["by_player"].empty:
                 hit_player_display = sb_hit_res["by_player"].copy()
                 hit_player_display["hit_rate"] = (hit_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
@@ -528,6 +553,16 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                                        f"{stats['hit_rate']*100:.0f}%")
                 st.caption("Same real check as the hitter side — a heavily skewed direction with a "
                            "poor hit rate on that side specifically points at a systematic bias.")
+            pit_sep = sb_pit_res.get("signal_separation", {})
+            if pit_sep.get("separation") is not None:
+                st.metric("Signal separation (real, discreteness-robust test)",
+                          f"{pit_sep['separation']:+.3f}")
+                st.caption(
+                    f"OVER-predicted games averaged {pit_sep['over_avg_deviation']:+.3f} vs raw "
+                    f"baseline (n={pit_sep['over_n']}); UNDER-predicted averaged "
+                    f"{pit_sep['under_avg_deviation']:+.3f} (n={pit_sep['under_n']}). Same real, "
+                    "discreteness-robust check as the hitter side."
+                )
             if not sb_pit_res["by_player"].empty:
                 pit_player_display = sb_pit_res["by_player"].copy()
                 pit_player_display["hit_rate"] = (pit_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
