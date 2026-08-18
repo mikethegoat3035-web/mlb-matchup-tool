@@ -5656,10 +5656,17 @@ def get_unconfirmed_games_today(date: str = None) -> pd.DataFrame:
     Returns a DataFrame with one row per game still missing a lineup:
     home_team, away_team, game_time, lineup_status, game_pk. Empty
     DataFrame (0 rows) if every game today already has both lineups in.
+    Returns None specifically when NO games could be found at all (too
+    early for the day's schedule to be posted, a real API/network issue,
+    etc.) — genuinely different from "0 pending because everything's
+    confirmed," and callers need to tell these apart: an empty DataFrame
+    used to look identical either way, which meant "couldn't check
+    anything" could silently display as "all ready" — a real, confirmed
+    false-positive, not a hypothetical one.
     """
     games = pull_todays_games(date=date)
     if games.empty:
-        return pd.DataFrame()
+        return None
     dh_labels = build_doubleheader_labels(games)
 
     pending_rows = []
@@ -6712,9 +6719,20 @@ def backtest_quality_score_multi_pitcher(season: int, prop_type: str, teams: lis
                  .rename(columns={"mean": "hit_rate", "count": "graded"})
                  if not combined.empty else pd.DataFrame())
 
+    # Same real directional diagnostic as the hitter side.
+    direction_breakdown = {}
+    if not combined.empty and "predicted_direction" in combined.columns:
+        for direction in ("OVER", "UNDER"):
+            subset = combined[combined["predicted_direction"] == direction]
+            if len(subset):
+                direction_breakdown[direction] = {
+                    "count": len(subset), "hit_rate": subset["hit"].mean(),
+                }
+
     return {
         "pitchers_tested": pitchers_tested, "total_graded": len(combined),
         "overall_hit_rate": overall_hit_rate, "by_player": by_player,
+        "direction_breakdown": direction_breakdown,
         "raw_rows": combined, "errors": errors,
     }
 
@@ -6816,9 +6834,25 @@ def backtest_quality_score_multi_hitter(season: int, prop_type: str, teams: list
                  .rename(columns={"mean": "hit_rate", "count": "graded"})
                  if not combined.empty else pd.DataFrame())
 
+    # Real diagnostic, same one that caught a real directional-bias
+    # finding on the NFL side — checks whether the signal is predicting
+    # one direction almost exclusively, and whether that direction is
+    # actually right more or less than half the time. A below-coinflip
+    # OVERALL rate combined with a heavily skewed direction split points
+    # at a systematic bias, not just noise.
+    direction_breakdown = {}
+    if not combined.empty and "predicted_direction" in combined.columns:
+        for direction in ("OVER", "UNDER"):
+            subset = combined[combined["predicted_direction"] == direction]
+            if len(subset):
+                direction_breakdown[direction] = {
+                    "count": len(subset), "hit_rate": subset["hit"].mean(),
+                }
+
     return {
         "hitters_tested": hitters_tested, "total_graded": len(combined),
         "overall_hit_rate": overall_hit_rate, "by_player": by_player,
+        "direction_breakdown": direction_breakdown,
         "raw_rows": combined, "errors": errors,
     }
 
