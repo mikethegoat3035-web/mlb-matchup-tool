@@ -6757,6 +6757,72 @@ def backtest_quality_score_multi_pitcher(season: int, prop_type: str, teams: lis
     }
 
 
+HITTER_BACKTEST_PROPS = ["hits", "total_bases", "singles", "home_runs",
+                          "hitter_hits_runs_rbi", "hitter_fantasy"]
+PITCHER_BACKTEST_PROPS = ["strikeouts", "outs", "walks_allowed", "hits_allowed",
+                           "pitcher_earned_runs", "pitcher_fantasy"]
+
+
+def backtest_quality_score_all_props(side: str, season: int, teams: list = None,
+                                       max_players: int = 8, max_test_games_per_player: int = 4,
+                                       min_games_before: int = None,
+                                       season_start: str = None, season_end: str = None) -> pd.DataFrame:
+    """
+    Loops the existing multi-hitter/multi-pitcher backtest across EVERY
+    real prop for one side, combining results into ONE table: one row per
+    prop, with real OVER/UNDER counts and hit rates for each — answers
+    "which props actually work" directly instead of one at a time.
+
+    Real, honest cost warning: this runs the full multi-player backtest
+    ONCE PER PROP (6 real props per side), so the real network-call cost
+    is roughly 6x a single-prop run. Defaults kept deliberately modest
+    (8 players, 4 games each, capped teams) for exactly this reason —
+    "maximize everything" here would mean 6 props x 30 teams x every
+    real player on each roster, which would almost certainly time out or
+    crash the app, same real risk already hit once this session from an
+    unrelated cause. Scale up gradually, not all at once.
+
+    side: 'hitter' or 'pitcher'.
+    """
+    props = HITTER_BACKTEST_PROPS if side == "hitter" else PITCHER_BACKTEST_PROPS
+    default_min_games = 15 if side == "hitter" else 8
+    min_games = min_games_before if min_games_before is not None else default_min_games
+
+    rows = []
+    for prop in props:
+        try:
+            if side == "hitter":
+                result = backtest_quality_score_multi_hitter(
+                    season=season, prop_type=prop, teams=teams,
+                    max_hitters=max_players, max_test_games_per_hitter=max_test_games_per_player,
+                    min_games_before=min_games, season_start=season_start, season_end=season_end,
+                )
+            else:
+                result = backtest_quality_score_multi_pitcher(
+                    season=season, prop_type=prop, teams=teams,
+                    max_pitchers=max_players, max_test_games_per_pitcher=max_test_games_per_player,
+                    min_games_before=min_games, season_start=season_start, season_end=season_end,
+                )
+        except Exception as e:
+            rows.append({"prop": prop, "error": str(e)})
+            continue
+
+        db = result.get("direction_breakdown", {})
+        over_stats = db.get("OVER", {"count": 0, "hit_rate": None})
+        under_stats = db.get("UNDER", {"count": 0, "hit_rate": None})
+        rows.append({
+            "prop": prop,
+            "players_tested": result.get("hitters_tested", result.get("pitchers_tested", 0)),
+            "total_graded": result.get("total_graded", 0),
+            "overall_hit_rate": result.get("overall_hit_rate"),
+            "over_count": over_stats["count"],
+            "over_hit_rate": over_stats["hit_rate"],
+            "under_count": under_stats["count"],
+            "under_hit_rate": under_stats["hit_rate"],
+        })
+    return pd.DataFrame(rows)
+
+
 def backtest_quality_score_multi_hitter(season: int, prop_type: str, teams: list = None,
                                           max_hitters: int = 10, max_test_games_per_hitter: int = 5,
                                           min_games_before: int = 15,
