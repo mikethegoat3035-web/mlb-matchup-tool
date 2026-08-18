@@ -87,7 +87,13 @@ if st.button("Check which lineups aren't confirmed yet", key="check_unconfirmed_
 
 if "pending_games" in st.session_state:
     pending = st.session_state.pending_games
-    if pending.empty:
+    if pending is None:
+        st.error("Couldn't find ANY games for today - this is NOT the same as \"all "
+                 "confirmed.\" Most likely it's too early and MLB hasn't posted today's "
+                 "full schedule yet, or there's a real network/date issue. Try again "
+                 "closer to midday, and don't trust a scan yet if this is what you're "
+                 "seeing.")
+    elif pending.empty:
         st.success("All of today's games have confirmed lineups. Nothing pending.")
     else:
         st.warning(f"{len(pending)} game(s) still missing a confirmed lineup:")
@@ -427,6 +433,16 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                   f"{sb_hit_res['total_graded']} real graded games total.")
         st.metric("Hitter overall hit rate", f"{sb_hit_res['overall_hit_rate']*100:.1f}%"
                   if sb_hit_res['overall_hit_rate'] is not None else "N/A")
+        hit_db = sb_hit_res.get("direction_breakdown", {})
+        if hit_db:
+            db_cols = st.columns(len(hit_db))
+            for i, (direction, stats) in enumerate(hit_db.items()):
+                db_cols[i].metric(f"{direction} predicted ({stats['count']})",
+                                  f"{stats['hit_rate']*100:.0f}%")
+            st.caption("If one direction is predicted almost exclusively AND its hit rate is "
+                       "well below 50%, that's a real, systematic bias — not just a bad-luck "
+                       "sample. Roughly even counts with hit rates near 50% on both sides "
+                       "points at noise instead.")
         if not sb_hit_res["by_player"].empty:
             hit_display = sb_hit_res["by_player"].copy()
             hit_display["hit_rate"] = (hit_display["hit_rate"] * 100).round(1).astype(str) + "%"
@@ -445,6 +461,14 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                   f"{sb_pit_res['total_graded']} real graded games total.")
         st.metric("Pitcher overall hit rate", f"{sb_pit_res['overall_hit_rate']*100:.1f}%"
                   if sb_pit_res['overall_hit_rate'] is not None else "N/A")
+        pit_db = sb_pit_res.get("direction_breakdown", {})
+        if pit_db:
+            db_cols2 = st.columns(len(pit_db))
+            for i, (direction, stats) in enumerate(pit_db.items()):
+                db_cols2[i].metric(f"{direction} predicted ({stats['count']})",
+                                   f"{stats['hit_rate']*100:.0f}%")
+            st.caption("Same real check as the hitter side — a heavily skewed direction with a "
+                       "poor hit rate on that side specifically points at a systematic bias.")
         if not sb_pit_res["by_player"].empty:
             pit_display = sb_pit_res["by_player"].copy()
             pit_display["hit_rate"] = (pit_display["hit_rate"] * 100).round(1).astype(str) + "%"
