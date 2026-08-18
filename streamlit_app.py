@@ -374,6 +374,17 @@ sb_all_props = st.checkbox(
          "real OVER/UNDER hit rates for each prop. Roughly 6x the cost of testing one prop - "
          "keep players/games LOW when this is checked.")
 
+sb_use_location_only = False
+if not sb_all_props:
+    sb_use_location_only = st.checkbox(
+        "Hitter side: use BROADER location-only zone signal instead of pitch-specific",
+        value=False, key="sb_use_location_only",
+        help="Real, direct A/B test - swaps the pitch-specific zone signal for the broader "
+             "hand+zone one (collapsed across every pitch type, bigger real sample per cell). "
+             "Run once unchecked, once checked, same settings, and compare the "
+             "'signal_separation' numbers directly to see which one actually works better on "
+             "real data. Hitter side only for now.")
+
 if not sb_all_props:
     sb_col3, sb_col4 = st.columns(2)
     sb_hitter_prop = sb_col3.selectbox(
@@ -439,6 +450,7 @@ if st.button("Run Scan Both Sides", type="primary", key="sb_run_btn"):
                 st.session_state.sb_hitter_result = backtest_quality_score_multi_hitter(
                     season=int(sb_season), prop_type=sb_hitter_prop, teams=sb_teams_list,
                     max_hitters=int(sb_max_hitters), max_test_games_per_hitter=int(sb_games_per_hitter),
+                    use_location_only=sb_use_location_only,
                 )
             except Exception as e:
                 st.error(f"Hitter-side scan failed: {e}")
