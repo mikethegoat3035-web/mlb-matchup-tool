@@ -13,11 +13,49 @@ Install once:
 from dataclasses import dataclass, field
 from typing import Optional
 import pandas as pd
+from datetime import datetime, timedelta
 
 try:
     from pybaseball import statcast_pitcher, statcast_batter, playerid_lookup
 except ImportError as e:
     raise ImportError("Install pybaseball first: pip install pybaseball") from e
+
+
+def get_mlb_today() -> datetime:
+    """
+    Real anchor for "today" everywhere this file means MLB's schedule day
+    - NOT the server's raw system clock.
+
+    REAL BUG FOUND AND FIXED: every date-of-slate lookup in this file
+    previously used bare datetime.now() (server-LOCAL time - UTC on
+    Streamlit Community Cloud), while MLB's actual schedule day runs on
+    US Eastern time. Since most MLB games start in the evening ET,
+    there's a real multi-hour window (roughly 8pm-midnight ET, i.e.
+    already past midnight UTC) where the server's calendar has silently
+    rolled into "tomorrow" while it's still tonight's real slate. This is
+    the confirmed, concrete cause of "Unconfirmed Lineups" wrongly
+    reporting everything confirmed - it was checking a different day's
+    schedule entirely (a day that had already finished, where every
+    lineup is trivially "confirmed" since the games are over), not a
+    quirk of the lineup-check logic itself.
+
+    Every "what day is it" lookup in this file should go through this,
+    not a bare datetime.now() - lookback math (days_recent, timedelta
+    windows) is fine using this as its anchor too, same fix either way.
+
+    Requires Python 3.9+ (zoneinfo is stdlib since 3.9). Falls back to
+    raw server time with a one-time printed warning if the timezone
+    database isn't available (rare, but possible on a minimal Linux
+    image) rather than crashing the app over a missing tz database.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        print("WARNING: could not load America/New_York timezone data - falling back "
+              "to raw server time for 'today'. Date-of-slate checks may be wrong if "
+              "the server isn't already running in US Eastern time.")
+        return datetime.now()
 
 
 # =============================================================================
@@ -1430,8 +1468,8 @@ def run_side_model(pitcher_last: str, pitcher_first: str, days_recent: int = 68,
     """
     from datetime import datetime, timedelta
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+    today = get_mlb_today().strftime("%Y-%m-%d")
+    start = (get_mlb_today() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
 
     pid = get_pitcher_id(pitcher_last, pitcher_first)
     pitcher_recent = build_arsenal_profile(pull_pitcher_pitches(pid, start, today))
@@ -3759,10 +3797,10 @@ def scan_todays_pitchers(days_recent: int = 30, default_lines: dict = None,
 
     lines_dict = default_lines or {"outs": 15.5, "strikeouts": 5.5,
                                      "walks_allowed": 1.5, "hits_allowed": 5.5}
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    recent_start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+    today_str = get_mlb_today().strftime("%Y-%m-%d")
+    recent_start = (get_mlb_today() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
 
-    games = pull_todays_games()
+    games = pull_todays_games(date=get_mlb_today().strftime("%m/%d/%Y"))
     if games.empty:
         return pd.DataFrame([{"note": "No games found for today."}])
     if max_games:
@@ -3858,8 +3896,8 @@ def auto_find_best_edges(slate_df: pd.DataFrame, top_n_pitchers: int = 3,
     if "score" not in slate_df.columns:
         return pd.DataFrame([{"note": "No valid slate scan to work from."}])
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    recent_start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+    today_str = get_mlb_today().strftime("%Y-%m-%d")
+    recent_start = (get_mlb_today() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
     sorted_slate = slate_df.sort_values("score", ascending=False)
     top_pitchers = sorted_slate if top_n_pitchers <= 0 else sorted_slate.head(top_n_pitchers)
 
@@ -4687,17 +4725,17 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
     live_lookup = _build_live_line_lookup(live_line_source) if use_live_lines else {}
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    pitcher_start = (datetime.now() - timedelta(days=pitcher_days_recent)).strftime("%Y-%m-%d")
+    today_str = get_mlb_today().strftime("%Y-%m-%d")
+    pitcher_start = (get_mlb_today() - timedelta(days=pitcher_days_recent)).strftime("%Y-%m-%d")
     pitcher_season_start = season_start  # season-long window the recent arsenal gets shrunk toward
 
     if hitter_season_long:
         hitter_start = season_start
     else:
         hd = hitter_days_recent if hitter_days_recent is not None else pitcher_days_recent
-        hitter_start = (datetime.now() - timedelta(days=hd)).strftime("%Y-%m-%d")
+        hitter_start = (get_mlb_today() - timedelta(days=hd)).strftime("%Y-%m-%d")
 
-    games = pull_todays_games()
+    games = pull_todays_games(date=get_mlb_today().strftime("%m/%d/%Y"))
     if games.empty:
         return pd.DataFrame([{"note": "No games found for today."}])
     if max_games:
@@ -4760,9 +4798,9 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 try:
                     if "game_date" in pitcher_raw_pitches.columns and not pitcher_raw_pitches.empty:
                         real_dates = pd.to_datetime(pitcher_raw_pitches["game_date"]).dt.date.unique()
-                        real_dates = sorted(d for d in real_dates if d < datetime.now().date())
+                        real_dates = sorted(d for d in real_dates if d < get_mlb_today().date())
                         if real_dates:
-                            pitcher_days_rest = (datetime.now().date() - real_dates[-1]).days
+                            pitcher_days_rest = (get_mlb_today().date() - real_dates[-1]).days
                 except Exception:
                     pitcher_days_rest = None
 
@@ -6164,11 +6202,16 @@ EXPECTED_PA_BY_ORDER_SLOT = {
 def pull_todays_games(date: str = None) -> pd.DataFrame:
     """
     Today's (or a given date's) MLB schedule with probable pitchers.
-    date format: 'MM/DD/YYYY'. Defaults to today if not given.
+    date format: 'MM/DD/YYYY'. Defaults to today (real US Eastern MLB
+    day, via get_mlb_today() - NOT statsapi.schedule()'s own undocumented
+    server-local default, which is what caused the real "Unconfirmed
+    Lineups shows everything confirmed" bug - see get_mlb_today()'s
+    docstring) if not given.
     """
     if statsapi is None:
         raise ImportError("pip install MLB-StatsAPI --break-system-packages")
-    games = statsapi.schedule(date=date) if date else statsapi.schedule()
+    resolved_date = date or get_mlb_today().strftime("%m/%d/%Y")
+    games = statsapi.schedule(date=resolved_date)
     return pd.DataFrame(games)
 
 
@@ -6231,7 +6274,7 @@ def get_unconfirmed_games_today(date: str = None) -> pd.DataFrame:
     anything" could silently display as "all ready" — a real, confirmed
     false-positive, not a hypothetical one.
     """
-    games = pull_todays_games(date=date)
+    games = pull_todays_games(date=date or get_mlb_today().strftime("%m/%d/%Y"))
     if games.empty:
         return None
     dh_labels = build_doubleheader_labels(games)
@@ -6271,11 +6314,30 @@ def pull_confirmed_lineup(game_pk: int) -> dict:
     pattern with this API but I could not fully verify it live (no network
     access in this build environment) — if it comes back empty, the
     boxscore fallback below should still work; check result['lineup_status'].
+
+    REAL GAP FOUND AND FIXED: "confirmed" previously meant ONLY "both
+    teams have a full 9-man batting order posted" - it never actually
+    checked either team's starting PITCHER, despite requesting
+    hydrate=probablePitcher above and despite this function's own name/
+    docstring claiming to pull "the confirmed batting order + starting
+    pitcher." A lineup can post before a starter is formally locked in
+    (rarer, but real - a late scratch/illness), so this was a genuine,
+    if narrower, hole in what "confirmed" actually meant. Now requires
+    BOTH teams' starting pitcher (via get_probable_pitcher, which already
+    has its own 3-tier real fallback) to resolve too, not just both
+    batting orders.
     """
     if statsapi is None:
         raise ImportError("pip install MLB-StatsAPI --break-system-packages")
 
     result = {"game_pk": game_pk, "home": {}, "away": {}, "lineup_status": "not_yet_posted"}
+
+    def _both_pitchers_confirmed():
+        try:
+            return (get_probable_pitcher(game_pk, "home") is not None
+                    and get_probable_pitcher(game_pk, "away") is not None)
+        except Exception:
+            return False
 
     # Attempt 1: direct hydrate call — simpler, one request
     try:
@@ -6303,8 +6365,11 @@ def pull_confirmed_lineup(game_pk: int) -> dict:
                     home_ready = True
                 else:
                     away_ready = True
-        if home_ready and away_ready:
+        if home_ready and away_ready and _both_pitchers_confirmed():
             result["lineup_status"] = "confirmed"
+            return result
+        elif home_ready and away_ready:
+            result["lineup_status"] = "lineups_posted_pitcher_tbd"
             return result
     except (KeyError, IndexError, AttributeError):
         pass  # fall through to boxscore approach below
@@ -6333,9 +6398,11 @@ def pull_confirmed_lineup(game_pk: int) -> dict:
             else:
                 away_ready = True
     if home_ready and away_ready:
-        result["lineup_status"] = "confirmed"
+        result["lineup_status"] = "confirmed" if _both_pitchers_confirmed() else "lineups_posted_pitcher_tbd"
 
     return result
+
+
 
 
 def get_batter_hand(player_id: int) -> str:
@@ -6466,9 +6533,9 @@ def screen_team_roster(pitcher_recent: list, pitcher_season: list, team_query: s
     from datetime import datetime, timedelta
 
     if today is None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = get_mlb_today().strftime("%Y-%m-%d")
     if recent_start is None:
-        recent_start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+        recent_start = (get_mlb_today() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
 
     roster = get_team_roster_batters(team_query)
     if not roster:
@@ -6602,9 +6669,9 @@ def run_lineup_matchup_report(game_pk: int, pitching_side: str,
     from datetime import datetime, timedelta
 
     if today is None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = get_mlb_today().strftime("%Y-%m-%d")
     if recent_start is None:
-        recent_start = (datetime.now() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
+        recent_start = (get_mlb_today() - timedelta(days=days_recent)).strftime("%Y-%m-%d")
 
     pitcher_info = get_probable_pitcher(game_pk, pitching_side)
     if not pitcher_info:
