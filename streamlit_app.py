@@ -174,7 +174,67 @@ else:
         else:
             st.caption("No mu comparison available for this pitcher.")
 
-    st.divider()
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Hitter side of the same verify panel - collapsed by default so it doesn't
+# add screen length to normal daily scans (the pitcher panel above stays
+# fully visible since it's the already-proven, daily-use check). The
+# hitter-side mu adjustment itself is NOT gated by this UI at all - it's
+# baked directly into the real mu used in the Best Edges table every scan,
+# running the same whether this expander is ever opened or not. This is
+# purely an optional, on-demand way to SEE it working, not a toggle for
+# whether it runs.
+# ---------------------------------------------------------------------------
+with st.expander("🔍 Verify Hitter-Side Mu (optional, real-data check)"):
+    st.caption(
+        "Pick a real hitter from tonight's already-scanned slate to see his mu WITH vs WITHOUT "
+        "tonight's park factor and the real opposing starting pitcher's matchup adjustment, side "
+        "by side. Run the scan first if you haven't yet. This is purely for spot-checking - "
+        "the actual hitter mu in the Best Edges table above already has this applied regardless."
+    )
+    vz_hitter_debug = st.session_state.get("vz_hitter_debug_capture")
+    if not vz_hitter_debug:
+        st.caption("Run the scan below first - this fills in automatically from real hitters already pulled.")
+    else:
+        vz_hitter_pick = st.selectbox("Hitter (from tonight's scan)", sorted(vz_hitter_debug.keys()), key="vz_hitter_pick")
+        if vz_hitter_pick:
+            h_entry = vz_hitter_debug[vz_hitter_pick]
+            st.caption(f"{vz_hitter_pick} — {h_entry['team']} vs {h_entry['opponent_pitcher']} — "
+                       f"park factor used: {h_entry['park_factor']}")
+
+            pa = h_entry.get("pitcher_adjustment")
+            if pa:
+                st.caption(
+                    f"Opposing-pitcher adjustment used: contact×{pa.get('contact_multiplier')}, "
+                    f"power×{pa.get('power_multiplier')}, K×{pa.get('k_multiplier')}"
+                )
+
+            zp = h_entry.get("zone_profile")
+            if zp:
+                st.subheader("Real hitter zone profile vs this pitcher's arsenal")
+                zp_df = pd.DataFrame([{
+                    "pitch_type": r.pitch_type, "vs_hand": r.vs_pitcher_hand, "attack_zone": r.attack_zone,
+                    "swing_pct": getattr(r, "swing_pct", None), "whiff_pct": getattr(r, "whiff_pct", None),
+                    "xwoba": getattr(r, "xwoba", None), "hardhit_pct": getattr(r, "hardhit_pct", None),
+                } for r in zp])
+                st.dataframe(zp_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No zone profile available for this hitter (too few real pitches in this window).")
+
+            h_no_adj, h_with_adj = h_entry.get("mu_no_adj"), h_entry.get("mu_with_adj")
+            if h_no_adj is not None and h_with_adj is not None and not h_no_adj.empty and not h_with_adj.empty:
+                h_compare = h_no_adj.merge(h_with_adj, on="stat")
+                h_compare["moved"] = h_compare["mu_with_adj"] != h_compare["mu_no_adj"]
+                st.caption("hits/singles/doubles/total_bases/home_runs/hits_runs_rbi/fantasy should "
+                           "show a real difference whenever the park isn't neutral OR tonight's "
+                           "opposing starter isn't exactly league-average - that's the actual check "
+                           "for whether this side is wired correctly.")
+                st.dataframe(h_compare, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No mu comparison available for this hitter.")
+
+
     st.caption(
         "No live/upcoming games today (or none confirmed yet)? Park factor doesn't actually "
         "need 'tonight' - it's just arithmetic against a real historical game log, so this "
@@ -259,6 +319,7 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
         try:
             max_g = int(qm_max_games) if qm_max_games > 0 else None
             vz_capture = {}
+            vz_hitter_capture = {}
             qm_slate = scan_full_slate_quality_mu(
                 pitcher_days_recent=int(qm_pitcher_days),
                 hitter_days_recent=int(qm_hitter_days) if qm_hitter_days is not None else None,
@@ -268,8 +329,9 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 use_live_lines=False, live_line_source="underdog",
                 min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
                 min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
-                max_games=max_g, debug_capture=vz_capture)
+                max_games=max_g, debug_capture=vz_capture, hitter_debug_capture=vz_hitter_capture)
             st.session_state.vz_debug_capture = vz_capture
+            st.session_state.vz_hitter_debug_capture = vz_hitter_capture
             if "note" in qm_slate.columns:
                 st.warning(qm_slate.iloc[0]["note"])
                 st.session_state.pop("qm_slate", None)
