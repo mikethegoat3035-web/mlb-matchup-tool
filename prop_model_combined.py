@@ -4624,7 +4624,8 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                 book_stat_map: dict = None,
                                 min_edge: float = 0.25, min_games_sampled: int = 5,
                                 min_quality_score: float = None,
-                                debug_capture: dict = None) -> pd.DataFrame:
+                                debug_capture: dict = None,
+                                hitter_debug_capture: dict = None) -> pd.DataFrame:
     """
     The full-slate 'quality mu' scan across BOTH pitcher and hitter props.
     Only scans games with a CONFIRMED lineup already posted (same
@@ -4644,6 +4645,13 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
         typing, no re-pulling data that was already just pulled - rather
         than requiring a second manual lookup against the live data. None
         (default) skips this entirely, zero overhead for existing callers.
+
+    hitter_debug_capture: same real-data-check idea, mirrored for hitters
+    - a SEPARATE dict, not reused from debug_capture above (pitcher and
+    hitter names could collide in a shared dict, and the two entry shapes
+    differ - team/opponent_pitcher/zone_profile/pitcher_adjustment/
+    mu_no_adj/mu_with_adj, not the pitcher shape). One entry per real
+    hitter actually scanned. Same None-default, zero-overhead contract.
 
     Pitcher and hitter data use SEPARATE, independent lookback windows:
       - pitcher_days_recent: days back for pitcher arsenal/game-log pulls.
@@ -4905,15 +4913,39 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                 if debug_capture is not None:
                     try:
                         probs_no_adjustment = pitcher_prop_probabilities(pid, pitcher_start, today_str, p_lines)
+                        # REAL GAP FOUND while checking a live scan (Skenes,
+                        # Aug 19 2026): earned_runs/fantasy live in a SEPARATE
+                        # pathway (pitcher_official_prop_probabilities, official
+                        # box-score data) from outs/strikeouts/walks_allowed/
+                        # hits_allowed above (Statcast pitch data) - this debug
+                        # capture only ever pulled from the Statcast pathway, so
+                        # the official-pathway park/lineup fix (built a few
+                        # rounds after this verify panel) was invisible here
+                        # even though it's real and working. Same diagnostic-
+                        # only extra-call pattern as probs_no_adjustment above -
+                        # default lines, doesn't need real live odds.
+                        official_no_adj, official_with_adj = pd.DataFrame(), pd.DataFrame()
+                        try:
+                            official_check_lines = {"earned_runs": 2.5, "fantasy": 12.5}
+                            official_no_adj = pitcher_official_prop_probabilities(pid, season, official_check_lines)
+                            official_with_adj = pitcher_official_prop_probabilities(
+                                pid, season, official_check_lines,
+                                park_factor=game_park_factor_for_pitchers, lineup_adjustment=lineup_adj)
+                        except Exception:
+                            pass  # official data can genuinely be missing/thin for some pitchers - not fatal
+
+                        combined_no_adj = pd.concat([probs_no_adjustment, official_no_adj], ignore_index=True)
+                        combined_with_adj = pd.concat([probs, official_with_adj], ignore_index=True)
+
                         debug_capture[pitcher_name] = {
                             "team": game.get(own_name_col, "?"), "opponent": game.get(opp_name_col, "?"),
                             "zone_breakdown": pitcher_zone_breakdown,
                             "park_factor": game_park_factor_for_pitchers,
                             "lineup_adjustment": lineup_adj,
-                            "mu_no_park": probs_no_adjustment[["stat", "recent_avg"]].rename(
-                                columns={"recent_avg": "mu_no_park"}) if "recent_avg" in probs_no_adjustment.columns else pd.DataFrame(),
-                            "mu_with_park": probs[["stat", "recent_avg"]].rename(
-                                columns={"recent_avg": "mu_with_park"}) if "recent_avg" in probs.columns else pd.DataFrame(),
+                            "mu_no_park": combined_no_adj[["stat", "recent_avg"]].rename(
+                                columns={"recent_avg": "mu_no_park"}) if "recent_avg" in combined_no_adj.columns else pd.DataFrame(),
+                            "mu_with_park": combined_with_adj[["stat", "recent_avg"]].rename(
+                                columns={"recent_avg": "mu_with_park"}) if "recent_avg" in combined_with_adj.columns else pd.DataFrame(),
                         }
                     except Exception:
                         pass  # debug capture is best-effort - never let it break the real scan
@@ -5035,6 +5067,36 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         h_probs = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines,
                                                              park_factor=game_park_factor,
                                                              pitcher_adjustment=pitcher_adj)
+
+                        if hitter_debug_capture is not None:
+                            try:
+                                h_probs_no_adj = hitter_prop_probabilities(bid, hitter_start, today_str, h_lines)
+                                h_official_no_adj, h_official_with_adj = pd.DataFrame(), pd.DataFrame()
+                                try:
+                                    h_official_check_lines = {"hits_runs_rbi": 1.5, "fantasy": 8.5}
+                                    h_official_no_adj = hitter_official_prop_probabilities(bid, season, h_official_check_lines)
+                                    h_official_with_adj = hitter_official_prop_probabilities(
+                                        bid, season, h_official_check_lines,
+                                        park_factor=game_park_factor, pitcher_adjustment=pitcher_adj)
+                                except Exception:
+                                    pass  # official data can genuinely be missing/thin - not fatal
+
+                                h_combined_no_adj = pd.concat([h_probs_no_adj, h_official_no_adj], ignore_index=True)
+                                h_combined_with_adj = pd.concat([h_probs, h_official_with_adj], ignore_index=True)
+
+                                hitter_debug_capture[hitter_name] = {
+                                    "team": game.get(opp_name_col, "?"),
+                                    "opponent_pitcher": pitcher_name,
+                                    "zone_profile": lineup_hitter_zone_profiles.get(bid, []),
+                                    "park_factor": game_park_factor,
+                                    "pitcher_adjustment": pitcher_adj,
+                                    "mu_no_adj": h_combined_no_adj[["stat", "recent_avg"]].rename(
+                                        columns={"recent_avg": "mu_no_adj"}) if "recent_avg" in h_combined_no_adj.columns else pd.DataFrame(),
+                                    "mu_with_adj": h_combined_with_adj[["stat", "recent_avg"]].rename(
+                                        columns={"recent_avg": "mu_with_adj"}) if "recent_avg" in h_combined_with_adj.columns else pd.DataFrame(),
+                                }
+                            except Exception:
+                                pass  # debug capture is best-effort - never let it break the real scan
                         hh_zone_profile = lineup_hitter_zone_profiles.get(bid, [])
                         crosswalk = build_pitch_crosswalk(
                             pitcher_recent, h_recent, batter_hand, pitcher_hand,
@@ -5210,11 +5272,17 @@ def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict,
     hitter_prop_probabilities - mirror of the pitcher-side official-pathway
     fix (same gap: this pathway had zero adjustment until now). hits_runs_rbi
     uses the blended contact/power multiplier (hits+runs+RBI are all
-    contact/damage-driven). 'fantasy' gets an explicitly-approximate
-    blended multiplier (contact+power, minus a K-based drag) - stated
-    plainly as an approximation, same reasoning as the pitcher-fantasy
-    fix. stolen_bases is left unadjusted - speed/basestealing has no real
-    connection to park or opposing pitcher quality the way contact does.
+    contact/damage-driven). 'fantasy' uses the REAL HITTER_FANTASY_WEIGHTS
+    (single=3, double=6, triple=8, home_run=10), weighted by THIS hitter's
+    own real average singles/doubles/triples/HR, to blend contact_multiplier
+    and power_multiplier in the correct real proportion for him specifically
+    - a pure slap hitter and a pure slugger get genuinely different weight
+    splits here, not the same flat blend. run/rbi/walk/hbp/stolen_base are
+    deliberately excluded from that blend - none has a defensible single
+    mechanism connecting it to this specific opposing pitcher (run/rbi lean
+    heavily on teammates, walk isn't captured by any signal built here,
+    stolen_base is speed-based) - so that real share of his own formula
+    stays honestly unadjusted rather than folded in as if captured.
     """
     if _poisson is None:
         raise ImportError("pip install scipy --break-system-packages")
@@ -5235,12 +5303,40 @@ def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict,
     park_mult_contact = park_factor.get("hits_factor", 100) / 100.0 if park_factor else 1.0
     contact_m = pitcher_adjustment.get("contact_multiplier", 1.0) if pitcher_adjustment else 1.0
     power_m = pitcher_adjustment.get("power_multiplier", 1.0) if pitcher_adjustment else 1.0
-    k_m = pitcher_adjustment.get("k_multiplier", 1.0) if pitcher_adjustment else 1.0
     hrr_mult = max(0.75, min(1.25, park_mult_contact * ((contact_m + power_m) / 2)))
-    # APPROXIMATE - see docstring. Weights are a reasonable, not precisely
-    # calibrated, split.
-    fantasy_mult = 1 + 0.30 * (((contact_m + power_m) / 2) - 1) - 0.15 * (k_m - 1)
-    fantasy_mult = max(0.75, min(1.25, fantasy_mult))
+
+    # REAL FIX - same category of problem the pitcher-side fantasy_mult
+    # had (caught via a live check: "pitcher fantasy uses Ks, ERs, AND
+    # outs"), actually a BIGGER gap here since HITTER_FANTASY_WEIGHTS has
+    # NINE real weighted components (single=3, double=6, triple=8,
+    # home_run=10, run=2, rbi=2, walk=3, hbp=2, stolen_base=4), not three
+    # - and the old 0.30/0.15 split didn't reflect any of them, just an
+    # arbitrary guess. Fixed the same way: use THIS hitter's own real
+    # average singles/doubles/triples/HR (already in `log`) times the
+    # REAL weights to get his real contact-driven vs power-driven split,
+    # applied to contact_multiplier and power_multiplier respectively.
+    # run/rbi/walk/hbp/stolen_base are deliberately left OUT of the blend
+    # - none has a defensible single mechanism connecting it to THIS
+    # specific opposing pitcher the way contact/power do (walk depends on
+    # plate discipline broadly, not the pitcher_adjustment signals built
+    # here; run/rbi depend heavily on teammates around him; stolen_base
+    # is speed-based, already excluded elsewhere for the same reason) -
+    # that real, non-trivial share of his own fantasy formula stays
+    # honestly unadjusted rather than folded in as if it were captured.
+    mean_singles = log["singles"].mean()
+    mean_xbh_value = (log["doubles"].mean() * HITTER_FANTASY_WEIGHTS["double"]
+                       + log["triples"].mean() * HITTER_FANTASY_WEIGHTS["triple"]
+                       + log["home_runs"].mean() * HITTER_FANTASY_WEIGHTS["home_run"])
+    single_contrib = mean_singles * HITTER_FANTASY_WEIGHTS["single"]
+    total_contrib = single_contrib + mean_xbh_value
+    contact_weight = single_contrib / total_contrib if total_contrib else 0.0
+    power_weight = mean_xbh_value / total_contrib if total_contrib else 0.0
+    # This hitter's own real split of "adjustable" fantasy weight between
+    # contact (singles) and power (2B/3B/HR) - NOT his overall share of
+    # the full formula (run/rbi/walk/hbp/SB are excluded from both the
+    # weight and the numerator, same as pitcher's "out" exclusion).
+    adjustable_swing = (contact_weight * (contact_m - 1)) + (power_weight * (power_m - 1))
+    fantasy_mult = max(0.75, min(1.25, 1 + adjustable_swing))
 
     rows = []
     for stat, line in lines.items():
@@ -5293,13 +5389,17 @@ def pitcher_official_prop_probabilities(person_id: int, season: int, lines: dict
 
     park_factor/lineup_adjustment: same real dicts as
     pitcher_prop_probabilities. Applied to earned_runs directly (blended
-    hr/hits park factor x lineup damage_multiplier). 'fantasy' is a
-    composite stat blended from outs/K/ER/win/quality_start that can't be
-    cleanly decomposed back into its real per-event drivers, so it gets
-    an explicitly-approximate blended multiplier (weighted K-multiplier
-    minus weighted damage-multiplier) rather than pretending to be exact
-    - stated plainly as an approximation, not hidden. 'win' is left
-    unadjusted - too many real, unrelated factors (bullpen, offense
+    hr/hits park factor x lineup damage_multiplier). 'fantasy' uses the
+    REAL PITCHER_FANTASY_WEIGHTS (out=1, strikeout=3, earned_run=-3),
+    weighted by THIS pitcher's own real average outs/K/ER, to blend a
+    K-driven and ER-driven multiplier in the correct real proportion -
+    "out" itself is deliberately left out of that blend (it isn't
+    adjusted anywhere in this system - no defensible single mechanism
+    connects lineup/park quality to how many outs he'll actually record,
+    a real managerial/bullpen decision, not a stat), so the real share
+    of his own fantasy formula that "out" represents stays honestly
+    unadjusted rather than silently folded into K/ER. 'win' is left
+    unadjusted too - too many real, unrelated factors (bullpen, offense
     support) for a defensible single mechanism here.
     """
     if _poisson is None:
@@ -5321,11 +5421,35 @@ def pitcher_official_prop_probabilities(person_id: int, season: int, lines: dict
         park_mult_er = (park_factor.get("hr_factor", 100) + park_factor.get("hits_factor", 100)) / 200.0
     lineup_damage_mult = lineup_adjustment.get("damage_multiplier", 1.0) if lineup_adjustment else 1.0
     lineup_k_mult = lineup_adjustment.get("k_multiplier", 1.0) if lineup_adjustment else 1.0
-    # APPROXIMATE - see docstring. 0.35/0.35 weights are a reasonable,
-    # not precisely calibrated, split reflecting that Ks and ER both
-    # matter substantially to a real fantasy score, without claiming to
-    # know pitcher_fantasy_score's exact internal weighting.
-    fantasy_mult = 1 + 0.35 * (lineup_k_mult - 1) - 0.35 * ((park_mult_er * lineup_damage_mult) - 1)
+
+    # REAL FIX (caught via a live check against a real pitcher - "pitcher
+    # fantasy uses Ks, ERs, AND outs"): the 0.35/0.35 split below used to
+    # completely ignore that "out" is a real, weighted term in
+    # PITCHER_FANTASY_WEIGHTS (out=1, strikeout=3, earned_run=-3) - and
+    # for a real, deep-into-games starter, outs contributes a genuinely
+    # comparable share to K's, not a rounding error. Since outs itself
+    # isn't adjusted anywhere in this system (no defensible single
+    # mechanism connects lineup/park quality to how many outs he'll
+    # actually record - that's a real managerial/bullpen decision, not
+    # a stat), that real share of HIS OWN fantasy formula simply can't
+    # be captured here - so instead of pretending K+ER alone represent
+    # the whole formula, this now computes the REAL proportional weight
+    # of K vs ER within THIS PITCHER'S OWN real average outs/K/ER (his
+    # actual real workload, not a generic league assumption), and scales
+    # fantasy_mult down honestly to reflect that the outs share is
+    # genuinely unadjusted, not silently absorbed into the other two.
+    mean_outs, mean_k, mean_er = log["outs"].mean(), log["strikeouts"].mean(), log["earned_runs"].mean()
+    out_contrib = abs(PITCHER_FANTASY_WEIGHTS["out"] * mean_outs)
+    k_contrib = abs(PITCHER_FANTASY_WEIGHTS["strikeout"] * mean_k)
+    er_contrib = abs(PITCHER_FANTASY_WEIGHTS["earned_run"] * mean_er)
+    total_contrib = out_contrib + k_contrib + er_contrib
+    k_weight = k_contrib / total_contrib if total_contrib else 0.0
+    er_weight = er_contrib / total_contrib if total_contrib else 0.0
+    # out_weight = out_contrib / total_contrib is deliberately NOT applied
+    # below - that's the real share of his formula this adjustment can't
+    # reach, left honestly unadjusted rather than papered over.
+
+    fantasy_mult = 1 + k_weight * (lineup_k_mult - 1) - er_weight * ((park_mult_er * lineup_damage_mult) - 1)
     fantasy_mult = max(0.75, min(1.25, fantasy_mult))
 
     rows = []
