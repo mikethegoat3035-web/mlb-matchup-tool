@@ -32,6 +32,7 @@ from prop_model_combined import (
     backtest_quality_score_multi_hitter,
     backtest_pitcher_prop_quality_walk_forward, backtest_quality_score_multi_pitcher,
     get_pitcher_id, backtest_quality_score_all_props,
+    get_player_id_from_full_name, pitcher_prop_probabilities, get_park_factor,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -105,6 +106,116 @@ if "pending_games" in st.session_state:
 
 
 # ---------------------------------------------------------------------------
+# Verify Zone Profile & Park Factor — real-data spot check
+#
+# Neither of these is directly visible anywhere else in this UI: the zone
+# xwoba_delta gets folded into the composite quality_score (only "Own
+# Stuff"/"Lineup Check" show in the Best Edges table's quality_components
+# column, not the individual zone number), and the park-adjusted pitcher
+# mu just shows up as a single "mu" value with no unadjusted number next
+# to it to compare against. Reads straight off whoever the scan below
+# already covered tonight - no separate name/park typing, no second real
+# data pull, since the scan already has both.
+# ---------------------------------------------------------------------------
+st.header("🔍 Verify Zone Profile & Park Factor (real-data check)")
+st.caption(
+    "Pick a real pitcher from tonight's already-scanned slate below to see the raw "
+    "attack_zone_breakdown() output (including the new xwoba/xwoba_delta columns) and "
+    "his hits_allowed/earned_runs mu WITH vs WITHOUT tonight's park factor, side by "
+    "side - so both are visible instead of baked silently into one number. Run the "
+    "scan first if you haven't yet."
+)
+vz_debug = st.session_state.get("vz_debug_capture")
+if not vz_debug:
+    st.caption("Run the scan below first - this fills in automatically from real pitchers already pulled.")
+else:
+    vz_pitcher_pick = st.selectbox("Pitcher (from tonight's scan)", sorted(vz_debug.keys()), key="vz_pitcher_pick")
+    if vz_pitcher_pick:
+        entry = vz_debug[vz_pitcher_pick]
+        st.caption(f"{vz_pitcher_pick} — {entry['team']} vs {entry['opponent']} — "
+                   f"park factor used: {entry['park_factor']}")
+
+        st.subheader("Real attack_zone_breakdown() output")
+        st.caption("If this is empty or every xwoba/xwoba_delta cell is NaN, that's the "
+                   "real thing to investigate - either too few pitches in some zones, or "
+                   "a genuine column mismatch on real data.")
+        zb = entry.get("zone_breakdown")
+        if zb is not None and not zb.empty:
+            st.dataframe(zb, use_container_width=True, hide_index=True)
+        else:
+            st.warning("No zone breakdown available for this pitcher (too few real pitches in this window).")
+
+        st.subheader("Park factor + real opposing lineup effect on this pitcher's mu")
+        st.caption(
+            "Now shows BOTH real adjustments combined - park factor (already there) and, "
+            "NEW, tonight's real opposing lineup's batting-order-weighted contact/whiff/chase/"
+            "damage against this pitcher's actual arsenal. This is the real fix for mu itself "
+            "not reflecting whether tonight's lineup is genuinely tough or weak."
+        )
+        lineup_adj = entry.get("lineup_adjustment")
+        if lineup_adj:
+            st.caption(
+                f"Lineup adjustment used ({lineup_adj.get('n_hitters', 0)} hitters, "
+                f"{lineup_adj.get('total_expected_pa', 0)} total expected PA): "
+                f"contact×{lineup_adj.get('contact_multiplier')}, "
+                f"K×{lineup_adj.get('k_multiplier')}, "
+                f"BB×{lineup_adj.get('bb_multiplier')}, "
+                f"damage(ER)×{lineup_adj.get('damage_multiplier')}"
+            )
+        no_park, with_park = entry.get("mu_no_park"), entry.get("mu_with_park")
+        if no_park is not None and with_park is not None and not no_park.empty and not with_park.empty:
+            compare = no_park.merge(with_park, on="stat")
+            compare["moved"] = compare["mu_with_park"] != compare["mu_no_park"]
+            st.caption("hits_allowed/strikeouts/walks_allowed/earned_runs should show a real "
+                       "difference (moved=True) whenever the park isn't neutral OR tonight's "
+                       "lineup isn't exactly league-average; outs should always show "
+                       "moved=False - that's the actual check for whether this is wired correctly.")
+            st.dataframe(compare, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No mu comparison available for this pitcher.")
+
+    st.divider()
+    st.caption(
+        "No live/upcoming games today (or none confirmed yet)? Park factor doesn't actually "
+        "need 'tonight' - it's just arithmetic against a real historical game log, so this "
+        "works on any completed games regardless of what's live right now."
+    )
+    with st.expander("Standalone park factor check (any pitcher, no live game needed)"):
+        pf_col1, pf_col2, pf_col3 = st.columns(3)
+        with pf_col1:
+            pf_pitcher_name = st.text_input("Pitcher full name", key="pf_pitcher_name")
+        with pf_col2:
+            pf_days = st.number_input("Days of recent starts to pull", min_value=15, max_value=180,
+                                       value=60, step=5, key="pf_days")
+        with pf_col3:
+            pf_team_query = st.text_input("Park to test (team name)", key="pf_team_query")
+        if st.button("Run standalone check", key="pf_run_btn"):
+            if not pf_pitcher_name or not pf_team_query:
+                st.error("Enter both a pitcher name and a team/park name.")
+            else:
+                try:
+                    pid = get_player_id_from_full_name(pf_pitcher_name, "pitcher")
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    start_str = (datetime.now() - pd.Timedelta(days=int(pf_days))).strftime("%Y-%m-%d")
+                    lines_check = {"hits_allowed": 5.5, "earned_runs": 2.5, "outs": 15.5}
+                    no_park = pitcher_prop_probabilities(pid, start_str, today_str, lines_check)
+                    pf = get_park_factor(pf_team_query)
+                    st.caption(f"Park factor used: {pf}")
+                    with_park = pitcher_prop_probabilities(pid, start_str, today_str, lines_check, park_factor=pf)
+                    if "recent_avg" in no_park.columns and "recent_avg" in with_park.columns:
+                        compare = no_park[["stat", "recent_avg"]].rename(columns={"recent_avg": "mu_no_park"}).merge(
+                            with_park[["stat", "recent_avg"]].rename(columns={"recent_avg": "mu_with_park"}),
+                            on="stat",
+                        )
+                        compare["moved"] = compare["mu_with_park"] != compare["mu_no_park"]
+                        st.dataframe(compare, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("No games found in this window for this pitcher.")
+                except Exception as e:
+                    st.error(f"Standalone check failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Quality Mu Slate Scanner — every confirmed game today, one table
 # ---------------------------------------------------------------------------
 st.header("🎯 Quality Mu Slate Scanner — every prop, one table")
@@ -147,6 +258,7 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
     with st.spinner("Scanning every confirmed game today — this can take a while on a full slate..."):
         try:
             max_g = int(qm_max_games) if qm_max_games > 0 else None
+            vz_capture = {}
             qm_slate = scan_full_slate_quality_mu(
                 pitcher_days_recent=int(qm_pitcher_days),
                 hitter_days_recent=int(qm_hitter_days) if qm_hitter_days is not None else None,
@@ -156,7 +268,8 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 use_live_lines=False, live_line_source="underdog",
                 min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
                 min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
-                max_games=max_g)
+                max_games=max_g, debug_capture=vz_capture)
+            st.session_state.vz_debug_capture = vz_capture
             if "note" in qm_slate.columns:
                 st.warning(qm_slate.iloc[0]["note"])
                 st.session_state.pop("qm_slate", None)
