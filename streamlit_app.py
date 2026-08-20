@@ -550,6 +550,55 @@ if "qm_slate" in st.session_state:
             st.dataframe(pd.DataFrame(leftover)[["player", "team", "prop_type", "line", "lean",
                                                   "quality_score", "edge"]],
                         use_container_width=True, hide_index=True)
+
+        # REAL FIX for a real gap: rescanning rebuilds the whole table
+        # from scratch, which resets every Include checkbox to False -
+        # and since the slips above are computed LIVE off whatever's
+        # currently checked, that means a rescan silently wipes both the
+        # checkboxes AND the slips they built. This button saves the
+        # ACTUAL slip contents (player/team/prop/line/lean/quality/edge -
+        # real captured values, not a reference back to the live table)
+        # into their own separate session_state slot that a rescan never
+        # touches, so you can rescan for fresh data without losing what
+        # you already built.
+        if st.button("🔒 Lock in these slips", key="lock_slips_btn"):
+            if "locked_slips" not in st.session_state:
+                st.session_state.locked_slips = []
+            new_locked = [pd.DataFrame(slip)[["player", "team", "prop_type", "line", "lean",
+                                               "quality_score", "edge", "games_sampled"]]
+                          for slip in slips if slip]
+            st.session_state.locked_slips.extend(new_locked)
+            st.success(f"Locked in {len(new_locked)} slip(s) - they'll now survive a rescan. "
+                       f"Scroll down to see all your locked slips.")
+
+    if st.session_state.get("locked_slips"):
+        st.divider()
+        st.header("🔒 Locked Slips (survive a rescan)")
+        st.caption(
+            "These are saved copies - rescanning above won't touch anything here. "
+            "One real limit worth knowing: this only survives a RESCAN, not a full app "
+            "reboot/redeploy (a reboot restarts everything from scratch, including this). "
+            "Download the CSV below if you want a copy that survives a reboot too - that's "
+            "a real file on your device, not app memory."
+        )
+        all_locked = pd.concat(st.session_state.locked_slips, keys=range(1, len(st.session_state.locked_slips) + 1),
+                                names=["slip_number"]).reset_index(level=0)
+        locked_csv = all_locked.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download ALL locked slips as CSV", locked_csv,
+                           file_name=f"locked_slips_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                           mime="text/csv", key="dl_locked_slips")
+        for i, locked_slip in enumerate(st.session_state.locked_slips):
+            lcol1, lcol2 = st.columns([5, 1])
+            with lcol1:
+                st.subheader(f"Locked Slip {i + 1} — {len(locked_slip)}-man")
+            with lcol2:
+                if st.button("Remove", key=f"remove_locked_{i}"):
+                    st.session_state.locked_slips.pop(i)
+                    st.rerun()
+            st.dataframe(locked_slip, use_container_width=True, hide_index=True)
+        if st.button("Clear ALL locked slips", key="clear_all_locked"):
+            st.session_state.locked_slips = []
+            st.rerun()
     
 
 
