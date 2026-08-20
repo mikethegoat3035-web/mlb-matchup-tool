@@ -358,14 +358,21 @@ if "qm_slate" in st.session_state:
         view2 = view2[view2["side"] == side_pick.lower()]
     view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
-    edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "quality_score", "quality_components"]
+    edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "edge", "games_sampled",
+                 "quality_score", "quality_components", "order_slot", "game_pk"]
     edit_cols = [c for c in edit_cols if c in view2.columns]
     edit_df = view2[edit_cols].reset_index(drop=True)
+    edit_df.insert(0, "Include", False)
 
     edited = st.data_editor(
         edit_df,
-        column_config={"line": st.column_config.NumberColumn("Line", step=0.5)},
-        disabled=["side", "player", "team", "prop_type", "mu", "quality_score", "quality_components"],
+        column_config={
+            "line": st.column_config.NumberColumn("Line", step=0.5),
+            "Include": st.column_config.CheckboxColumn(
+                "Include", help="Check to add this leg to the slip builder below"),
+        },
+        disabled=["side", "player", "team", "prop_type", "mu", "edge", "games_sampled",
+                  "quality_score", "quality_components", "order_slot", "game_pk"],
         use_container_width=True,
         key="be_edit_table",
     )
@@ -375,14 +382,42 @@ if "qm_slate" in st.session_state:
         r = rescore_quality_mu_row(mu=float(row["mu"]), new_line=float(row["line"]))
         p_over = r["p_over"]
         results.append({
+            "Include": row["Include"],
             "side": row["side"], "player": row["player"], "team": row["team"],
             "prop_type": row["prop_type"], "line": row["line"], "mu": row["mu"],
             "p_over": p_over, "edge": abs(p_over - 0.5),
             "lean": "OVER" if p_over > 0.5 else "UNDER",
+            "games_sampled": row.get("games_sampled"),
             "quality_score": row["quality_score"],
             "quality_components": row.get("quality_components"),
+            "order_slot": row.get("order_slot"),
+            "game_pk": row.get("game_pk"),
         })
     final_df = pd.DataFrame(results).sort_values("edge", ascending=False)
+
+    st.subheader("Minimum bar")
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        min_quality_gate = st.number_input("Min quality_score", min_value=0, max_value=100, value=70, step=1)
+    with fcol2:
+        min_prob_gate = st.number_input("Min confidence % (whichever direction it leans)",
+                                         min_value=50, max_value=100, value=70, step=1)
+    with fcol3:
+        min_edge_gate = st.number_input("Min edge", min_value=0.0, max_value=0.5, value=0.20, step=0.01)
+
+    # "p_over >= 70%" as stated would silently exclude every real UNDER
+    # lean (an UNDER's real confidence shows as a LOW p_over, by
+    # definition - a 0.25 p_over IS a 75%-confident UNDER). Applying the
+    # gate to whichever direction the leg actually leans - max(p_over,
+    # 1-p_over) - is the correct, direction-agnostic version of the same
+    # real request, not a literal column check that would break unders.
+    confidence = final_df["p_over"].apply(lambda p: max(p, 1 - p))
+    qualified_df = final_df[
+        (final_df["quality_score"].fillna(0) >= min_quality_gate)
+        & (confidence >= min_prob_gate / 100.0)
+        & (final_df["edge"].fillna(0) >= min_edge_gate)
+    ].copy()
+    st.caption(f"{len(qualified_df)} of {len(final_df)} legs clear the bar above.")
 
     def color_edge(val):
         intensity = min(val / 0.5, 1.0)
@@ -399,16 +434,122 @@ if "qm_slate" in st.session_state:
         intensity = min(val / 100, 1.0)
         return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
 
-    styled = (final_df.style
+    display_cols_final = [c for c in qualified_df.columns if c not in ("Include", "order_slot", "game_pk")]
+    styled = (qualified_df[display_cols_final].style
               .map(color_edge, subset=["edge"])
               .map(color_prob, subset=["p_over"])
               .map(color_quality, subset=["quality_score"]))
     st.dataframe(styled, use_container_width=True)
 
-    csv = final_df.to_csv(index=False).encode("utf-8")
+    csv = qualified_df[display_cols_final].to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download this view as CSV", csv,
                        file_name=f"best_edges_{datetime.now().strftime('%Y%m%d')}.csv",
                        mime="text/csv", key="dl_best_edges")
+
+    st.divider()
+
+    # ---------------------------------------------------------------------
+    # Slip Builder - real feature, not a display gimmick. Checked legs
+    # above get automatically grouped into slips, ranked by a blended
+    # real signal (quality_score + edge + batting-order for hitters -
+    # earlier order slot = more real plate appearances = weighted
+    # slightly higher), with hard conflict rules (never two legs from the
+    # same real game_pk, never two legs on the same real player, in the
+    # same slip - correlated legs, not independent ones) enforced by
+    # actually checking and swapping, not just hoping the sort avoids it.
+    # Re-groups automatically on every rerun, which Streamlit already
+    # does on any checkbox change - "moves them around as more come in"
+    # falls out of that for free, no extra wiring needed.
+    # ---------------------------------------------------------------------
+    st.header("🎰 Slip Builder")
+    sb_target_size = st.selectbox("Target slip size", [3, 2, 4], index=0,
+                                   help="Default 3-man slips; leftover legs that don't divide evenly "
+                                        "get folded into a 2-man or 4-man slip instead, never a "
+                                        "same-size slip short a leg.")
+
+    selected = qualified_df[qualified_df["Include"] == True].copy()
+    checked_total = int((final_df["Include"] == True).sum())
+    if checked_total > len(selected):
+        st.caption(f"You checked {checked_total} legs, but {checked_total - len(selected)} of them "
+                   f"don't clear the quality/confidence/edge bar above and were left out of the slips below.")
+    if selected.empty:
+        st.caption("Check the Include box on legs above to start building slips.")
+    else:
+        # Blended strength score - quality_score is the dominant real
+        # signal (0-100 scale, already reflects real matchup trust);
+        # edge added at a real but secondary weight (edge is 0-0.5 scale,
+        # scaled up so it meaningfully but doesn't dominate); batting
+        # order is a small real tiebreak only, not a primary driver -
+        # earlier order_slot (1=leadoff) gets a small bonus, pitchers
+        # (no order_slot) get no bonus/penalty either way.
+        def _strength(row):
+            s = row["quality_score"] if pd.notna(row["quality_score"]) else 50.0
+            s += row["edge"] * 100 * 0.5
+            if pd.notna(row.get("order_slot")):
+                s += max(0, 9 - row["order_slot"]) * 0.5
+            return s
+
+        selected["_strength"] = selected.apply(_strength, axis=1)
+        selected = selected.sort_values("_strength", ascending=False).reset_index(drop=True)
+
+        n = len(selected)
+        # How many slips, and what size each is - prefer all-target_size
+        # slips; if there's a remainder, absorb it into ONE slip sized
+        # 2-4 instead of ever leaving a same-size slip short a leg.
+        base = sb_target_size
+        if n < base:
+            slip_sizes = [n] if n > 0 else []
+        else:
+            n_slips = n // base
+            remainder = n % base
+            slip_sizes = [base] * n_slips
+            if remainder:
+                if remainder + base <= 4:
+                    slip_sizes[-1] += remainder  # fold remainder into the last slip (still <=4)
+                else:
+                    slip_sizes.append(max(2, remainder))  # own slip, floored at 2
+
+        slips = [[] for _ in slip_sizes]
+        slip_games = [set() for _ in slip_sizes]
+        slip_players = [set() for _ in slip_sizes]
+
+        leftover = []
+        for _, leg in selected.iterrows():
+            placed = False
+            # Try slips in strength-tier order (slip 0 = strongest tier)
+            # so the ranking itself still roughly sorts strongest-to-
+            # weakest across slips, same tiering idea discussed earlier.
+            for i, size in enumerate(slip_sizes):
+                if len(slips[i]) >= size:
+                    continue
+                if leg["game_pk"] in slip_games[i] or leg["player"] in slip_players[i]:
+                    continue
+                slips[i].append(leg)
+                slip_games[i].add(leg["game_pk"])
+                slip_players[i].add(leg["player"])
+                placed = True
+                break
+            if not placed:
+                leftover.append(leg)
+
+        for i, slip in enumerate(slips):
+            if not slip:
+                continue
+            avg_q = sum(l["quality_score"] for l in slip if pd.notna(l["quality_score"])) / max(len(slip), 1)
+            st.subheader(f"Slip {i + 1} — {len(slip)}-man (avg quality {avg_q:.0f})")
+            slip_display = pd.DataFrame(slip)[["player", "team", "prop_type", "line", "lean",
+                                                "quality_score", "edge", "games_sampled"]]
+            st.dataframe(slip_display, use_container_width=True, hide_index=True)
+
+        if leftover:
+            st.warning(
+                f"{len(leftover)} checked leg(s) couldn't be placed without breaking the "
+                f"same-game/same-player rule against every open slip slot - shown below, "
+                f"add manually or check a different combination of legs."
+            )
+            st.dataframe(pd.DataFrame(leftover)[["player", "team", "prop_type", "line", "lean",
+                                                  "quality_score", "edge"]],
+                        use_container_width=True, hide_index=True)
     
 
 
