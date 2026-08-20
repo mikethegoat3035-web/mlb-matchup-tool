@@ -565,7 +565,7 @@ if "qm_slate" in st.session_state:
             if "locked_slips" not in st.session_state:
                 st.session_state.locked_slips = []
             new_locked = [pd.DataFrame(slip)[["player", "team", "prop_type", "line", "lean",
-                                               "quality_score", "edge", "games_sampled"]]
+                                               "quality_score", "edge", "games_sampled", "game_pk"]]
                           for slip in slips if slip]
             st.session_state.locked_slips.extend(new_locked)
             st.success(f"Locked in {len(new_locked)} slip(s) - they'll now survive a rescan. "
@@ -583,10 +583,63 @@ if "qm_slate" in st.session_state:
         )
         all_locked = pd.concat(st.session_state.locked_slips, keys=range(1, len(st.session_state.locked_slips) + 1),
                                 names=["slip_number"]).reset_index(level=0)
-        locked_csv = all_locked.to_csv(index=False).encode("utf-8")
+        locked_display_cols = [c for c in all_locked.columns if c != "game_pk"]
+        locked_csv = all_locked[locked_display_cols].to_csv(index=False).encode("utf-8")
         st.download_button("📥 Download ALL locked slips as CSV", locked_csv,
                            file_name=f"locked_slips_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                            mime="text/csv", key="dl_locked_slips")
+
+        # REAL FIX for the exact gap just found: locking used to be
+        # permanently frozen - no way to top up an already-locked
+        # incomplete slip (e.g. a 2-man) with a newly-checked leg without
+        # manually redoing everything. This adds a real, working "add to
+        # an existing locked slip" action - recomputed fresh from
+        # whatever's checked in the live table RIGHT NOW (not relying on
+        # a variable from the Slip Builder block above, which may not
+        # even exist this render pass if nothing's currently checked),
+        # respecting the same real conflict rules (no same game_pk, no
+        # same player already in that slip) and the same 4-man ceiling.
+        currently_checked = qualified_df[qualified_df["Include"] == True]
+        growable_slips = [i for i, s in enumerate(st.session_state.locked_slips) if len(s) < 4]
+        if not currently_checked.empty and growable_slips:
+            st.subheader("Add a checked leg to an existing locked slip")
+            target_idx = st.selectbox(
+                "Which locked slip?",
+                growable_slips,
+                format_func=lambda i: f"Locked Slip {i + 1} ({len(st.session_state.locked_slips[i])}-man, room for {4 - len(st.session_state.locked_slips[i])} more)",
+                key="topup_target",
+            )
+            leg_options = list(currently_checked["player"] + " - " + currently_checked["prop_type"])
+            picks = st.multiselect("Which checked leg(s) to add?", leg_options, key="topup_legs")
+            if st.button("Add to locked slip", key="topup_btn") and picks:
+                target_slip = st.session_state.locked_slips[target_idx]
+                existing_games = set(target_slip["game_pk"]) if "game_pk" in target_slip.columns else set()
+                existing_players = set(target_slip["player"])
+                added, skipped = 0, []
+                for pick in picks:
+                    row = currently_checked[(currently_checked["player"] + " - " + currently_checked["prop_type"]) == pick].iloc[0]
+                    if len(target_slip) >= 4:
+                        skipped.append((pick, "slip already at 4-man max"))
+                        continue
+                    if row["player"] in existing_players:
+                        skipped.append((pick, "same player already in this slip"))
+                        continue
+                    if row["game_pk"] in existing_games:
+                        skipped.append((pick, "another leg from this same game is already in this slip"))
+                        continue
+                    target_slip = pd.concat([target_slip, pd.DataFrame([row[
+                        ["player", "team", "prop_type", "line", "lean", "quality_score", "edge", "games_sampled", "game_pk"]
+                    ]])], ignore_index=True)
+                    existing_players.add(row["player"])
+                    existing_games.add(row["game_pk"])
+                    added += 1
+                st.session_state.locked_slips[target_idx] = target_slip
+                if added:
+                    st.success(f"Added {added} leg(s) to Locked Slip {target_idx + 1}.")
+                if skipped:
+                    st.warning(f"Skipped: " + ", ".join(f"{p} ({r})" for p, r in skipped))
+                st.rerun()
+
         for i, locked_slip in enumerate(st.session_state.locked_slips):
             lcol1, lcol2 = st.columns([5, 1])
             with lcol1:
@@ -595,7 +648,8 @@ if "qm_slate" in st.session_state:
                 if st.button("Remove", key=f"remove_locked_{i}"):
                     st.session_state.locked_slips.pop(i)
                     st.rerun()
-            st.dataframe(locked_slip, use_container_width=True, hide_index=True)
+            locked_slip_display_cols = [c for c in locked_slip.columns if c != "game_pk"]
+            st.dataframe(locked_slip[locked_slip_display_cols], use_container_width=True, hide_index=True)
         if st.button("Clear ALL locked slips", key="clear_all_locked"):
             st.session_state.locked_slips = []
             st.rerun()
