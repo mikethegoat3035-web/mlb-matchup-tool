@@ -5159,6 +5159,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                     "player": (f"{hitter_name} ({dh_labels.get(game_pk)})"
                                                if dh_labels.get(game_pk) else hitter_name),
                                     "game_number": dh_labels.get(game_pk, ""),
+                                    "order_slot": order_slot,
                                     "team": game.get(opp_name_col, "?"),
                                     "opponent": game.get(own_name_col, "?"),
                                     "line": hrow["line"], "mu": hrow["recent_avg"],
@@ -5193,6 +5194,7 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                             "player": (f"{hitter_name} ({dh_labels.get(game_pk)})"
                                                        if dh_labels.get(game_pk) else hitter_name),
                                             "game_number": dh_labels.get(game_pk, ""),
+                                            "order_slot": order_slot,
                                             "team": game.get(opp_name_col, "?"),
                                             "opponent": game.get(own_name_col, "?"),
                                             "line": hrow["line"], "mu": hrow["recent_avg"],
