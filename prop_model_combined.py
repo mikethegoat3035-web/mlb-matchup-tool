@@ -566,6 +566,22 @@ LEAGUE_AVG_ISO = 0.155
 # game across 9 hitters is roughly 1.1-1.3, so a real per-hitter average
 # lands well under that.
 LEAGUE_AVG_HR_RATE = 0.13
+# REAL, approximate league-average per-game baselines for the two
+# COMPOSITE stats found to have the SAME unshrunk-mean bug as home_runs,
+# just one level up - a real, separate root cause from the home_runs fix
+# above, not covered by it. hitter_official_prop_probabilities() averages
+# the real, FINAL aggregated fantasy-points/hits+runs+RBI total directly
+# from recent games, without ever decomposing back into home_runs/
+# singles/etc - meaning a hitter with one or two big HR-fueled fantasy
+# nights in his recent window inflates this average the same bursty way,
+# completely bypassing the home_runs-specific fix, since it's a
+# different number being averaged. Real, honest ballpark estimates (not
+# live-pulled exact figures - no network access here), built from
+# HITTER_FANTASY_WEIGHTS and typical real per-game hitting lines
+# (~0.75 singles, ~0.1 doubles, ~0.04 HR, ~0.45 runs, ~0.45 RBI, ~0.3
+# walks per game for an average real hitter).
+LEAGUE_AVG_FANTASY_PTS = 6.3
+LEAGUE_AVG_HITS_RUNS_RBI = 1.8
 
 
 # ---------------------------------------------------------------------------
@@ -5361,6 +5377,21 @@ def hitter_official_prop_probabilities(person_id: int, season: int, lines: dict,
         if stat not in log.columns:
             continue
         mean = log[stat].mean()
+        # REAL SHRINKAGE FIX - same root problem as home_runs, one level
+        # up: "fantasy"/"hits_runs_rbi" are composite totals that spike
+        # hard on a single big HR-driven game, and a short recent window
+        # can be dominated by one or two such nights without enough real
+        # sample to know if that's his real level or a hot, unsustainable
+        # stretch. Same real "trust your own sample more as it grows"
+        # blend already used for home_runs and elsewhere in this file.
+        if stat == "fantasy":
+            games_n = len(log)
+            weight_own = min(games_n / 25, 1.0)
+            mean = (weight_own * mean) + ((1 - weight_own) * LEAGUE_AVG_FANTASY_PTS)
+        elif stat == "hits_runs_rbi":
+            games_n = len(log)
+            weight_own = min(games_n / 25, 1.0)
+            mean = (weight_own * mean) + ((1 - weight_own) * LEAGUE_AVG_HITS_RUNS_RBI)
         if stat == "hits_runs_rbi":
             mean = mean * hrr_mult
         elif stat == "fantasy":
@@ -7244,6 +7275,14 @@ def backtest_hitter_prop_walk_forward(batter_id: int, prop_type: str, line: floa
         if len(prior) < min_games_before:
             continue
         mu = prior[prop_type].mean()
+        # Same real shrinkage fix as the live hitter_prop_probabilities()
+        # function - applies here too so this specific backtest can
+        # actually reflect it, closing the gap that made the earlier
+        # Quality-Score Backtest blind to the fix entirely.
+        if prop_type == "home_runs":
+            games_n = len(prior)
+            weight_own = min(games_n / 25, 1.0)
+            mu = (weight_own * mu) + ((1 - weight_own) * LEAGUE_AVG_HR_RATE)
         p_over = 1 - _poisson.cdf(math.floor(line), mu)
         actual_value = log.iloc[i][prop_type]
         predicted_over = p_over >= 0.5
@@ -7462,6 +7501,21 @@ def backtest_hitter_prop_quality_walk_forward(batter_id: int, prop_type: str, li
         if len(prior) < min_games_before:
             continue
         raw_mu = prior[prop_type].mean()
+        # Same real shrinkage fix as the live hitter_prop_probabilities()/
+        # hitter_official_prop_probabilities() functions - applies here too
+        # so this specific backtest can actually reflect it.
+        if prop_type == "home_runs":
+            games_n = len(prior)
+            weight_own = min(games_n / 25, 1.0)
+            raw_mu = (weight_own * raw_mu) + ((1 - weight_own) * LEAGUE_AVG_HR_RATE)
+        elif prop_type == "fantasy":
+            games_n = len(prior)
+            weight_own = min(games_n / 25, 1.0)
+            raw_mu = (weight_own * raw_mu) + ((1 - weight_own) * LEAGUE_AVG_FANTASY_PTS)
+        elif prop_type == "hits_runs_rbi":
+            games_n = len(prior)
+            weight_own = min(games_n / 25, 1.0)
+            raw_mu = (weight_own * raw_mu) + ((1 - weight_own) * LEAGUE_AVG_HITS_RUNS_RBI)
         game_date = test_row["game_date"]
         actual_value = test_row[prop_type]
 
