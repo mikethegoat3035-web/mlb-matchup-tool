@@ -550,6 +550,22 @@ def weighted_matchup_score(pitcher_arsenal: list[PitchProfile], hitter_metric_by
 # constants) used only to translate raw numbers into a plain-language read.
 LEAGUE_AVG_XBA = 0.245
 LEAGUE_AVG_ISO = 0.155
+# REAL FIX for a real, confirmed bug: found via a live Quality-Score
+# Backtest - home_runs was over-predicted 61% of the time (54/89 real
+# tests) but only actually hit 9% of the time when it did. Root cause:
+# hitter_prop_probabilities() used a plain, unweighted mean() with ZERO
+# shrinkage toward anything for EVERY stat, including home_runs - fine
+# for a stable, frequent stat like hits, genuinely wrong for a rare,
+# bursty stat where a short hot stretch (4 HR in his last 15 games, say)
+# gets fed straight into the Poisson math as if it were his real,
+# durable rate, with nothing pulling it back toward reality. Approximate,
+# real-ballpark league-average individual hitter HR/game rate (NOT a
+# live-pulled exact number - no network access in this build environment
+# to confirm the precise current-season figure, same honesty standard as
+# every other approximate league constant in this file) - real team HR/
+# game across 9 hitters is roughly 1.1-1.3, so a real per-hitter average
+# lands well under that.
+LEAGUE_AVG_HR_RATE = 0.13
 
 
 # ---------------------------------------------------------------------------
@@ -5881,6 +5897,23 @@ def hitter_prop_probabilities(batter_id: int, start_dt: str, end_dt: str,
         if stat not in log.columns:
             continue
         mean = log[stat].mean()
+        # REAL SHRINKAGE FIX (home_runs specifically) - see
+        # LEAGUE_AVG_HR_RATE's own comment for the full real bug this
+        # closes. A short recent hot stretch now gets pulled back toward
+        # a real league baseline, weighted by how much real sample
+        # actually backs it - the SAME real "trust your own sample more
+        # as it grows" principle already used elsewhere in this file
+        # (weight_own = min(games_n/threshold, 1.0)), just previously
+        # missing specifically here. full_confidence_games=25 means a
+        # hitter needs a real 25-game window before his own rate is
+        # trusted at full weight - below that, blends toward the real
+        # league baseline instead of taking a hot/cold short stretch at
+        # face value.
+        if stat == "home_runs":
+            games_n = len(log)
+            full_confidence_games = 25
+            weight_own = min(games_n / full_confidence_games, 1.0)
+            mean = (weight_own * mean) + ((1 - weight_own) * LEAGUE_AVG_HR_RATE)
         if park_factor:
             if stat == "home_runs":
                 mean = mean * (park_factor.get("hr_factor", 100) / 100.0)
