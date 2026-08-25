@@ -8275,3 +8275,4 @@ def backtest_pitcher_win_walk_forward(pitcher_id: int, season: int,
             "hit": predicted_over == actual_over,
         })
     return pd.DataFrame(rows)
+                                            
