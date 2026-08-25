@@ -364,9 +364,24 @@ if "qm_slate" in st.session_state:
              "haven't played yet.",
     )
 
+    # Manual, deliberate team exclusion - separate from the automatic
+    # started-game check above, for real reasons that check can't know
+    # about on its own (you personally don't want a team shown right now,
+    # regardless of whether their game has actually started - injury
+    # news, a lineup you don't trust, anything). Team list is built fresh
+    # from THIS scan's real data, not a hardcoded list, so it only ever
+    # shows teams that are actually on tonight's slate.
+    real_teams_tonight = sorted(qm_slate["team"].dropna().unique().tolist()) if "team" in qm_slate.columns else []
+    excluded_teams = st.multiselect(
+        "Also exclude these specific teams (manual, your own reasons)",
+        options=real_teams_tonight, default=[], key="be_excluded_teams",
+    )
+
     view2 = qm_slate.copy()
     if side_pick != "All":
         view2 = view2[view2["side"] == side_pick.lower()]
+    if excluded_teams and "team" in view2.columns:
+        view2 = view2[~view2["team"].isin(excluded_teams)]
     if hide_started and "game_pk" in view2.columns:
         try:
             started_games = get_already_started_games()
