@@ -26,7 +26,7 @@ from datetime import datetime
 from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
-    match_book_line_to_player, get_unconfirmed_games_today,
+    match_book_line_to_player, get_unconfirmed_games_today, get_already_started_games,
     backtest_full_season_mlb, PITCHER_BACKTEST_LINES, HITTER_BACKTEST_LINES,
     backtest_hitter_prop_quality_walk_forward, get_batter_id,
     backtest_quality_score_multi_hitter,
@@ -353,9 +353,32 @@ if "qm_slate" in st.session_state:
     side_pick = st.radio("Side", ["All", "Pitcher", "Hitter"], horizontal=True, key="be_side")
     top_n = st.slider("Show top N by quality_score", min_value=5, max_value=150, value=30, key="be_top_n")
 
+    hide_started = st.checkbox(
+        "Hide games that have already started (real, live check)", value=True, key="be_hide_started",
+        help="On a full slate, more real rows can clear your filters than the "
+             "150-max display can show at once - some teams' legs can get "
+             "silently squeezed out if enough other teams' legs rank higher and "
+             "fill every slot first. This checks REAL, CURRENT game status "
+             "right now (not the original scan's snapshot) and removes started "
+             "games BEFORE the top-N cutoff, freeing real room for teams that "
+             "haven't played yet.",
+    )
+
     view2 = qm_slate.copy()
     if side_pick != "All":
         view2 = view2[view2["side"] == side_pick.lower()]
+    if hide_started and "game_pk" in view2.columns:
+        try:
+            started_games = get_already_started_games()
+            if started_games:
+                before_count = len(view2)
+                view2 = view2[~view2["game_pk"].isin(started_games)]
+                removed = before_count - len(view2)
+                if removed > 0:
+                    st.caption(f"Removed {removed} row(s) from games already underway - "
+                               f"freed that room for teams that haven't played yet.")
+        except Exception:
+            pass  # a real, live status-check hiccup shouldn't break the whole table - show everything instead
     view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
     edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "edge", "games_sampled",
