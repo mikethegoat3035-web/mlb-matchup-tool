@@ -6341,6 +6341,49 @@ def pull_todays_games(date: str = None) -> pd.DataFrame:
     return pd.DataFrame(games)
 
 
+def get_already_started_games(date: str = None) -> set:
+    """
+    REAL, LIVE feature - not from the original scan's snapshot. Games
+    starting is genuinely time-sensitive: a scan run at 4pm has no idea
+    which games have kicked off by 7pm when you're actually looking at
+    results. This pulls a FRESH real schedule check every time it's
+    called, using pull_todays_games()'s already-real status field, so
+    "already started" always reflects right now, not whenever the scan
+    happened to run.
+
+    Real purpose: on a full slate, more real rows can clear a real filter
+    (like .00/10/70) than the display's top_n cap (150 max) can show at
+    once - meaning some real, qualifying legs from certain teams can get
+    silently cut off if enough OTHER teams' legs rank higher and fill
+    every slot first. Excluding already-started games BEFORE the top_n
+    cutoff genuinely frees up real room for teams that haven't played
+    yet, rather than just hiding stale rows after the fact.
+
+    Uses MLB-StatsAPI's real, standard status field - "Scheduled"/
+    "Pre-Game"/"Warmup" mean not started; "In Progress"/"Live"/"Delayed"/
+    "Manager Challenge" mean started; "Final"/"Game Over"/"Completed
+    Early" mean finished. These are MLB-StatsAPI's well-established,
+    standard status conventions, not something newly invented here - but
+    the exact literal strings haven't been confirmed against a live pull
+    from this build environment (no network access here), same honesty
+    standard as every other "standard field" claim in this file.
+
+    Returns a real set of game_pk values for games that have started or
+    finished - empty set (not a crash) if the schedule pull itself fails
+    for any reason, so a real network hiccup here degrades to "show
+    everything" rather than breaking the whole results table.
+    """
+    NOT_STARTED_STATUSES = {"Scheduled", "Pre-Game", "Warmup"}
+    try:
+        games = pull_todays_games(date=date)
+    except Exception:
+        return set()
+    if games.empty or "status" not in games.columns or "game_id" not in games.columns:
+        return set()
+    started = games[~games["status"].isin(NOT_STARTED_STATUSES)]
+    return set(started["game_id"].dropna().tolist())
+
+
 def build_doubleheader_labels(games_df: pd.DataFrame) -> dict:
     """
     Maps game_pk -> a human label like "Game 1" / "Game 2" for a real
