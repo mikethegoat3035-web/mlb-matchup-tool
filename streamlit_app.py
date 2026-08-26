@@ -34,6 +34,7 @@ from prop_model_combined import (
     backtest_pitcher_prop_quality_walk_forward, backtest_quality_score_multi_pitcher,
     get_pitcher_id, backtest_quality_score_all_props,
     get_player_id_from_full_name, pitcher_prop_probabilities, get_park_factor,
+    simulate_combo_hit_rate_from_backtest,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -1152,6 +1153,116 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
 
     st.caption("50% is the real coinflip baseline — meaningfully above that across a real "
                "sample is genuine evidence the zone/matchup work is adding something real.")
+
+
+st.divider()
+st.header("🎰📊 Combo Backtest — 2-man vs 3-man, real cash rate")
+st.caption(
+    "Answers a more direct question than the sections above: not 'does the signal exist' "
+    "but 'if I'd actually built N-man combos every night from legs clearing this quality bar, "
+    "what % would have cashed?' Reuses the exact same real hitter data/rules already pulled "
+    "above (real starters only via workload proxy, real 1-6 batting-order proxy via PA volume, "
+    "real min_games_sampled floor) - just recombines those same real legs into simulated combos "
+    "the way you'd actually play them, instead of grading each leg alone."
+)
+st.caption(
+    "⚠️ Real, honest limit: the underlying data has no real game ID, only team + date - so "
+    "'same game' here is approximated as 'same team, same date', not a byte-for-byte match to "
+    "the live slip builder's exact rule. Good for a real, directional read on 2-man vs 3-man; "
+    "not a perfect reproduction of what the live builder would have built."
+)
+
+cb_col1, cb_col2 = st.columns(2)
+cb_season = cb_col1.number_input("Season", value=2026, step=1, key="cb_season")
+cb_teams_raw = cb_col2.text_input("Teams (comma-separated, blank = all 30 - NOT recommended)",
+                                    value="yankees, dodgers", key="cb_teams_raw")
+
+cb_all_props = st.checkbox("Test ALL real hitter props automatically (6), not just one",
+                            value=False, key="cb_all_props")
+if not cb_all_props:
+    cb_hitter_prop = st.selectbox(
+        "Hitter prop to test", ["total_bases", "singles", "home_runs",
+                                 "hitter_hits_runs_rbi", "hitter_fantasy"],
+        key="cb_hitter_prop")
+
+cb_col3, cb_col4 = st.columns(2)
+cb_max_hitters = cb_col3.number_input("Max hitters (keep LOW)", min_value=1, max_value=30,
+                                       value=10, step=1, key="cb_max_hitters")
+cb_games_per_hitter = cb_col4.number_input("Test games per hitter (keep LOW)", min_value=1,
+                                            max_value=15, value=5, step=1, key="cb_games_per_hitter")
+
+cb_min_quality = st.slider("Minimum quality_score to include a leg", min_value=0, max_value=100,
+                            value=70, step=5, key="cb_min_quality")
+
+if st.button("Run 2-man vs 3-man comparison", type="primary", key="cb_run_btn"):
+    cb_teams_list = [t.strip() for t in cb_teams_raw.split(",") if t.strip()] or None
+    with st.spinner("Pulling real hitter data and simulating combos — this reuses the same "
+                     "real, slow walk-forward pull as the section above..."):
+        try:
+            if cb_all_props:
+                cb_result = backtest_quality_score_all_props(
+                    side="hitter", season=int(cb_season), teams=cb_teams_list,
+                    max_players=int(cb_max_hitters), max_test_games_per_player=int(cb_games_per_hitter),
+                )
+                # backtest_quality_score_all_props returns a summary table, not raw_rows -
+                # re-run per-prop to get the real raw rows this comparison actually needs
+                cb_raw_frames = []
+                for prop in ["total_bases", "singles", "home_runs",
+                             "hitter_hits_runs_rbi", "hitter_fantasy"]:
+                    try:
+                        r = backtest_quality_score_multi_hitter(
+                            season=int(cb_season), prop_type=prop, teams=cb_teams_list,
+                            max_hitters=int(cb_max_hitters), max_test_games_per_hitter=int(cb_games_per_hitter),
+                        )
+                        if r.get("raw_rows") is not None and not r["raw_rows"].empty:
+                            cb_raw_frames.append(r["raw_rows"])
+                    except Exception:
+                        continue
+                cb_raw = pd.concat(cb_raw_frames, ignore_index=True) if cb_raw_frames else pd.DataFrame()
+            else:
+                cb_single = backtest_quality_score_multi_hitter(
+                    season=int(cb_season), prop_type=cb_hitter_prop, teams=cb_teams_list,
+                    max_hitters=int(cb_max_hitters), max_test_games_per_hitter=int(cb_games_per_hitter),
+                )
+                cb_raw = cb_single.get("raw_rows", pd.DataFrame())
+
+            if cb_raw is None or cb_raw.empty:
+                st.warning("No real graded rows came back - nothing to simulate combos from.")
+                st.session_state.cb_result_2man = None
+                st.session_state.cb_result_3man = None
+            else:
+                st.session_state.cb_result_2man = simulate_combo_hit_rate_from_backtest(
+                    cb_raw, min_quality=float(cb_min_quality), combo_size=2)
+                st.session_state.cb_result_3man = simulate_combo_hit_rate_from_backtest(
+                    cb_raw, min_quality=float(cb_min_quality), combo_size=3)
+        except Exception as e:
+            st.error(f"Combo backtest failed: {e}")
+            st.session_state.cb_result_2man = None
+            st.session_state.cb_result_3man = None
+
+if st.session_state.get("cb_result_2man") is not None or st.session_state.get("cb_result_3man") is not None:
+    r2 = st.session_state.get("cb_result_2man")
+    r3 = st.session_state.get("cb_result_3man")
+    ccol1, ccol2 = st.columns(2)
+    with ccol1:
+        st.subheader("2-man")
+        if r2 and "error" not in r2:
+            st.metric("Real cash rate", f"{r2['combo_hit_rate']*100:.1f}%" if r2['combo_hit_rate'] is not None else "N/A")
+            st.caption(f"{r2['combos_built']} real combos built from {r2['real_legs_available']} "
+                       f"legs clearing quality >= {int(cb_min_quality)} "
+                       f"({r2['legs_leftover_ungrouped']} leftover, couldn't be paired)")
+        else:
+            st.warning(r2.get("error", "No result") if r2 else "No result")
+    with ccol2:
+        st.subheader("3-man")
+        if r3 and "error" not in r3:
+            st.metric("Real cash rate", f"{r3['combo_hit_rate']*100:.1f}%" if r3['combo_hit_rate'] is not None else "N/A")
+            st.caption(f"{r3['combos_built']} real combos built from {r3['real_legs_available']} "
+                       f"legs clearing quality >= {int(cb_min_quality)} "
+                       f"({r3['legs_leftover_ungrouped']} leftover, couldn't be paired)")
+        else:
+            st.warning(r3.get("error", "No result") if r3 else "No result")
+
 
 
 
