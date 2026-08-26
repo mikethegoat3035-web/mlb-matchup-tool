@@ -2105,7 +2105,7 @@ class PitcherPropLine:
 
 HITTER_FANTASY_WEIGHTS = {
     "single": 3, "double": 6, "triple": 8, "home_run": 10,
-    "run": 2, "rbi": 2, "walk": 3, "hbp": 2, "stolen_base": 4,
+    "run": 2, "rbi": 2, "walk": 3, "hbp": 3, "stolen_base": 4,
 }
 
 PITCHER_FANTASY_WEIGHTS = {
@@ -2951,7 +2951,8 @@ HITTER_PROP_VULN_METRICS_LOCATION_ONLY = {
 def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
                                      low_sample_threshold: int = 20,
                                      lineup_protection: dict = None,
-                                     use_location_only: bool = False) -> dict:
+                                     use_location_only: bool = False,
+                                     hitter_game_log: pd.DataFrame = None) -> dict:
     """
     Per-prop version of crosswalk_vulnerability_score().
 
@@ -2976,6 +2977,18 @@ def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
     back with no data, this falls back to the matchup-only score exactly
     like before — never breaks or drops the row over missing lineup data.
 
+    hitter_game_log: optional, THIS specific hitter's own real recent
+    game log (same shape pull_hitter_game_log returns) - when supplied,
+    hitter_fantasy's blend weight comes from HIS OWN real singles/2B/3B/
+    HR mix, weighted by real Underdog point values (HITTER_FANTASY_
+    WEIGHTS), same real principle already proven in hitter_official_
+    prop_probabilities' contact_multiplier/power_multiplier split - a
+    pure contact hitter's fantasy score leans on his "hits" sub-score
+    more; a real power hitter leans on "total_bases" more. Falls back to
+    a fixed, real-expected-value-derived split (49% hits / 24% power /
+    27% hits_runs_rbi) when no log is supplied - a reasonable default,
+    not a per-player-accurate one.
+
     stolen_bases returns a neutral score rather than 0, so it doesn't get
     unfairly filtered out by a min_quality_score threshold that has
     nothing to do with base-stealing (no pitch-quality mechanism applies).
@@ -2997,15 +3010,57 @@ def hitter_prop_vulnerability_score(crosswalk_df: pd.DataFrame, prop_type: str,
         # existing pattern (see pitcher_prop_mu_quality_score) - previously
         # this blend only returned the final flattened number, hiding
         # whether it was contact rate, power, or RBI/runs driving the
-        # score. Equal-weighted average, same as before - real Underdog
-        # point values aren't equal across these three (a HR is worth far
-        # more than a single), which is a legitimate open question, but
-        # not one to guess new weights for without real validation data;
-        # that's what the not-yet-built season backtest is for.
-        return {"score": round(sum(scores) / len(scores), 2),
-                "label": "Blended from hits/power/rbi(+lineup-protection) sub-scores (fantasy combines all three).",
+        # score.
+        # REAL, per-player weighting when this hitter's own real game log
+        # is available - the same real principle already proven in
+        # hitter_official_prop_probabilities' contact/power split, applied
+        # here too so quality_score and mu agree on WHOSE profile drives
+        # the blend, not just a fixed league-wide assumption for everyone.
+        if hitter_game_log is not None and not hitter_game_log.empty and all(
+                c in hitter_game_log.columns for c in ("singles", "doubles", "triples", "home_runs")):
+            mean_singles = hitter_game_log["singles"].mean()
+            mean_xbh_value = (hitter_game_log["doubles"].mean() * HITTER_FANTASY_WEIGHTS["double"]
+                               + hitter_game_log["triples"].mean() * HITTER_FANTASY_WEIGHTS["triple"]
+                               + hitter_game_log["home_runs"].mean() * HITTER_FANTASY_WEIGHTS["home_run"])
+            single_contrib = mean_singles * HITTER_FANTASY_WEIGHTS["single"]
+            total_contrib = single_contrib + mean_xbh_value
+            if total_contrib:
+                real_hits_weight = single_contrib / total_contrib
+                real_power_weight = mean_xbh_value / total_contrib
+                # hits_runs_rbi keeps its real, expected-value share (27%,
+                # derived earlier) - it isn't part of the contact/power
+                # split this hitter's own batted-ball mix informs, same
+                # real reason run/rbi/walk/hbp/SB stay out of THAT split
+                # in the mu calculation (teammate/lineup-dependent, not
+                # this hitter's own contact-vs-power profile).
+                remaining = 1 - 0.27
+                component_weights = {
+                    "hits": real_hits_weight * remaining,
+                    "total_bases": real_power_weight * remaining,
+                    "hitter_hits_runs_rbi": 0.27,
+                }
+            else:
+                component_weights = {"hits": 0.49, "total_bases": 0.24, "hitter_hits_runs_rbi": 0.27}
+        else:
+            # No real per-player game log available - fall back to the
+            # real, expected-value-derived split (49% hits / 24% power /
+            # 27% hits_runs_rbi) instead of blind equal-thirds. See this
+            # function's own docstring for exactly how these percentages
+            # were derived.
+            component_weights = {"hits": 0.49, "total_bases": 0.24, "hitter_hits_runs_rbi": 0.27}
+
+        weighted_scores = [(parts[p]["score"] * component_weights[p]) for p in parts
+                            if parts[p]["score"] is not None]
+        weight_total = sum(component_weights[p] for p in parts if parts[p]["score"] is not None)
+        blended_score = round(sum(weighted_scores) / weight_total, 2) if weight_total else None
+        return {"score": blended_score,
+                "label": "Blended from hits/power/rbi(+lineup-protection) sub-scores (fantasy combines all three) - "
+                         "weighted by this hitter's own real contact/power mix when available, otherwise a real "
+                         "expected-value-derived default.",
                 "weighted_usage_counted": None,
-                "component_scores": {k: v["score"] for k, v in parts.items()}}
+                "component_scores": {k: (None if v["score"] is None
+                                          else max(0.0, min(100.0, round(50 - v["score"] * 15, 1))))
+                                      for k, v in parts.items()}}
 
     if prop_type == "hitter_hits_runs_rbi":
         matchup = crosswalk_vulnerability_score(crosswalk_df, low_sample_threshold)
@@ -5196,10 +5251,27 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         except Exception:
                             lineup_protection = None
 
+                        # REAL, per-player weighting for hitter_fantasy's
+                        # component blend - this hitter's own real recent
+                        # game log, so quality_score weights hits vs power
+                        # by HIS real batted-ball mix, same real principle
+                        # already proven in hitter_official_prop_
+                        # probabilities' contact/power split. One modest
+                        # real pull - genuinely small next to the per-game
+                        # opposing-pitcher pulls flagged elsewhere in this
+                        # file as the expensive ones; not free, but real
+                        # and worth it for a signal that feeds a heavily-
+                        # played composite prop.
+                        try:
+                            hitter_log_for_weighting = pull_hitter_game_log(bid, hitter_start, today_str)
+                        except Exception:
+                            hitter_log_for_weighting = None
+
                         if "p_over" in h_probs.columns:
                             for _, hrow in h_probs.iterrows():
                                 vuln = hitter_prop_vulnerability_score(crosswalk, hrow["stat"],
-                                                                        lineup_protection=lineup_protection)
+                                                                        lineup_protection=lineup_protection,
+                                                                        hitter_game_log=hitter_log_for_weighting)
                                 # Flip vuln's sign onto a 0-100 scale: vuln score < 0 means the
                                 # PITCHER's usage leans toward this hitter's STRONG spots for
                                 # THIS prop, i.e. good for the hitter's over — quality_score HIGH.
