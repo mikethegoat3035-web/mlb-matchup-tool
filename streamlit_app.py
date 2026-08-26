@@ -27,6 +27,7 @@ from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
     match_book_line_to_player, get_unconfirmed_games_today, get_already_started_games,
+    pull_todays_games,
     backtest_full_season_mlb, PITCHER_BACKTEST_LINES, HITTER_BACKTEST_LINES,
     backtest_hitter_prop_quality_walk_forward, get_batter_id,
     backtest_quality_score_multi_hitter,
@@ -314,12 +315,76 @@ qm_min_games = qf2.number_input("Minimum games sampled", value=15, step=1, key="
 qm_min_quality = qf3.number_input("Minimum quality_score (0 = don't filter on this)",
                                   value=60, step=5, key="qm_min_quality")
 
+st.subheader("Scan one game at a time")
+st.caption("Each box scans only that game's two teams - real, isolated scanning, "
+           "not a display filter on an already-scanned slate. Useful when you "
+           "specifically want to check whether a game was skipped, and why, "
+           "without waiting on the full slate.")
+try:
+    todays_games_for_boxes = pull_todays_games()
+    if not todays_games_for_boxes.empty:
+        game_cols = st.columns(4)
+        for idx, g in todays_games_for_boxes.iterrows():
+            away, home = g.get("away_name", "?"), g.get("home_name", "?")
+            with game_cols[idx % 4]:
+                if st.button(f"{away} @ {home}", key=f"qm_gamebox_{idx}"):
+                    with st.spinner(f"Scanning {away} @ {home}..."):
+                        try:
+                            box_errors = []
+                            box_slate = scan_full_slate_quality_mu(
+                                pitcher_days_recent=int(qm_pitcher_days),
+                                hitter_days_recent=int(qm_hitter_days) if qm_hitter_days is not None else None,
+                                hitter_season_long=qm_hitter_season_long,
+                                season_start=SEASON_START,
+                                include_official_props=qm_include_official,
+                                use_live_lines=False, live_line_source="underdog",
+                                min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
+                                min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
+                                team_filter=[away, home], scan_errors=box_errors,
+                            )
+                            if box_errors:
+                                for err in box_errors:
+                                    st.warning(err)
+                            if box_slate.empty:
+                                st.info("No props cleared your filters for this game "
+                                        "(or see the warning above if it was skipped entirely).")
+                            else:
+                                # REAL FIX - this used to OVERWRITE qm_slate
+                                # entirely, wiping out any previously
+                                # scanned games the moment a new game box
+                                # was clicked. Now it ACCUMULATES: merges
+                                # this game's props into whatever's
+                                # already there, so scanning several
+                                # individual games in a row builds one
+                                # combined pool - real slips can still
+                                # pull from every game you've scanned,
+                                # not just the most recent one.
+                                if "qm_slate" in st.session_state and not st.session_state.qm_slate.empty:
+                                    existing = st.session_state.qm_slate
+                                    # avoid double-counting if the same game gets scanned twice
+                                    if "game_pk" in existing.columns and "game_pk" in box_slate.columns:
+                                        already_scanned_pks = set(existing["game_pk"].unique())
+                                        box_slate = box_slate[~box_slate["game_pk"].isin(already_scanned_pks)]
+                                    st.session_state.qm_slate = pd.concat([existing, box_slate], ignore_index=True)
+                                else:
+                                    st.session_state.qm_slate = box_slate
+                                st.success(f"Found {len(box_slate)} props for {away} @ {home} - "
+                                          f"added to your existing pool "
+                                          f"({len(st.session_state.qm_slate)} total props now).")
+                        except Exception as e:
+                            st.error(f"Scan failed: {e}")
+except Exception as e:
+    st.caption(f"(Per-game boxes unavailable right now: {e})")
+
+st.markdown("---")
+
 if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
     with st.spinner("Scanning every confirmed game today — this can take a while on a full slate..."):
         try:
             max_g = int(qm_max_games) if qm_max_games > 0 else None
             vz_capture = {}
             vz_hitter_capture = {}
+            qm_scan_errors = []
             qm_slate = scan_full_slate_quality_mu(
                 pitcher_days_recent=int(qm_pitcher_days),
                 hitter_days_recent=int(qm_hitter_days) if qm_hitter_days is not None else None,
@@ -329,9 +394,14 @@ if st.button("Scan full slate (pitcher + hitter)", key="qm_scan_btn"):
                 use_live_lines=False, live_line_source="underdog",
                 min_edge=float(qm_min_edge), min_games_sampled=int(qm_min_games),
                 min_quality_score=float(qm_min_quality) if qm_min_quality > 0 else None,
-                max_games=max_g, debug_capture=vz_capture, hitter_debug_capture=vz_hitter_capture)
+                max_games=max_g, debug_capture=vz_capture, hitter_debug_capture=vz_hitter_capture,
+                scan_errors=qm_scan_errors)
             st.session_state.vz_debug_capture = vz_capture
             st.session_state.vz_hitter_debug_capture = vz_hitter_capture
+            if qm_scan_errors:
+                with st.expander(f"{len(qm_scan_errors)} game(s) skipped or errored during this scan - click to see why"):
+                    for err in qm_scan_errors:
+                        st.warning(err)
             if "note" in qm_slate.columns:
                 st.warning(qm_slate.iloc[0]["note"])
                 st.session_state.pop("qm_slate", None)
