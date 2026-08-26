@@ -575,14 +575,53 @@ if "qm_slate" in st.session_state:
                                         "get folded into a 2-man or 4-man slip instead, never a "
                                         "same-size slip short a leg.")
 
-    selected = qualified_df[qualified_df["Include"] == True].copy()
-    checked_total = int((final_df["Include"] == True).sum())
-    if checked_total > len(selected):
-        st.caption(f"You checked {checked_total} legs, but {checked_total - len(selected)} of them "
-                   f"don't clear the quality/confidence/edge bar above and were left out of the slips below.")
-    if selected.empty:
-        st.caption("Check the Include box on legs above to start building slips.")
+    # REAL FIX for the exact workflow gap just found live tonight: checking
+    # legs used to only ever reflect the CURRENT scan's table - rescanning
+    # a new game reset every checkbox, and "Lock in" froze specific slip
+    # GROUPINGS rather than just remembering which PLAYERS you wanted kept.
+    # This is simpler and closer to what was actually asked for: one
+    # persistent pool of "kept" legs that survives every rescan, growing
+    # as you check new legs from new games - the slip builder below
+    # always re-groups the FULL current pool from scratch, so adding one
+    # more kept leg after a new scan genuinely can reshuffle everything
+    # into fresh, better-balanced slips, not just append a new isolated one.
+    just_checked = qualified_df[qualified_df["Include"] == True].copy()
+    kcol1, kcol2 = st.columns([1, 3])
+    with kcol1:
+        if st.button("➕ Keep checked legs", key="keep_checked_btn"):
+            if just_checked.empty:
+                st.warning("Nothing is checked right now - check some legs above first.")
+            else:
+                if "kept_pool" not in st.session_state or st.session_state.kept_pool.empty:
+                    st.session_state.kept_pool = just_checked
+                else:
+                    existing_keys = set(zip(st.session_state.kept_pool["player"],
+                                             st.session_state.kept_pool["prop_type"],
+                                             st.session_state.kept_pool["line"]))
+                    new_rows = just_checked[~just_checked.apply(
+                        lambda r: (r["player"], r["prop_type"], r["line"]) in existing_keys, axis=1)]
+                    st.session_state.kept_pool = pd.concat(
+                        [st.session_state.kept_pool, new_rows], ignore_index=True)
+                st.success(f"Kept pool now has {len(st.session_state.kept_pool)} legs total - "
+                           f"scan the next game, check more, and click this again to keep growing it.")
+    with kcol2:
+        if st.session_state.get("kept_pool") is not None and not st.session_state.kept_pool.empty:
+            if st.button("🗑️ Clear kept pool (start over)", key="clear_kept_btn"):
+                st.session_state.kept_pool = pd.DataFrame()
+                st.rerun()
+
+    selected = st.session_state.get("kept_pool", pd.DataFrame())
+    if selected is None or selected.empty:
+        selected = pd.DataFrame()
     else:
+        selected = selected.copy()
+    checked_total = len(selected)
+    if selected.empty:
+        st.caption("Check legs above and click \"Keep checked legs\" to start building your pool. "
+                   "It survives every rescan - keep adding from each new game as its lineup confirms.")
+    else:
+        st.caption(f"Building slips from your full kept pool ({len(selected)} legs, across every "
+                   f"game you've scanned and kept so far) - not just this one scan.")
         # Blended strength score - quality_score is the dominant real
         # signal (0-100 scale, already reflects real matchup trust);
         # edge added at a real but secondary weight (edge is 0-0.5 scale,
