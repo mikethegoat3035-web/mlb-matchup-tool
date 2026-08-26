@@ -4657,7 +4657,9 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                                 min_edge: float = 0.25, min_games_sampled: int = 5,
                                 min_quality_score: float = None,
                                 debug_capture: dict = None,
-                                hitter_debug_capture: dict = None) -> pd.DataFrame:
+                                hitter_debug_capture: dict = None,
+                                team_filter: list = None,
+                                scan_errors: list = None) -> pd.DataFrame:
     """
     The full-slate 'quality mu' scan across BOTH pitcher and hitter props.
     Only scans games with a CONFIRMED lineup already posted (same
@@ -4790,6 +4792,17 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
         if game_pk is None:
             continue
 
+        # REAL, NEW feature - lets a specific game be scanned in isolation
+        # (mirrors the NFL model's team_filter). Checks both real team
+        # names for this game against whatever was passed in, case-
+        # insensitive, so "Rockies" or "Colorado Rockies" both match.
+        if team_filter:
+            home = str(game.get("home_name", "")).lower()
+            away = str(game.get("away_name", "")).lower()
+            wanted = [t.lower() for t in team_filter]
+            if not any(w in home or w in away for w in wanted):
+                continue
+
         # Real park factor for TONIGHT's specific game, computed once per
         # game and reused for both pitcher and hitter mu (previously only
         # computed later, inside the hitter loop, and only ever passed to
@@ -4799,9 +4812,23 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
 
         try:
             lineup_check = pull_confirmed_lineup(game_pk)
-        except Exception:
+        except Exception as e:
+            # REAL FIX - this used to silently `continue` with ZERO trace
+            # of WHY a game got skipped, making a genuine data-pull bug
+            # for one specific game indistinguishable from "lineup really
+            # isn't confirmed yet" from the outside - exactly the real
+            # confusion that came up live tonight. Now the actual real
+            # reason gets captured and can be shown in the UI, instead of
+            # a silent, unexplained gap in the results.
+            if scan_errors is not None:
+                scan_errors.append(f"{game.get('away_name','?')} @ {game.get('home_name','?')}: "
+                                    f"lineup check crashed - {type(e).__name__}: {e}")
             continue
         if lineup_check.get("lineup_status") != "confirmed":
+            if scan_errors is not None:
+                scan_errors.append(f"{game.get('away_name','?')} @ {game.get('home_name','?')}: "
+                                    f"skipped - lineup_status='{lineup_check.get('lineup_status')}' "
+                                    f"(not 'confirmed' at scan time)")
             continue  # skip entirely — no partial/guessed scans on this pass
 
         for side, opp_name_col, own_name_col, batting_side in [
@@ -8275,4 +8302,3 @@ def backtest_pitcher_win_walk_forward(pitcher_id: int, season: int,
             "hit": predicted_over == actual_over,
         })
     return pd.DataFrame(rows)
-                                            
