@@ -7736,6 +7736,90 @@ def compute_signal_separation_diagnostic(raw_rows: pd.DataFrame) -> dict:
     }
 
 
+def simulate_combo_hit_rate_from_backtest(raw_rows: pd.DataFrame, min_quality: float = 70.0,
+                                           combo_size: int = 2) -> dict:
+    """
+    Answers a real, more direct question than either existing backtest
+    does: not "does quality_score discriminate" or "is mu well-
+    calibrated" in the abstract, but "if I'd actually built N-man combos
+    every real night from legs clearing min_quality, what % of those real
+    combos would have hit?" - the same real, historical rows already
+    validated in the other backtests, just recombined the way you'd
+    actually play them.
+
+    REAL, STATED LIMITATION - read before trusting the number: raw_rows
+    (from backtest_quality_score_multi_hitter/_pitcher) has no real
+    game_pk or opponent column, only player/team/game_date. The live
+    slip builder's real same-game conflict check (no two legs from the
+    identical real game_pk) can't be exactly reproduced here - this uses
+    team + game_date as an approximate stand-in instead (no two legs
+    from the same team on the same real date). This is NOT identical to
+    the live builder's real logic: two hitters from DIFFERENT teams who
+    happened to play EACH OTHER that day would incorrectly be treated as
+    two separate, combinable games here, when the live builder would
+    correctly block them as the same real game. A real, honest
+    simplification - useful for a directional read, not a byte-for-byte
+    reproduction of what the live slip builder would have actually built.
+
+    Real simulation logic: for each real date in the data, take every
+    real leg clearing min_quality that day, greedily pair/group them
+    into combo_size-man combos respecting the team+date proxy rule above
+    (one leg per team per combo), skip any leftover legs that don't fill
+    a complete combo (no partial combos - matches how you'd actually
+    play). A simulated combo "hits" only if EVERY real leg in it hit.
+
+    Returns real counts and the real historical hit rate for these
+    simulated combos, plus how many real legs were cleared but couldn't
+    be grouped (no valid, non-conflicting partner that day).
+    """
+    if raw_rows is None or raw_rows.empty:
+        return {"error": "No real graded rows to test."}
+    required = {"quality_score", "hit", "game_date", "team", "player"}
+    missing = required - set(raw_rows.columns)
+    if missing:
+        return {"error": f"Missing required real columns: {missing}"}
+
+    pool = raw_rows[raw_rows["quality_score"] >= min_quality].dropna(subset=["hit"]).copy()
+    if pool.empty:
+        return {"error": f"No real legs cleared quality >= {min_quality}."}
+
+    combos_built = 0
+    combos_hit = 0
+    legs_used = 0
+    legs_leftover = 0
+
+    for game_date, day_group in pool.groupby("game_date"):
+        available = day_group.sample(frac=1, random_state=42).to_dict("records")  # real, fixed shuffle for reproducibility
+        while len(available) >= combo_size:
+            combo = [available.pop(0)]
+            used_teams = {combo[0]["team"]}
+            i = 0
+            while len(combo) < combo_size and i < len(available):
+                candidate = available[i]
+                if candidate["team"] not in used_teams:
+                    combo.append(available.pop(i))
+                    used_teams.add(candidate["team"])
+                else:
+                    i += 1
+            if len(combo) == combo_size:
+                combos_built += 1
+                legs_used += combo_size
+                if all(leg["hit"] for leg in combo):
+                    combos_hit += 1
+            else:
+                legs_leftover += len(combo)  # couldn't fill this combo - real legs left ungrouped
+                break  # no more valid non-conflicting partners left today
+        legs_leftover += len(available)  # any remaining legs too few to attempt another combo
+
+    hit_rate = (combos_hit / combos_built) if combos_built else None
+    return {
+        "min_quality": min_quality, "combo_size": combo_size,
+        "real_legs_available": len(pool), "combos_built": combos_built,
+        "combos_hit": combos_hit, "combo_hit_rate": hit_rate,
+        "legs_leftover_ungrouped": legs_leftover,
+    }
+
+
 def backtest_quality_score_all_props(side: str, season: int, teams: list = None,
                                        max_players: int = 8, max_test_games_per_player: int = 4,
                                        min_games_before: int = None,
