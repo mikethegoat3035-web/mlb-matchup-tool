@@ -349,28 +349,27 @@ try:
                                 st.info("No props cleared your filters for this game "
                                         "(or see the warning above if it was skipped entirely).")
                             else:
-                                # REAL FIX - this used to OVERWRITE qm_slate
-                                # entirely, wiping out any previously
-                                # scanned games the moment a new game box
-                                # was clicked. Now it ACCUMULATES: merges
-                                # this game's props into whatever's
-                                # already there, so scanning several
-                                # individual games in a row builds one
-                                # combined pool - real slips can still
-                                # pull from every game you've scanned,
-                                # not just the most recent one.
-                                if "qm_slate" in st.session_state and not st.session_state.qm_slate.empty:
-                                    existing = st.session_state.qm_slate
-                                    # avoid double-counting if the same game gets scanned twice
-                                    if "game_pk" in existing.columns and "game_pk" in box_slate.columns:
-                                        already_scanned_pks = set(existing["game_pk"].unique())
-                                        box_slate = box_slate[~box_slate["game_pk"].isin(already_scanned_pks)]
-                                    st.session_state.qm_slate = pd.concat([existing, box_slate], ignore_index=True)
-                                else:
-                                    st.session_state.qm_slate = box_slate
-                                st.success(f"Found {len(box_slate)} props for {away} @ {home} - "
-                                          f"added to your existing pool "
-                                          f"({len(st.session_state.qm_slate)} total props now).")
+                                # SUPERSEDED - this used to accumulate qm_slate
+                                # across scans so the slip builder could pull
+                                # from every scanned game. That's now handled
+                                # correctly by the separate "Keep checked
+                                # legs" pool instead, which is exactly the
+                                # right place for cross-scan persistence -
+                                # this table's real job is just showing THIS
+                                # scan cleanly. Accumulating here too was
+                                # causing a real, confusing bug: unchecked
+                                # players from old scans kept sitting in this
+                                # table indefinitely, when only what you
+                                # actually check-and-keep should carry
+                                # forward. Real fix: this table now always
+                                # shows exactly the game you just scanned,
+                                # nothing more - check what you want, click
+                                # "Keep checked legs" below, and THAT is what
+                                # persists across scans.
+                                st.session_state.qm_slate = box_slate
+                                st.success(f"Found {len(box_slate)} props for {away} @ {home}. "
+                                          f"Check who you want, then click \"Keep checked legs\" "
+                                          f"below to carry them forward before scanning the next game.")
                         except Exception as e:
                             st.error(f"Scan failed: {e}")
 except Exception as e:
