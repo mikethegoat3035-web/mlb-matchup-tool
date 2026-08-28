@@ -1449,7 +1449,9 @@ else:
         else:
             today_str = get_mlb_today().strftime("%Y-%m-%d")
             combined_hitters_series = {}
+            combined_pitchers_series = {}
             sim_lineup_teams = {}
+            sim_pitcher_teams = {}
 
             # Real, deliberate change - runs BOTH sides automatically
             # instead of making the user pick one. A real game always has
@@ -1512,13 +1514,22 @@ else:
                         sim_results = simulate_matchup_n_times(
                             lineup_crosswalks, starter_avg_outs, n_simulations=sim_n_games)
                     combined_hitters_series.update(sim_results["hitters"])
+                    # Real, genuine gap closed - the starter's OWN real
+                    # simulated stats (strikeouts/outs/hits_allowed/
+                    # walks_allowed) were already being computed here the
+                    # whole time, just never surfaced anywhere in the UI.
+                    combined_pitchers_series[opposing_pitcher["name"]] = sim_results["starter"]
+                    sim_pitcher_teams[opposing_pitcher["name"]] = pitching_side
                     st.success(f"Ran {sim_n_games} real, full simulated games for "
                                f"{opposing_pitcher['name']} vs the {hitting_side} lineup.")
 
-            if combined_hitters_series:
-                st.session_state["sim_results"] = {"hitters": combined_hitters_series}
+            if combined_hitters_series or combined_pitchers_series:
+                st.session_state["sim_results"] = {"hitters": combined_hitters_series,
+                                                     "pitchers": combined_pitchers_series}
                 st.session_state["sim_lineup_names"] = list(combined_hitters_series.keys())
+                st.session_state["sim_pitcher_names"] = list(combined_pitchers_series.keys())
                 st.session_state["sim_lineup_teams"] = sim_lineup_teams
+                st.session_state["sim_pitcher_teams"] = sim_pitcher_teams
 
     if "sim_results" in st.session_state:
         st.subheader("Enter each real line to check against the simulated games")
@@ -1529,12 +1540,22 @@ else:
             "with the actual real book line."
         )
         sim_props_wanted = st.multiselect(
-            "Which props to show", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
-                                     "strikeouts", "total_bases", "hits_runs_rbi", "fantasy"],
+            "Which hitter props to show", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
+                                            "strikeouts", "total_bases", "hits_runs_rbi", "fantasy"],
             default=["hits", "total_bases", "home_runs", "hits_runs_rbi", "fantasy"],
             key="sim_props_multiselect",
         )
-        if not sim_props_wanted:
+        sim_pitcher_props_wanted = st.multiselect(
+            "Which pitcher props to show",
+            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs", "pitcher_fantasy"],
+            default=["strikeouts", "outs", "earned_runs", "pitcher_fantasy"],
+            key="sim_pitcher_props_multiselect",
+            help="The starter's own real simulated stats. pitcher_fantasy uses the real "
+                 "scoring: 3pts/K, 1pt/out, -3pts/earned run, +5pts/quality start. Win isn't "
+                 "included - it genuinely depends on the opposing team's own score, which this "
+                 "simulation doesn't model (only one lineup vs one starter at a time).",
+        )
+        if not sim_props_wanted and not sim_pitcher_props_wanted:
             st.info("Pick at least one prop above.")
         else:
             def _round_half(x):
@@ -1547,14 +1568,23 @@ else:
                     series = st.session_state["sim_results"]["hitters"].get(name, {}).get(prop, [])
                     default_avg = sum(series) / len(series) if series else 1.5
                     base_rows.append({
-                        "player": name, "team": team, "prop": prop,
+                        "side": "hitter", "player": name, "team": team, "prop": prop,
+                        "your_line": _round_half(default_avg),
+                    })
+            for name in st.session_state.get("sim_pitcher_names", []):
+                team = st.session_state.get("sim_pitcher_teams", {}).get(name, "?")
+                for prop in sim_pitcher_props_wanted:
+                    series = st.session_state["sim_results"].get("pitchers", {}).get(name, {}).get(prop, [])
+                    default_avg = sum(series) / len(series) if series else 1.5
+                    base_rows.append({
+                        "side": "pitcher", "player": name, "team": team, "prop": prop,
                         "your_line": _round_half(default_avg),
                     })
             base_df = pd.DataFrame(base_rows)
 
             edited_lines = st.data_editor(
                 base_df, key="sim_lines_editor", width='stretch', hide_index=True,
-                disabled=["player", "team", "prop"],
+                disabled=["side", "player", "team", "prop"],
                 column_config={
                     "your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5),
                 },
@@ -1562,14 +1592,62 @@ else:
 
             result_rows = []
             for _, row in edited_lines.iterrows():
-                series = st.session_state["sim_results"]["hitters"].get(row["player"], {}).get(row["prop"], [])
+                source = "pitchers" if row["side"] == "pitcher" else "hitters"
+                series = st.session_state["sim_results"].get(source, {}).get(row["player"], {}).get(row["prop"], [])
                 r = real_over_rate_from_simulation(series, row["your_line"])
-                result_rows.append({"player": row["player"], "team": row["team"], "prop": row["prop"],
-                                     "line": row["your_line"], **r})
+                result_rows.append({"side": row["side"], "player": row["player"], "team": row["team"],
+                                     "prop": row["prop"], "line": row["your_line"], **r})
             result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
-            st.dataframe(result_df, width='stretch')
+            result_df.insert(0, "Include", False)
+            edited_results = st.data_editor(
+                result_df, key="sim_results_editor", width='stretch', hide_index=True,
+                disabled=[c for c in result_df.columns if c != "Include"],
+                column_config={
+                    "Include": st.column_config.CheckboxColumn(
+                        "Include", help="Check to keep this real simulated result"),
+                },
+            )
             st.caption("over_count/total is the real, empirical rate across the simulated games - "
                        "'over in 67 of 100', not a formula's single calculated probability.")
+
+            # Same real, proven "keep checked legs" pattern already used for
+            # the main scan above - lets simulated results from THIS game
+            # survive into the next game's simulation instead of being lost
+            # the moment you pick a different matchup.
+            just_checked_sim = edited_results[edited_results["Include"] == True].copy()
+            scol1, scol2 = st.columns([1, 3])
+            with scol1:
+                if st.button("➕ Keep checked sim results", key="sim_keep_checked_btn"):
+                    if just_checked_sim.empty:
+                        st.warning("Nothing is checked right now - check some rows above first.")
+                    else:
+                        if "sim_kept_pool" not in st.session_state or st.session_state.sim_kept_pool.empty:
+                            st.session_state.sim_kept_pool = just_checked_sim
+                        else:
+                            existing_keys = set(zip(st.session_state.sim_kept_pool["side"],
+                                                     st.session_state.sim_kept_pool["player"],
+                                                     st.session_state.sim_kept_pool["prop"],
+                                                     st.session_state.sim_kept_pool["line"]))
+                            new_rows = just_checked_sim[~just_checked_sim.apply(
+                                lambda r: (r["side"], r["player"], r["prop"], r["line"]) in existing_keys, axis=1)]
+                            st.session_state.sim_kept_pool = pd.concat(
+                                [st.session_state.sim_kept_pool, new_rows], ignore_index=True)
+                        st.success(f"Kept pool now has {len(st.session_state.sim_kept_pool)} real "
+                                   f"simulated result(s) - run the next game's simulation, check more, "
+                                   f"and click this again to keep growing it.")
+            with scol2:
+                if st.session_state.get("sim_kept_pool") is not None and not st.session_state.sim_kept_pool.empty:
+                    if st.button("🗑️ Clear kept sim pool (start over)", key="sim_clear_kept_btn"):
+                        st.session_state.sim_kept_pool = pd.DataFrame()
+                        st.rerun()
+
+            kept_sim = st.session_state.get("sim_kept_pool", pd.DataFrame())
+            if kept_sim is not None and not kept_sim.empty:
+                st.subheader("Kept simulated results (survives across games)")
+                st.dataframe(kept_sim.drop(columns=["Include"], errors="ignore"), width='stretch')
+            else:
+                st.caption("Check rows above and click \"Keep checked sim results\" to start building "
+                           "a pool that survives into the next game's simulation.")
 
 
 
