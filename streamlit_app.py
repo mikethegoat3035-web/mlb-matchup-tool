@@ -21,7 +21,7 @@ http://localhost:8501). Close the terminal window to shut it down.
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
@@ -1474,13 +1474,22 @@ else:
                     continue
 
                 pid = opposing_pitcher["player_id"]
-                with st.spinner(f"Pulling {opposing_pitcher['name']}'s real pitch data and building his real arsenal..."):
+                # Real fix - matches the same, already-established convention
+                # used everywhere else in this file (scan_full_slate_quality_
+                # mu's own default): pitchers use a recent, 68-day rolling
+                # window since real arsenal/stuff can meaningfully change
+                # over a season, while hitters use the full season by
+                # default. This simulation was pulling full-season data for
+                # BOTH sides until now, which didn't match that real,
+                # deliberate convention.
+                pitcher_recent_start = (get_mlb_today() - timedelta(days=68)).strftime("%Y-%m-%d")
+                with st.spinner(f"Pulling {opposing_pitcher['name']}'s real, recent (68-day) pitch data and building his real arsenal..."):
                     try:
-                        pitcher_pitches = pull_pitcher_pitches(pid, SEASON_START, today_str)
+                        pitcher_pitches = pull_pitcher_pitches(pid, pitcher_recent_start, today_str)
                         pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
                         pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
                                         if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
-                        pitcher_game_log = pull_pitcher_game_log(pid, SEASON_START, today_str)
+                        pitcher_game_log = pull_pitcher_game_log(pid, pitcher_recent_start, today_str)
                         starter_avg_outs = (pitcher_game_log["outs"].mean()
                                             if pitcher_game_log is not None and not pitcher_game_log.empty
                                             else 15.0)
@@ -1495,6 +1504,9 @@ else:
                 progress = st.progress(0.0, text=f"Building real crosswalks for the {hitting_side} lineup...")
                 for i, hitter in enumerate(real_lineup):
                     try:
+                        # Hitters correctly stay on the full season here -
+                        # matches the same default convention (hitter_
+                        # season_long=True) used everywhere else.
                         h_pitches = pull_batter_pitches(hitter["player_id"], SEASON_START, today_str)
                         batter_hand = (h_pitches["stand"].mode().iloc[0]
                                       if not h_pitches.empty and "stand" in h_pitches else "R")
