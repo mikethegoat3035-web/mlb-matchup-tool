@@ -1442,7 +1442,7 @@ if sim_games_df is None or sim_games_df.empty:
     st.info("No games found for today.")
 else:
     sim_game_options = {
-        f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}": row["game_pk"]
+        f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}": row["game_id"]
         for _, row in sim_games_df.iterrows()
     }
     sim_game_label = st.selectbox("Pick a real game", list(sim_game_options.keys()), key="sim_game_select")
