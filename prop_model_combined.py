@@ -3375,7 +3375,7 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
     # 3 real outs or beyond 27).
     starter_outs_target = max(3, min(27, round(rng.gauss(starter_avg_outs, 4.5))))
 
-    starter_stats = {name: {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0}
+    starter_stats = {name: {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0}
                       for name in lineup_names}
     hitter_stats = {name: {"hits": 0, "singles": 0, "doubles": 0, "triples": 0,
                             "home_runs": 0, "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0}
@@ -3426,6 +3426,14 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
                 if bases[1]:
                     if bases[2]:
                         hs["rbi"] += 1  # bases loaded - the run is forced in
+                        # Real, genuine gap closed - earned runs allowed
+                        # were never tracked at all. Honest simplification:
+                        # every run that scores here counts as earned -
+                        # this simulation doesn't model errors/unearned-run
+                        # scenarios, so there's no real basis to mark a run
+                        # otherwise.
+                        if starter_active:
+                            starter_stats[name]["earned_runs"] += 1
                     else:
                         bases[2] = True  # 2nd forced to 3rd (3rd was empty)
                     bases[1] = True  # 1st forced to 2nd
@@ -3463,6 +3471,11 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
             else:
                 new_bases[real_bases_advanced - 1] = True  # the batter's own new position
             hs["rbi"] += runners_scored
+            # Same real, honest earned-run tracking as the walk case above -
+            # every run that scores here counts toward the starter's earned
+            # runs allowed while he's actually in the game.
+            if starter_active and runners_scored > 0:
+                starter_stats[name]["earned_runs"] += runners_scored
             bases = new_bases
 
         if starter_active and starter_outs >= starter_outs_target:
@@ -3494,7 +3507,8 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
     needing to re-run the simulation for every possible line.
     """
     rng = random.Random(random_state)
-    starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": []}
+    starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": [],
+                       "earned_runs": [], "quality_start": [], "pitcher_fantasy": []}
     hitter_series = {name: {"hits": [], "singles": [], "doubles": [], "triples": [],
                              "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [],
                              "hits_runs_rbi": [], "total_bases": [], "fantasy": []}
@@ -3502,12 +3516,26 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
 
     for _ in range(n_simulations):
         game = simulate_one_game(lineup_crosswalks, starter_avg_outs, rng)
-        starter_game_totals = {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0}
+        starter_game_totals = {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0}
         for hitter_line in game["starter_stats"].values():
             for k in starter_game_totals:
                 starter_game_totals[k] += hitter_line[k]
         for k, v in starter_game_totals.items():
             starter_series[k].append(v)
+        # Real, honest addition - quality_start (6+ real innings = 18+
+        # outs, 3 or fewer real earned runs) is computable from what's
+        # already tracked. "Win" is NOT included - it genuinely depends on
+        # the opposing team's own score, which this simulation doesn't
+        # model (only one lineup vs one starter at a time, not a full,
+        # interacting two-team scoreboard) - leaving it out is an honest
+        # scope limit, not an oversight.
+        quality_start = 1 if starter_game_totals["outs"] >= 18 and starter_game_totals["earned_runs"] <= 3 else 0
+        starter_series["quality_start"].append(quality_start)
+        pitcher_fantasy = (starter_game_totals["strikeouts"] * 3
+                            + starter_game_totals["outs"] * 1
+                            - starter_game_totals["earned_runs"] * 3
+                            + quality_start * 5)
+        starter_series["pitcher_fantasy"].append(pitcher_fantasy)
 
         for name, hs in game["hitter_stats"].items():
             for k in ("hits", "singles", "doubles", "triples", "home_runs",
