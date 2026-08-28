@@ -35,6 +35,12 @@ from prop_model_combined import (
     get_pitcher_id, backtest_quality_score_all_props,
     get_player_id_from_full_name, pitcher_prop_probabilities, get_park_factor,
     simulate_combo_hit_rate_from_backtest,
+    bootstrap_mu_stability, pull_hitter_game_log, get_mlb_today,
+    pull_official_hitter_game_log, HITTER_FANTASY_WEIGHTS,
+    pull_confirmed_lineup, get_probable_pitcher,
+    pull_pitcher_pitches, build_arsenal_profile, pull_batter_pitches,
+    build_hitter_profile, build_pitch_crosswalk, pull_pitcher_game_log,
+    simulate_matchup_n_times, real_over_rate_from_simulation,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -102,7 +108,7 @@ if "pending_games" in st.session_state:
         st.warning(f"{len(pending)} game(s) still missing a confirmed lineup:")
         display_cols = ["away_team", "home_team", "game_number", "game_time", "lineup_status"]
         display_cols = [c for c in display_cols if c in pending.columns]
-        st.dataframe(pending[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(pending[display_cols], width='stretch', hide_index=True)
         st.caption("Rescan closer to first pitch for these specific games once their "
                    "lineups post — usually 1-3 hours before game time.")
 
@@ -143,7 +149,7 @@ else:
                    "a genuine column mismatch on real data.")
         zb = entry.get("zone_breakdown")
         if zb is not None and not zb.empty:
-            st.dataframe(zb, use_container_width=True, hide_index=True)
+            st.dataframe(zb, width='stretch', hide_index=True)
         else:
             st.warning("No zone breakdown available for this pitcher (too few real pitches in this window).")
 
@@ -172,7 +178,7 @@ else:
                        "difference (moved=True) whenever the park isn't neutral OR tonight's "
                        "lineup isn't exactly league-average; outs should always show "
                        "moved=False - that's the actual check for whether this is wired correctly.")
-            st.dataframe(compare, use_container_width=True, hide_index=True)
+            st.dataframe(compare, width='stretch', hide_index=True)
         else:
             st.caption("No mu comparison available for this pitcher.")
 
@@ -220,7 +226,7 @@ with st.expander("🔍 Verify Hitter-Side Mu (optional, real-data check)"):
                     "swing_pct": getattr(r, "swing_pct", None), "whiff_pct": getattr(r, "whiff_pct", None),
                     "xwoba": getattr(r, "xwoba", None), "hardhit_pct": getattr(r, "hardhit_pct", None),
                 } for r in zp])
-                st.dataframe(zp_df, use_container_width=True, hide_index=True)
+                st.dataframe(zp_df, width='stretch', hide_index=True)
             else:
                 st.caption("No zone profile available for this hitter (too few real pitches in this window).")
 
@@ -232,7 +238,7 @@ with st.expander("🔍 Verify Hitter-Side Mu (optional, real-data check)"):
                            "show a real difference whenever the park isn't neutral OR tonight's "
                            "opposing starter isn't exactly league-average - that's the actual check "
                            "for whether this side is wired correctly.")
-                st.dataframe(h_compare, use_container_width=True, hide_index=True)
+                st.dataframe(h_compare, width='stretch', hide_index=True)
             else:
                 st.caption("No mu comparison available for this hitter.")
 
@@ -270,7 +276,7 @@ with st.expander("🔍 Verify Hitter-Side Mu (optional, real-data check)"):
                             on="stat",
                         )
                         compare["moved"] = compare["mu_with_park"] != compare["mu_no_park"]
-                        st.dataframe(compare, use_container_width=True, hide_index=True)
+                        st.dataframe(compare, width='stretch', hide_index=True)
                     else:
                         st.warning("No games found in this window for this pitcher.")
                 except Exception as e:
@@ -464,6 +470,45 @@ if "qm_slate" in st.session_state:
                                f"freed that room for teams that haven't played yet.")
         except Exception:
             pass  # a real, live status-check hiccup shouldn't break the whole table - show everything instead
+    # REAL FIX for a real, recurring frustration - pure quality_score
+    # sorting naturally, structurally favors genuinely elite hitters, who
+    # clear a high bar against nearly any pitcher regardless of tonight's
+    # specific matchup. Worse: the SAME hitter can occupy several of the
+    # 150 slots at once (once per prop type he clears), crowding out other
+    # players' genuinely good matchups before they're ever seen. This caps
+    # how many rows any ONE player can take up, applied BEFORE the top_n
+    # cutoff, so the freed room goes to other real, qualifying players -
+    # not a fix to quality_score itself (that's still an honest, correct
+    # read on each individual matchup), just a display-level fix for
+    # variety.
+    max_per_player = st.slider(
+        "Max rows per player (spreads the top 150 across more players)",
+        min_value=1, max_value=10, value=3, key="be_max_per_player",
+        help="A genuinely elite hitter can clear the bar on several different "
+             "props the same night, each taking its own slot. Capping this "
+             "means the same few elite names don't quietly crowd out everyone "
+             "else's real matchups.",
+    )
+    if "player" in view2.columns:
+        view2 = (view2.sort_values("quality_score", ascending=False)
+                  .groupby("player", group_keys=False).head(max_per_player))
+    # Same real cap, applied to TEAM instead of player - if the SAME
+    # opposing pitcher genuinely has a broad weakness, multiple hitters on
+    # the SAME team can legitimately all score well against him at once,
+    # crowding out other real games' matchups the same way one elite
+    # hitter's multiple props could. This doesn't fix quality_score itself
+    # (a real, broad pitcher weakness is real, honest signal) - it just
+    # stops one single game from dominating the limited display slots.
+    max_per_team = st.slider(
+        "Max rows per team (spreads the top 150 across more games)",
+        min_value=1, max_value=15, value=5, key="be_max_per_team",
+        help="If tonight's opposing pitcher has a genuine broad weakness, several "
+             "hitters on the same team can legitimately all score well - capping "
+             "this keeps one game from quietly filling most of your 150 slots.",
+    )
+    if "team" in view2.columns:
+        view2 = (view2.sort_values("quality_score", ascending=False)
+                  .groupby("team", group_keys=False).head(max_per_team))
     view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
     edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "edge", "games_sampled",
@@ -481,9 +526,118 @@ if "qm_slate" in st.session_state:
         },
         disabled=["side", "player", "team", "prop_type", "mu", "edge", "games_sampled",
                   "quality_score", "quality_components", "order_slot", "game_pk"],
-        use_container_width=True,
+        width='stretch',
         key="be_edit_table",
     )
+
+    st.subheader("🎲 Mu Stability Check (bootstrap)")
+    st.caption(
+        "Not a quality check - quality_score already answers 'is this a good "
+        "matchup.' This answers a different, complementary question: how much "
+        "should you trust the specific mu number, given the real sample it's "
+        "built from? Reshuffles each hitter's own real game log hundreds of "
+        "times to see how much his average actually moves around - a low "
+        "number means a genuinely reliable estimate, a high number means real "
+        "streakiness sitting underneath what might still be a real, genuine edge."
+    )
+    if st.button("Check stability for hitters checked above", key="be_stability_btn"):
+        checked_hitters = edited[(edited["Include"] == True) & (edited["side"] == "hitter")]
+        if checked_hitters.empty:
+            st.warning("Check some hitter legs above first.")
+        else:
+            stability_rows = []
+            with st.spinner(f"Reshuffling real game logs for {checked_hitters['player'].nunique()} hitter(s)..."):
+                for player_name in checked_hitters["player"].unique():
+                    player_rows = checked_hitters[checked_hitters["player"] == player_name]
+                    try:
+                        pid = get_player_id_from_full_name(player_name, "hitter")
+                        log = pull_hitter_game_log(pid, SEASON_START, get_mlb_today().strftime("%Y-%m-%d"))
+                    except Exception as e:
+                        stability_rows.append({"player": player_name, "prop_type": "-",
+                                                "error": f"Couldn't pull real game log: {e}"})
+                        continue
+                    # REAL FIX - hitter_fantasy/hitter_hits_runs_rbi aren't
+                    # raw columns in the pitch-event-based log above at all
+                    # (no real runs/RBI data in it, by design - see that
+                    # function's own docstring). Only pull the separate,
+                    # real official box-score log when actually needed, since
+                    # it's a real, extra network call.
+                    official_log = None
+                    needs_official = player_rows["prop_type"].isin(["hitter_fantasy", "hitter_hits_runs_rbi"]).any()
+                    if needs_official:
+                        try:
+                            official_log = pull_official_hitter_game_log(pid, int(SEASON_START[:4]))
+                            if official_log is not None and not official_log.empty:
+                                official_log["hitter_hits_runs_rbi"] = (
+                                    official_log["hits"] + official_log["runs"] + official_log["rbi"])
+                                official_log["hitter_fantasy"] = (
+                                    official_log["singles"] * HITTER_FANTASY_WEIGHTS["single"]
+                                    + official_log["doubles"] * HITTER_FANTASY_WEIGHTS["double"]
+                                    + official_log["triples"] * HITTER_FANTASY_WEIGHTS["triple"]
+                                    + official_log["home_runs"] * HITTER_FANTASY_WEIGHTS["home_run"]
+                                    + official_log["runs"] * HITTER_FANTASY_WEIGHTS["run"]
+                                    + official_log["rbi"] * HITTER_FANTASY_WEIGHTS["rbi"]
+                                    + official_log["walks"] * HITTER_FANTASY_WEIGHTS["walk"]
+                                    + official_log["hbp"] * HITTER_FANTASY_WEIGHTS["hbp"]
+                                    + official_log["stolen_bases"] * HITTER_FANTASY_WEIGHTS["stolen_base"]
+                                )
+                        except Exception as e:
+                            stability_rows.append({"player": player_name, "prop_type": "hitter_fantasy/hrr",
+                                                    "error": f"Couldn't pull real official box score log: {e}"})
+
+                    for _, prow in player_rows.iterrows():
+                        prop = prow["prop_type"]
+                        real_line = prow["line"]
+                        source_log = official_log if prop in ("hitter_fantasy", "hitter_hits_runs_rbi") else log
+                        result = bootstrap_mu_stability(source_log, prop, n_iterations=500)
+                        # REAL, NEW addition at the user's explicit request -
+                        # not just the resampled average, but the actual,
+                        # empirical rate: of his REAL historical games, how
+                        # many genuinely cleared THIS specific real line -
+                        # a model-free check against the Poisson-derived
+                        # p_over the live scan actually uses. If these two
+                        # numbers are close, that's real evidence the
+                        # Poisson shape fits this hitter well; if they
+                        # diverge, that's a real, honest warning the
+                        # theoretical curve isn't matching his real pattern.
+                        empirical_over_pct = None
+                        empirical_over_count = None
+                        if (source_log is not None and not source_log.empty
+                                and prop in source_log.columns and pd.notna(real_line)):
+                            over_mask = source_log[prop] > real_line
+                            empirical_over_count = int(over_mask.sum())
+                            empirical_over_pct = round(over_mask.mean() * 100, 1)
+                        stability_rows.append({
+                            "player": player_name, "prop_type": prop, "line": real_line,
+                            "real_mu": result.get("real_mu"), "n_games": result.get("n_games"),
+                            "coefficient_of_variation": result.get("coefficient_of_variation"),
+                            "real_over_count": empirical_over_count,
+                            "real_over_pct": empirical_over_pct,
+                        })
+            if stability_rows:
+                stability_df = pd.DataFrame(stability_rows)
+                # Real, combined view - not a hard cutoff (which risks
+                # throwing away a genuinely good, real edge just because
+                # it's had a real hot/cold streak), but a soft, proportional
+                # discount: a stable hitter keeps his full quality_score, a
+                # volatile one gets a real, meaningful markdown, without
+                # vanishing outright just for showing some real streakiness.
+                real_quality_map = checked_hitters.set_index(["player", "prop_type"])["quality_score"].to_dict()
+                PENALTY_WEIGHT = 0.4
+                def _adjusted(row):
+                    q = real_quality_map.get((row["player"], row["prop_type"]))
+                    cv = row.get("coefficient_of_variation")
+                    if q is None or cv is None:
+                        return None
+                    return round(q * (1 - min(PENALTY_WEIGHT * cv, 0.9)), 1)
+                stability_df["adjusted_quality_score"] = stability_df.apply(_adjusted, axis=1)
+                stability_df = stability_df.sort_values("adjusted_quality_score", ascending=False, na_position="last")
+                st.dataframe(stability_df, width='stretch')
+                st.caption("adjusted_quality_score combines both signals - a stable hitter's real "
+                           "quality_score comes through unchanged; a volatile one gets a real, "
+                           "proportional discount instead of being silently dropped. Sorted so the "
+                           "most trustworthy real plays - genuinely good AND consistent - rise to "
+                           "the top, without throwing away a real edge just for being streaky.")
 
     results = []
     for _, row in edited.iterrows():
@@ -547,7 +701,7 @@ if "qm_slate" in st.session_state:
               .map(color_edge, subset=["edge"])
               .map(color_prob, subset=["p_over"])
               .map(color_quality, subset=["quality_score"]))
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(styled, width='stretch')
 
     csv = qualified_df[display_cols_final].to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download this view as CSV", csv,
@@ -686,7 +840,7 @@ if "qm_slate" in st.session_state:
             st.subheader(f"Slip {i + 1} — {len(slip)}-man (avg quality {avg_q:.0f})")
             slip_display = pd.DataFrame(slip)[["player", "team", "prop_type", "line", "lean",
                                                 "quality_score", "edge", "games_sampled"]]
-            st.dataframe(slip_display, use_container_width=True, hide_index=True)
+            st.dataframe(slip_display, width='stretch', hide_index=True)
 
         if leftover:
             st.warning(
@@ -696,7 +850,7 @@ if "qm_slate" in st.session_state:
             )
             st.dataframe(pd.DataFrame(leftover)[["player", "team", "prop_type", "line", "lean",
                                                   "quality_score", "edge"]],
-                        use_container_width=True, hide_index=True)
+                        width='stretch', hide_index=True)
 
         # REAL FIX for a real gap: rescanning rebuilds the whole table
         # from scratch, which resets every Include checkbox to False -
@@ -796,7 +950,7 @@ if "qm_slate" in st.session_state:
                     st.session_state.locked_slips.pop(i)
                     st.rerun()
             locked_slip_display_cols = [c for c in locked_slip.columns if c != "game_pk"]
-            st.dataframe(locked_slip[locked_slip_display_cols], use_container_width=True, hide_index=True)
+            st.dataframe(locked_slip[locked_slip_display_cols], width='stretch', hide_index=True)
         if st.button("Clear ALL locked slips", key="clear_all_locked"):
             st.session_state.locked_slips = []
             st.rerun()
@@ -892,7 +1046,7 @@ if "bt_result" in st.session_state:
         if not result["by_prop"].empty:
             by_prop_display = result["by_prop"].copy()
             by_prop_display["hit_rate"] = (by_prop_display["hit_rate"] * 100).round(1).astype(str) + "%"
-            st.dataframe(by_prop_display, use_container_width=True, hide_index=True)
+            st.dataframe(by_prop_display, width='stretch', hide_index=True)
         else:
             st.info("No per-prop data.")
 
@@ -901,7 +1055,7 @@ if "bt_result" in st.session_state:
                 by_player_display = result["by_player"].copy()
                 by_player_display["hit_rate"] = (by_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
                 st.dataframe(by_player_display.sort_values("graded", ascending=False),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
             else:
                 st.info("No per-player data.")
 
@@ -1047,7 +1201,7 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
             if "signal_separation" in hit_display.columns:
                 hit_display["signal_separation"] = hit_display["signal_separation"].apply(
                     lambda v: f"{v:+.3f}" if v is not None and pd.notna(v) else "N/A")
-            st.dataframe(hit_display, use_container_width=True, hide_index=True)
+            st.dataframe(hit_display, width='stretch', hide_index=True)
             st.caption(
                 "50% is the real coinflip baseline on overall/over/under hit rates — but those "
                 "are known to be structurally biased for rare, low-count props (see conversation "
@@ -1070,7 +1224,7 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
             if "signal_separation" in pit_display.columns:
                 pit_display["signal_separation"] = pit_display["signal_separation"].apply(
                     lambda v: f"{v:+.3f}" if v is not None and pd.notna(v) else "N/A")
-            st.dataframe(pit_display, use_container_width=True, hide_index=True)
+            st.dataframe(pit_display, width='stretch', hide_index=True)
 
     else:
         st.subheader("Hitter results")
@@ -1109,7 +1263,7 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                 hit_player_display = sb_hit_res["by_player"].copy()
                 hit_player_display["hit_rate"] = (hit_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
                 st.dataframe(hit_player_display.sort_values("graded", ascending=False),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
             if sb_hit_res["errors"]:
                 with st.expander(f"⚠️ {len(sb_hit_res['errors'])} hitter-side error(s)"):
                     for e in sb_hit_res["errors"][:50]:
@@ -1145,7 +1299,7 @@ if st.session_state.get("sb_hitter_result") is not None or st.session_state.get(
                 pit_player_display = sb_pit_res["by_player"].copy()
                 pit_player_display["hit_rate"] = (pit_player_display["hit_rate"] * 100).round(1).astype(str) + "%"
                 st.dataframe(pit_player_display.sort_values("graded", ascending=False),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
             if sb_pit_res["errors"]:
                 with st.expander(f"⚠️ {len(sb_pit_res['errors'])} pitcher-side error(s)"):
                     for e in sb_pit_res["errors"][:50]:
@@ -1262,6 +1416,135 @@ if st.session_state.get("cb_result_2man") is not None or st.session_state.get("c
                        f"({r3['legs_leftover_ungrouped']} leftover, couldn't be paired)")
         else:
             st.warning(r3.get("error", "No result") if r3 else "No result")
+
+
+# ---------------------------------------------------------------------------
+# Full matchup simulation - real, pitch-by-pitch simulated games using the
+# actual real lineup and real crosswalks, not a single formula's one answer.
+# ---------------------------------------------------------------------------
+st.header("🎮 Full Matchup Simulation")
+st.caption(
+    "Real, pitch-by-pitch simulation of the actual real lineup against the "
+    "actual real starter - not a single formula's one answer. Runs the whole "
+    "game many times (realistic starter workload and bullpen handoff "
+    "included), then shows you the real, empirical rate at which each "
+    "hitter's specific props actually clear a real line, built from "
+    "genuinely re-simulating outcomes rather than computing one probability."
+)
+
+sim_games_df = None
+try:
+    sim_games_df = pull_todays_games()
+except Exception as e:
+    st.error(f"Couldn't pull today's real games: {e}")
+
+if sim_games_df is None or sim_games_df.empty:
+    st.info("No games found for today.")
+else:
+    sim_game_options = {
+        f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}": row["game_pk"]
+        for _, row in sim_games_df.iterrows()
+    }
+    sim_game_label = st.selectbox("Pick a real game", list(sim_game_options.keys()), key="sim_game_select")
+    sim_game_pk = sim_game_options[sim_game_label]
+    sim_side = st.radio(
+        "Which team's real hitters do you want to simulate (facing the OTHER team's real starter)?",
+        ["home", "away"], key="sim_side_select",
+        help="Home hitters face the away team's real starter, and vice versa.",
+    )
+    sim_n_games = st.slider("Number of simulated games", 20, 200, 100, key="sim_n_games_slider")
+
+    if st.button("Run full matchup simulation", key="sim_run_button"):
+        with st.spinner("Pulling the real lineup and confirming the real starter..."):
+            try:
+                lineup_data = pull_confirmed_lineup(sim_game_pk)
+            except Exception as e:
+                st.error(f"Couldn't pull the real lineup: {e}")
+                lineup_data = None
+
+        if lineup_data is None or lineup_data.get("lineup_status") not in (
+                "confirmed", "lineups_posted_pitcher_tbd"):
+            st.warning("The real lineup for this game hasn't posted yet - try again closer to first pitch.")
+        else:
+            hitting_side = sim_side
+            pitching_side = "away" if sim_side == "home" else "home"
+            real_lineup = lineup_data.get(hitting_side, [])
+            if not real_lineup:
+                st.warning(f"No real, confirmed lineup found for the {hitting_side} team yet.")
+            else:
+                try:
+                    opposing_pitcher = get_probable_pitcher(sim_game_pk, pitching_side)
+                except Exception as e:
+                    opposing_pitcher = None
+                    st.error(f"Couldn't identify the real opposing starter: {e}")
+
+                if opposing_pitcher is None:
+                    st.warning("No real, confirmed starter found for the opposing team yet.")
+                else:
+                    today_str = get_mlb_today().strftime("%Y-%m-%d")
+                    pid = opposing_pitcher["player_id"]
+
+                    with st.spinner(f"Pulling {opposing_pitcher['name']}'s real pitch data and building his real arsenal..."):
+                        try:
+                            pitcher_pitches = pull_pitcher_pitches(pid, SEASON_START, today_str)
+                            pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
+                            pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
+                                            if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
+                            pitcher_game_log = pull_pitcher_game_log(pid, SEASON_START, today_str)
+                            starter_avg_outs = (pitcher_game_log["outs"].mean()
+                                                if pitcher_game_log is not None and not pitcher_game_log.empty
+                                                else 15.0)
+                        except Exception as e:
+                            st.error(f"Couldn't pull the real starter's data: {e}")
+                            pitcher_arsenal = None
+
+                    if pitcher_arsenal:
+                        lineup_crosswalks = {}
+                        progress = st.progress(0.0, text="Building real crosswalks for each hitter...")
+                        for i, hitter in enumerate(real_lineup):
+                            try:
+                                h_pitches = pull_batter_pitches(hitter["player_id"], SEASON_START, today_str)
+                                batter_hand = (h_pitches["stand"].mode().iloc[0]
+                                              if not h_pitches.empty and "stand" in h_pitches else "R")
+                                h_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
+                                crosswalk = build_pitch_crosswalk(
+                                    pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
+                                lineup_crosswalks[hitter["name"]] = crosswalk
+                            except Exception as e:
+                                st.caption(f"Skipped {hitter['name']} - couldn't build a real crosswalk: {e}")
+                            progress.progress((i + 1) / len(real_lineup),
+                                               text=f"Built {i+1}/{len(real_lineup)} real hitter crosswalks...")
+                        progress.empty()
+
+                        if not lineup_crosswalks:
+                            st.warning("Couldn't build real crosswalks for any hitter in this lineup.")
+                        else:
+                            with st.spinner(f"Running {sim_n_games} full, real simulated games..."):
+                                sim_results = simulate_matchup_n_times(
+                                    lineup_crosswalks, starter_avg_outs, n_simulations=sim_n_games)
+                            st.session_state["sim_results"] = sim_results
+                            st.session_state["sim_lineup_names"] = list(lineup_crosswalks.keys())
+                            st.success(f"Ran {sim_n_games} real, full simulated games for "
+                                       f"{opposing_pitcher['name']} vs the {hitting_side} lineup.")
+
+    if "sim_results" in st.session_state:
+        st.subheader("Enter real lines to check against the simulated games")
+        sim_prop_choice = st.selectbox(
+            "Prop", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
+                     "strikeouts", "total_bases", "hits_runs_rbi", "fantasy"],
+            key="sim_prop_select",
+        )
+        sim_line = st.number_input("Real line", value=1.5, step=0.5, key="sim_line_input")
+        sim_rows = []
+        for name in st.session_state["sim_lineup_names"]:
+            series = st.session_state["sim_results"]["hitters"].get(name, {}).get(sim_prop_choice, [])
+            r = real_over_rate_from_simulation(series, sim_line)
+            sim_rows.append({"player": name, "line": sim_line, **r})
+        sim_df = pd.DataFrame(sim_rows).sort_values("over_rate", ascending=False, na_position="last")
+        st.dataframe(sim_df, width='stretch')
+        st.caption("over_count/total is the real, empirical rate across the simulated games - "
+                   "'over in 67 of 100', not a formula's single calculated probability.")
+
 
 
 
