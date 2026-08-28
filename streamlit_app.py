@@ -454,6 +454,18 @@ if "qm_slate" in st.session_state:
     )
 
     view2 = qm_slate.copy()
+    if view2.empty or "quality_score" not in view2.columns:
+        st.info("No results matched your filters - nothing cleared the real quality/edge/sample "
+                "thresholds on this scan. Try widening the filters above and re-scanning.")
+        # Real, safe fallback - an empty but PROPERLY-COLUMNED dataframe,
+        # not a bare st.stop(). This section's own remaining code already
+        # has real, working guards for an empty view2 (it'll just show
+        # empty tables) - st.stop() would also wrongly kill the entirely
+        # separate, independent simulation section further down the page,
+        # which doesn't depend on this scan's results at all.
+        view2 = pd.DataFrame(columns=["side", "player", "team", "prop_type", "line", "mu",
+                                       "edge", "games_sampled", "quality_score",
+                                       "quality_components", "game_pk"])
     if side_pick != "All":
         view2 = view2[view2["side"] == side_pick.lower()]
     if excluded_teams and "team" in view2.columns:
@@ -470,45 +482,12 @@ if "qm_slate" in st.session_state:
                                f"freed that room for teams that haven't played yet.")
         except Exception:
             pass  # a real, live status-check hiccup shouldn't break the whole table - show everything instead
-    # REAL FIX for a real, recurring frustration - pure quality_score
-    # sorting naturally, structurally favors genuinely elite hitters, who
-    # clear a high bar against nearly any pitcher regardless of tonight's
-    # specific matchup. Worse: the SAME hitter can occupy several of the
-    # 150 slots at once (once per prop type he clears), crowding out other
-    # players' genuinely good matchups before they're ever seen. This caps
-    # how many rows any ONE player can take up, applied BEFORE the top_n
-    # cutoff, so the freed room goes to other real, qualifying players -
-    # not a fix to quality_score itself (that's still an honest, correct
-    # read on each individual matchup), just a display-level fix for
-    # variety.
-    max_per_player = st.slider(
-        "Max rows per player (spreads the top 150 across more players)",
-        min_value=1, max_value=10, value=3, key="be_max_per_player",
-        help="A genuinely elite hitter can clear the bar on several different "
-             "props the same night, each taking its own slot. Capping this "
-             "means the same few elite names don't quietly crowd out everyone "
-             "else's real matchups.",
-    )
-    if "player" in view2.columns:
-        view2 = (view2.sort_values("quality_score", ascending=False)
-                  .groupby("player", group_keys=False).head(max_per_player))
-    # Same real cap, applied to TEAM instead of player - if the SAME
-    # opposing pitcher genuinely has a broad weakness, multiple hitters on
-    # the SAME team can legitimately all score well against him at once,
-    # crowding out other real games' matchups the same way one elite
-    # hitter's multiple props could. This doesn't fix quality_score itself
-    # (a real, broad pitcher weakness is real, honest signal) - it just
-    # stops one single game from dominating the limited display slots.
-    max_per_team = st.slider(
-        "Max rows per team (spreads the top 150 across more games)",
-        min_value=1, max_value=15, value=5, key="be_max_per_team",
-        help="If tonight's opposing pitcher has a genuine broad weakness, several "
-             "hitters on the same team can legitimately all score well - capping "
-             "this keeps one game from quietly filling most of your 150 slots.",
-    )
-    if "team" in view2.columns:
-        view2 = (view2.sort_values("quality_score", ascending=False)
-                  .groupby("team", group_keys=False).head(max_per_team))
+    # Real, deliberate removal - these caps existed to spread the top 150
+    # across more players/teams, but the full matchup simulation now
+    # handles the underlying concern better: it directly filters out
+    # streaky/fluky results via real, empirical re-simulation instead of
+    # this blunter, display-level workaround. Keeping quality_score's own
+    # honest, direct sort here instead.
     view2 = view2.sort_values("quality_score", ascending=False).head(top_n)
 
     edit_cols = ["side", "player", "team", "prop_type", "line", "mu", "edge", "games_sampled",
@@ -655,7 +634,14 @@ if "qm_slate" in st.session_state:
             "order_slot": row.get("order_slot"),
             "game_pk": row.get("game_pk"),
         })
-    final_df = pd.DataFrame(results).sort_values("edge", ascending=False)
+    final_df = pd.DataFrame(results)
+    if final_df.empty:
+        final_df = pd.DataFrame(columns=["side", "player", "team", "prop_type", "line", "mu",
+                                          "p_over", "edge", "lean", "games_sampled",
+                                          "quality_score", "quality_components", "order_slot",
+                                          "game_pk", "Include"])
+    else:
+        final_df = final_df.sort_values("edge", ascending=False)
 
     st.subheader("Minimum bar")
     fcol1, fcol2, fcol3 = st.columns(3)
@@ -1447,15 +1433,10 @@ else:
     }
     sim_game_label = st.selectbox("Pick a real game", list(sim_game_options.keys()), key="sim_game_select")
     sim_game_pk = sim_game_options[sim_game_label]
-    sim_side = st.radio(
-        "Which team's real hitters do you want to simulate (facing the OTHER team's real starter)?",
-        ["home", "away"], key="sim_side_select",
-        help="Home hitters face the away team's real starter, and vice versa.",
-    )
     sim_n_games = st.slider("Number of simulated games", 20, 200, 100, key="sim_n_games_slider")
 
     if st.button("Run full matchup simulation", key="sim_run_button"):
-        with st.spinner("Pulling the real lineup and confirming the real starter..."):
+        with st.spinner("Pulling the real lineup and confirming both real starters..."):
             try:
                 lineup_data = pull_confirmed_lineup(sim_game_pk)
             except Exception as e:
@@ -1466,84 +1447,129 @@ else:
                 "confirmed", "lineups_posted_pitcher_tbd"):
             st.warning("The real lineup for this game hasn't posted yet - try again closer to first pitch.")
         else:
-            hitting_side = sim_side
-            pitching_side = "away" if sim_side == "home" else "home"
-            real_lineup = lineup_data.get(hitting_side, [])
-            if not real_lineup:
-                st.warning(f"No real, confirmed lineup found for the {hitting_side} team yet.")
-            else:
+            today_str = get_mlb_today().strftime("%Y-%m-%d")
+            combined_hitters_series = {}
+            sim_lineup_teams = {}
+
+            # Real, deliberate change - runs BOTH sides automatically
+            # instead of making the user pick one. A real game always has
+            # two lineups facing two different real starters - there's no
+            # actual reason to force a choice when both are just as easy
+            # to pull and simulate together.
+            for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
+                real_lineup = lineup_data.get(hitting_side, [])
+                if not real_lineup:
+                    st.warning(f"No real, confirmed lineup found for the {hitting_side} team yet - skipped.")
+                    continue
                 try:
                     opposing_pitcher = get_probable_pitcher(sim_game_pk, pitching_side)
                 except Exception as e:
                     opposing_pitcher = None
-                    st.error(f"Couldn't identify the real opposing starter: {e}")
+                    st.error(f"Couldn't identify the real {pitching_side} starter: {e}")
 
                 if opposing_pitcher is None:
-                    st.warning("No real, confirmed starter found for the opposing team yet.")
-                else:
-                    today_str = get_mlb_today().strftime("%Y-%m-%d")
-                    pid = opposing_pitcher["player_id"]
+                    st.warning(f"No real, confirmed starter found for the {pitching_side} team yet - skipped.")
+                    continue
 
-                    with st.spinner(f"Pulling {opposing_pitcher['name']}'s real pitch data and building his real arsenal..."):
-                        try:
-                            pitcher_pitches = pull_pitcher_pitches(pid, SEASON_START, today_str)
-                            pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
-                            pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
-                                            if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
-                            pitcher_game_log = pull_pitcher_game_log(pid, SEASON_START, today_str)
-                            starter_avg_outs = (pitcher_game_log["outs"].mean()
-                                                if pitcher_game_log is not None and not pitcher_game_log.empty
-                                                else 15.0)
-                        except Exception as e:
-                            st.error(f"Couldn't pull the real starter's data: {e}")
-                            pitcher_arsenal = None
+                pid = opposing_pitcher["player_id"]
+                with st.spinner(f"Pulling {opposing_pitcher['name']}'s real pitch data and building his real arsenal..."):
+                    try:
+                        pitcher_pitches = pull_pitcher_pitches(pid, SEASON_START, today_str)
+                        pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
+                        pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
+                                        if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
+                        pitcher_game_log = pull_pitcher_game_log(pid, SEASON_START, today_str)
+                        starter_avg_outs = (pitcher_game_log["outs"].mean()
+                                            if pitcher_game_log is not None and not pitcher_game_log.empty
+                                            else 15.0)
+                    except Exception as e:
+                        st.error(f"Couldn't pull {opposing_pitcher['name']}'s real data: {e}")
+                        pitcher_arsenal = None
 
-                    if pitcher_arsenal:
-                        lineup_crosswalks = {}
-                        progress = st.progress(0.0, text="Building real crosswalks for each hitter...")
-                        for i, hitter in enumerate(real_lineup):
-                            try:
-                                h_pitches = pull_batter_pitches(hitter["player_id"], SEASON_START, today_str)
-                                batter_hand = (h_pitches["stand"].mode().iloc[0]
-                                              if not h_pitches.empty and "stand" in h_pitches else "R")
-                                h_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
-                                crosswalk = build_pitch_crosswalk(
-                                    pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
-                                lineup_crosswalks[hitter["name"]] = crosswalk
-                            except Exception as e:
-                                st.caption(f"Skipped {hitter['name']} - couldn't build a real crosswalk: {e}")
-                            progress.progress((i + 1) / len(real_lineup),
-                                               text=f"Built {i+1}/{len(real_lineup)} real hitter crosswalks...")
-                        progress.empty()
+                if not pitcher_arsenal:
+                    continue
 
-                        if not lineup_crosswalks:
-                            st.warning("Couldn't build real crosswalks for any hitter in this lineup.")
-                        else:
-                            with st.spinner(f"Running {sim_n_games} full, real simulated games..."):
-                                sim_results = simulate_matchup_n_times(
-                                    lineup_crosswalks, starter_avg_outs, n_simulations=sim_n_games)
-                            st.session_state["sim_results"] = sim_results
-                            st.session_state["sim_lineup_names"] = list(lineup_crosswalks.keys())
-                            st.success(f"Ran {sim_n_games} real, full simulated games for "
-                                       f"{opposing_pitcher['name']} vs the {hitting_side} lineup.")
+                lineup_crosswalks = {}
+                progress = st.progress(0.0, text=f"Building real crosswalks for the {hitting_side} lineup...")
+                for i, hitter in enumerate(real_lineup):
+                    try:
+                        h_pitches = pull_batter_pitches(hitter["player_id"], SEASON_START, today_str)
+                        batter_hand = (h_pitches["stand"].mode().iloc[0]
+                                      if not h_pitches.empty and "stand" in h_pitches else "R")
+                        h_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
+                        crosswalk = build_pitch_crosswalk(
+                            pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
+                        lineup_crosswalks[hitter["name"]] = crosswalk
+                        sim_lineup_teams[hitter["name"]] = hitting_side
+                    except Exception as e:
+                        st.caption(f"Skipped {hitter['name']} - couldn't build a real crosswalk: {e}")
+                    progress.progress((i + 1) / len(real_lineup),
+                                       text=f"Built {i+1}/{len(real_lineup)} real {hitting_side} hitter crosswalks...")
+                progress.empty()
+
+                if lineup_crosswalks:
+                    with st.spinner(f"Running {sim_n_games} full, real simulated games for the {hitting_side} lineup..."):
+                        sim_results = simulate_matchup_n_times(
+                            lineup_crosswalks, starter_avg_outs, n_simulations=sim_n_games)
+                    combined_hitters_series.update(sim_results["hitters"])
+                    st.success(f"Ran {sim_n_games} real, full simulated games for "
+                               f"{opposing_pitcher['name']} vs the {hitting_side} lineup.")
+
+            if combined_hitters_series:
+                st.session_state["sim_results"] = {"hitters": combined_hitters_series}
+                st.session_state["sim_lineup_names"] = list(combined_hitters_series.keys())
+                st.session_state["sim_lineup_teams"] = sim_lineup_teams
 
     if "sim_results" in st.session_state:
-        st.subheader("Enter real lines to check against the simulated games")
-        sim_prop_choice = st.selectbox(
-            "Prop", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
-                     "strikeouts", "total_bases", "hits_runs_rbi", "fantasy"],
-            key="sim_prop_select",
+        st.subheader("Enter each real line to check against the simulated games")
+        st.caption(
+            "Every hitter has his own real line for every prop - this shows them all "
+            "together instead of switching one prop at a time. Starting values are the "
+            "real simulated average, rounded to the nearest half - overwrite each one "
+            "with the actual real book line."
         )
-        sim_line = st.number_input("Real line", value=1.5, step=0.5, key="sim_line_input")
-        sim_rows = []
-        for name in st.session_state["sim_lineup_names"]:
-            series = st.session_state["sim_results"]["hitters"].get(name, {}).get(sim_prop_choice, [])
-            r = real_over_rate_from_simulation(series, sim_line)
-            sim_rows.append({"player": name, "line": sim_line, **r})
-        sim_df = pd.DataFrame(sim_rows).sort_values("over_rate", ascending=False, na_position="last")
-        st.dataframe(sim_df, width='stretch')
-        st.caption("over_count/total is the real, empirical rate across the simulated games - "
-                   "'over in 67 of 100', not a formula's single calculated probability.")
+        sim_props_wanted = st.multiselect(
+            "Which props to show", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
+                                     "strikeouts", "total_bases", "hits_runs_rbi", "fantasy"],
+            default=["hits", "total_bases", "home_runs", "hits_runs_rbi", "fantasy"],
+            key="sim_props_multiselect",
+        )
+        if not sim_props_wanted:
+            st.info("Pick at least one prop above.")
+        else:
+            def _round_half(x):
+                return round(x * 2) / 2 if x is not None else 1.5
+
+            base_rows = []
+            for name in st.session_state["sim_lineup_names"]:
+                team = st.session_state.get("sim_lineup_teams", {}).get(name, "?")
+                for prop in sim_props_wanted:
+                    series = st.session_state["sim_results"]["hitters"].get(name, {}).get(prop, [])
+                    default_avg = sum(series) / len(series) if series else 1.5
+                    base_rows.append({
+                        "player": name, "team": team, "prop": prop,
+                        "your_line": _round_half(default_avg),
+                    })
+            base_df = pd.DataFrame(base_rows)
+
+            edited_lines = st.data_editor(
+                base_df, key="sim_lines_editor", width='stretch', hide_index=True,
+                disabled=["player", "team", "prop"],
+                column_config={
+                    "your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5),
+                },
+            )
+
+            result_rows = []
+            for _, row in edited_lines.iterrows():
+                series = st.session_state["sim_results"]["hitters"].get(row["player"], {}).get(row["prop"], [])
+                r = real_over_rate_from_simulation(series, row["your_line"])
+                result_rows.append({"player": row["player"], "team": row["team"], "prop": row["prop"],
+                                     "line": row["your_line"], **r})
+            result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
+            st.dataframe(result_df, width='stretch')
+            st.caption("over_count/total is the real, empirical rate across the simulated games - "
+                       "'over in 67 of 100', not a formula's single calculated probability.")
 
 
 
