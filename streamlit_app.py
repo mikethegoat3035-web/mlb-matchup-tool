@@ -1433,7 +1433,10 @@ else:
     }
     sim_game_label = st.selectbox("Pick a real game", list(sim_game_options.keys()), key="sim_game_select")
     sim_game_pk = sim_game_options[sim_game_label]
-    sim_n_games = st.slider("Number of simulated games", 20, 200, 100, key="sim_n_games_slider")
+    sim_n_games = st.slider("Number of simulated games", 100, 2000, 1000, step=100, key="sim_n_games_slider",
+                             help="1000 is fast (~5 seconds for both lineups combined) and gives real, "
+                                  "statistically tighter over_rate/avg estimates than 100 would - "
+                                  "there's little real reason to use fewer.")
 
     if st.button("Run full matchup simulation", key="sim_run_button"):
         with st.spinner("Pulling the real lineup and confirming both real starters..."):
@@ -1452,6 +1455,7 @@ else:
             combined_pitchers_series = {}
             sim_lineup_teams = {}
             sim_pitcher_teams = {}
+            combined_lineup_coverage = {}
 
             # Real, deliberate change - runs BOTH sides automatically
             # instead of making the user pick one. A real game always has
@@ -1515,6 +1519,24 @@ else:
                             pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
                         lineup_crosswalks[hitter["name"]] = crosswalk
                         sim_lineup_teams[hitter["name"]] = hitting_side
+                        # Real, new check - what real % of the PITCHER'S
+                        # actual, usage-weighted arsenal does this hitter
+                        # have a genuine sample against? A pitch type with
+                        # hitter_n_pitches below a real minimum falls back
+                        # to plain league-average for that pitch (per the
+                        # crosswalk's own design) - fine on its own, but if
+                        # that's true for the pitcher's BIGGEST pitches, too
+                        # much of this hitter's simulated result is really
+                        # "we don't know" dressed up as "average," not a
+                        # genuinely proven read.
+                        if "pitcher_usage_pct" in crosswalk.columns and "hitter_n_pitches" in crosswalk.columns:
+                            has_real_sample = crosswalk["hitter_n_pitches"] >= 10
+                            covered_usage = crosswalk.loc[has_real_sample, "pitcher_usage_pct"].sum()
+                            total_usage = crosswalk["pitcher_usage_pct"].sum()
+                            combined_lineup_coverage[hitter["name"]] = (
+                                round(covered_usage / total_usage * 100, 1) if total_usage else 0.0)
+                        else:
+                            combined_lineup_coverage[hitter["name"]] = 0.0
                     except Exception as e:
                         st.caption(f"Skipped {hitter['name']} - couldn't build a real crosswalk: {e}")
                     progress.progress((i + 1) / len(real_lineup),
@@ -1542,6 +1564,7 @@ else:
                 st.session_state["sim_pitcher_names"] = list(combined_pitchers_series.keys())
                 st.session_state["sim_lineup_teams"] = sim_lineup_teams
                 st.session_state["sim_pitcher_teams"] = sim_pitcher_teams
+                st.session_state["sim_lineup_coverage"] = combined_lineup_coverage
 
     if "sim_results" in st.session_state:
         st.subheader("Enter each real line to check against the simulated games")
@@ -1570,96 +1593,178 @@ else:
         if not sim_props_wanted and not sim_pitcher_props_wanted:
             st.info("Pick at least one prop above.")
         else:
-            def _round_half(x):
-                return round(x * 2) / 2 if x is not None else 1.5
-
-            base_rows = []
-            for name in st.session_state["sim_lineup_names"]:
-                team = st.session_state.get("sim_lineup_teams", {}).get(name, "?")
-                for prop in sim_props_wanted:
-                    series = st.session_state["sim_results"]["hitters"].get(name, {}).get(prop, [])
-                    default_avg = sum(series) / len(series) if series else 1.5
-                    base_rows.append({
-                        "side": "hitter", "player": name, "team": team, "prop": prop,
-                        "your_line": _round_half(default_avg),
-                    })
-            for name in st.session_state.get("sim_pitcher_names", []):
-                team = st.session_state.get("sim_pitcher_teams", {}).get(name, "?")
-                for prop in sim_pitcher_props_wanted:
-                    series = st.session_state["sim_results"].get("pitchers", {}).get(name, {}).get(prop, [])
-                    default_avg = sum(series) / len(series) if series else 1.5
-                    base_rows.append({
-                        "side": "pitcher", "player": name, "team": team, "prop": prop,
-                        "your_line": _round_half(default_avg),
-                    })
-            base_df = pd.DataFrame(base_rows)
-
-            edited_lines = st.data_editor(
-                base_df, key="sim_lines_editor", width='stretch', hide_index=True,
-                disabled=["side", "player", "team", "prop"],
-                column_config={
-                    "your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5),
-                },
+            # Real, two-stage flow - Stage 1 finds who's genuinely great
+            # WITHOUT needing a line at all (the real average is fixed,
+            # line-independent - it's the true value the simulation
+            # produced, not something that changes based on what you later
+            # decide to check it against). Stage 2 only shows lines for
+            # whoever actually survives Stage 1, instead of asking you to
+            # enter a real line for every single player up front.
+            st.subheader("Stage 1 - who actually stayed great across the simulation")
+            st.caption(
+                "No line needed yet. For each prop, ranks every real player against the "
+                "rest of tonight's own field - genuinely above-average AND consistent "
+                "(not just a few simulated outlier games carrying the number)."
+            )
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                min_zscore = st.slider("Minimum edge (real std devs above tonight's own field)",
+                                        0.0, 2.0, 0.5, step=0.1, key="sim_min_zscore")
+            with fcol2:
+                max_cv = st.slider("Maximum coefficient of variation (lower = more consistent)",
+                                    0.1, 1.5, 0.6, step=0.05, key="sim_max_cv")
+            min_coverage = st.slider(
+                "Minimum real data coverage for hitters (% of the pitcher's real, "
+                "usage-weighted arsenal the hitter has a genuine sample against)",
+                0, 100, 60, step=5, key="sim_min_coverage",
+                help="A hitter with no real at-bats against the pitcher's biggest pitch "
+                     "falls back to plain league-average for it - fine on its own, but if "
+                     "too much of his simulated result rests on that fallback rather than "
+                     "his own real, proven data, he shouldn't be able to slip through here "
+                     "looking 'fine' when it's really 'unknown.' Doesn't apply to pitchers - "
+                     "this is specifically about a hitter's sample against a pitcher's arsenal.",
             )
 
-            result_rows = []
-            for _, row in edited_lines.iterrows():
-                source = "pitchers" if row["side"] == "pitcher" else "hitters"
-                series = st.session_state["sim_results"].get(source, {}).get(row["player"], {}).get(row["prop"], [])
-                r = real_over_rate_from_simulation(series, row["your_line"])
-                result_rows.append({"side": row["side"], "player": row["player"], "team": row["team"],
-                                     "prop": row["prop"], "line": row["your_line"], **r})
-            result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
-            result_df.insert(0, "Include", False)
-            edited_results = st.data_editor(
-                result_df, key="sim_results_editor", width='stretch', hide_index=True,
-                disabled=[c for c in result_df.columns if c != "Include"],
-                column_config={
-                    "Include": st.column_config.CheckboxColumn(
-                        "Include", help="Check to keep this real simulated result"),
-                },
-            )
-            st.caption("over_count/total is the real, empirical rate across the simulated games - "
-                       "'over in 67 of 100', not a formula's single calculated probability.")
+            stage1_rows = []
+            all_props = [("hitter", name, "hitters", sim_props_wanted)
+                          for name in st.session_state["sim_lineup_names"]]
+            all_props += [("pitcher", name, "pitchers", sim_pitcher_props_wanted)
+                           for name in st.session_state.get("sim_pitcher_names", [])]
+            for side, name, source, props in all_props:
+                team = (st.session_state.get("sim_lineup_teams", {}) if side == "hitter"
+                        else st.session_state.get("sim_pitcher_teams", {})).get(name, "?")
+                for prop in props:
+                    series = st.session_state["sim_results"].get(source, {}).get(name, {}).get(prop, [])
+                    if not series:
+                        continue
+                    avg = sum(series) / len(series)
+                    std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
+                    cv = round(std / avg, 3) if avg else None
+                    stage1_rows.append({"side": side, "player": name, "team": team, "prop": prop,
+                                         "real_avg": round(avg, 2), "cv": cv})
+            stage1_df = pd.DataFrame(stage1_rows)
 
-            # Same real, proven "keep checked legs" pattern already used for
-            # the main scan above - lets simulated results from THIS game
-            # survive into the next game's simulation instead of being lost
-            # the moment you pick a different matchup.
-            just_checked_sim = edited_results[edited_results["Include"] == True].copy()
-            scol1, scol2 = st.columns([1, 3])
-            with scol1:
-                if st.button("➕ Keep checked sim results", key="sim_keep_checked_btn"):
-                    if just_checked_sim.empty:
-                        st.warning("Nothing is checked right now - check some rows above first.")
-                    else:
-                        if "sim_kept_pool" not in st.session_state or st.session_state.sim_kept_pool.empty:
-                            st.session_state.sim_kept_pool = just_checked_sim
-                        else:
-                            existing_keys = set(zip(st.session_state.sim_kept_pool["side"],
-                                                     st.session_state.sim_kept_pool["player"],
-                                                     st.session_state.sim_kept_pool["prop"],
-                                                     st.session_state.sim_kept_pool["line"]))
-                            new_rows = just_checked_sim[~just_checked_sim.apply(
-                                lambda r: (r["side"], r["player"], r["prop"], r["line"]) in existing_keys, axis=1)]
-                            st.session_state.sim_kept_pool = pd.concat(
-                                [st.session_state.sim_kept_pool, new_rows], ignore_index=True)
-                        st.success(f"Kept pool now has {len(st.session_state.sim_kept_pool)} real "
-                                   f"simulated result(s) - run the next game's simulation, check more, "
-                                   f"and click this again to keep growing it.")
-            with scol2:
-                if st.session_state.get("sim_kept_pool") is not None and not st.session_state.sim_kept_pool.empty:
-                    if st.button("🗑️ Clear kept sim pool (start over)", key="sim_clear_kept_btn"):
-                        st.session_state.sim_kept_pool = pd.DataFrame()
-                        st.rerun()
-
-            kept_sim = st.session_state.get("sim_kept_pool", pd.DataFrame())
-            if kept_sim is not None and not kept_sim.empty:
-                st.subheader("Kept simulated results (survives across games)")
-                st.dataframe(kept_sim.drop(columns=["Include"], errors="ignore"), width='stretch')
+            if stage1_df.empty:
+                st.warning("No real data to rank yet.")
             else:
-                st.caption("Check rows above and click \"Keep checked sim results\" to start building "
-                           "a pool that survives into the next game's simulation.")
+                # Real, within-prop z-score - "how many real std devs above
+                # tonight's own field average is this specific player, for
+                # this specific prop" - a fair, direct comparison since
+                # different props sit on completely different real scales
+                # (hits averages ~1-2, fantasy averages ~5-10).
+                # REAL BUG FIX - grouping by "prop" alone would mix a
+                # hitter's "strikeouts" (~1-2 per game, times he struck
+                # out) with a pitcher's "strikeouts" (~5-7 per start, his
+                # own real Ks) into the same comparison group, since both
+                # share the literal prop name. Must group by (side, prop)
+                # together - hitter props only compare against other
+                # hitters, pitcher props only against other pitchers.
+                stage1_df["field_mean"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("mean")
+                stage1_df["field_std"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("std").fillna(0.01)
+                stage1_df["zscore"] = round((stage1_df["real_avg"] - stage1_df["field_mean"])
+                                              / stage1_df["field_std"].replace(0, 0.01), 2)
+                # Real coverage check - only meaningful for hitters (a
+                # hitter's real sample against the pitcher's arsenal).
+                # Pitchers default to 100 here so this check never
+                # incorrectly excludes them - it's not the same real
+                # concept on that side.
+                coverage_map = st.session_state.get("sim_lineup_coverage", {})
+                stage1_df["coverage"] = stage1_df.apply(
+                    lambda r: coverage_map.get(r["player"], 100.0) if r["side"] == "hitter" else 100.0, axis=1)
+
+                survivors = stage1_df[
+                    (stage1_df["zscore"] >= min_zscore)
+                    & (stage1_df["cv"].fillna(99) <= max_cv)
+                    & (stage1_df["coverage"] >= min_coverage)
+                ].sort_values("zscore", ascending=False)
+
+                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "coverage"]],
+                              width='stretch')
+                st.caption(f"{len(survivors)} of {len(stage1_df)} real (player, prop) combinations "
+                           f"cleared both bars above.")
+
+                if survivors.empty:
+                    st.info("Nothing cleared the bar - try lowering the sliders above.")
+                else:
+                    st.subheader("Stage 2 - enter each real line for the survivors above")
+
+                    def _round_half(x):
+                        return round(x * 2) / 2 if x is not None else 1.5
+
+                    base_rows = []
+                    for _, srow in survivors.iterrows():
+                        base_rows.append({
+                            "side": srow["side"], "player": srow["player"], "team": srow["team"],
+                            "prop": srow["prop"], "your_line": _round_half(srow["real_avg"]),
+                        })
+                    base_df = pd.DataFrame(base_rows)
+
+                    edited_lines = st.data_editor(
+                        base_df, key="sim_lines_editor", width='stretch', hide_index=True,
+                        disabled=["side", "player", "team", "prop"],
+                        column_config={
+                            "your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5),
+                        },
+                    )
+
+                    result_rows = []
+                    for _, row in edited_lines.iterrows():
+                        source = "pitchers" if row["side"] == "pitcher" else "hitters"
+                        series = st.session_state["sim_results"].get(source, {}).get(row["player"], {}).get(row["prop"], [])
+                        r = real_over_rate_from_simulation(series, row["your_line"])
+                        result_rows.append({"side": row["side"], "player": row["player"], "team": row["team"],
+                                             "prop": row["prop"], "line": row["your_line"], **r})
+                    result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
+                    result_df.insert(0, "Include", False)
+                    edited_results = st.data_editor(
+                        result_df, key="sim_results_editor", width='stretch', hide_index=True,
+                        disabled=[c for c in result_df.columns if c != "Include"],
+                        column_config={
+                            "Include": st.column_config.CheckboxColumn(
+                                "Include", help="Check to keep this real simulated result"),
+                        },
+                    )
+                    st.caption("over_count/total is the real, empirical rate across the simulated games - "
+                               "'over in 67 of 100', not a formula's single calculated probability.")
+
+                    # Same real, proven "keep checked legs" pattern already used for
+                    # the main scan above - lets simulated results from THIS game
+                    # survive into the next game's simulation instead of being lost
+                    # the moment you pick a different matchup.
+                    just_checked_sim = edited_results[edited_results["Include"] == True].copy()
+                    scol1, scol2 = st.columns([1, 3])
+                    with scol1:
+                        if st.button("➕ Keep checked sim results", key="sim_keep_checked_btn"):
+                            if just_checked_sim.empty:
+                                st.warning("Nothing is checked right now - check some rows above first.")
+                            else:
+                                if "sim_kept_pool" not in st.session_state or st.session_state.sim_kept_pool.empty:
+                                    st.session_state.sim_kept_pool = just_checked_sim
+                                else:
+                                    existing_keys = set(zip(st.session_state.sim_kept_pool["side"],
+                                                             st.session_state.sim_kept_pool["player"],
+                                                             st.session_state.sim_kept_pool["prop"],
+                                                             st.session_state.sim_kept_pool["line"]))
+                                    new_rows = just_checked_sim[~just_checked_sim.apply(
+                                        lambda r: (r["side"], r["player"], r["prop"], r["line"]) in existing_keys, axis=1)]
+                                    st.session_state.sim_kept_pool = pd.concat(
+                                        [st.session_state.sim_kept_pool, new_rows], ignore_index=True)
+                                st.success(f"Kept pool now has {len(st.session_state.sim_kept_pool)} real "
+                                           f"simulated result(s) - run the next game's simulation, check more, "
+                                           f"and click this again to keep growing it.")
+                    with scol2:
+                        if st.session_state.get("sim_kept_pool") is not None and not st.session_state.sim_kept_pool.empty:
+                            if st.button("🗑️ Clear kept sim pool (start over)", key="sim_clear_kept_btn"):
+                                st.session_state.sim_kept_pool = pd.DataFrame()
+                                st.rerun()
+
+                    kept_sim = st.session_state.get("sim_kept_pool", pd.DataFrame())
+                    if kept_sim is not None and not kept_sim.empty:
+                        st.subheader("Kept simulated results (survives across games)")
+                        st.dataframe(kept_sim.drop(columns=["Include"], errors="ignore"), width='stretch')
+                    else:
+                        st.caption("Check rows above and click \"Keep checked sim results\" to start building "
+                                   "a pool that survives into the next game's simulation.")
 
 
 
