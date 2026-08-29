@@ -7962,6 +7962,19 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
          or the lineup is confirmed, the real starter shows up here even
          when probablePitcher doesn't
     Each attempt is wrapped so a failure in one doesn't block the others.
+
+    Real, honest caveat added after a live report of the wrong pitcher
+    coming back for a real game: attempt 3 specifically has NOT been
+    verified live (no network access in this build environment) to
+    confirm whether boxscore_data's "stats" field is genuinely game-
+    specific or could reflect season-cumulative numbers for a player who
+    hasn't actually thrown a pitch in THIS game yet - if it's the latter,
+    attempt 3 could match on any pitcher on the roster with a real
+    season start, not necessarily today's real starter. The "source"
+    field below tells you which attempt actually resolved it, so this
+    can be checked directly against a real game rather than trusted
+    blindly - treat a "attempt_3_actual_stats" result with real caution
+    until this gets verified against live data.
     """
     if statsapi is None:
         raise ImportError("pip install MLB-StatsAPI --break-system-packages")
@@ -7974,7 +7987,7 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
         game = sched["dates"][0]["games"][0]
         pp = game.get("teams", {}).get(side, {}).get("probablePitcher")
         if pp and pp.get("id"):
-            return {"player_id": pp["id"], "name": pp.get("fullName")}
+            return {"player_id": pp["id"], "name": pp.get("fullName"), "source": "attempt_1_schedule_hydrate"}
     except (KeyError, IndexError, TypeError):
         pass
 
@@ -7985,7 +7998,7 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
         if isinstance(team, dict) and team.get("probablePitcher"):
             p = team["probablePitcher"]
             if p.get("id"):
-                return {"player_id": p["id"], "name": p.get("fullName")}
+                return {"player_id": p["id"], "name": p.get("fullName"), "source": "attempt_2_boxscore_probable"}
     except Exception:
         box = None
 
@@ -8001,7 +8014,8 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
             if stats.get("gamesStarted", 0) or stats.get("battersFaced", 0):
                 person = pdata.get("person", {})
                 if person.get("id"):
-                    return {"player_id": person["id"], "name": person.get("fullName")}
+                    return {"player_id": person["id"], "name": person.get("fullName"),
+                            "source": "attempt_3_actual_stats"}
     except Exception:
         pass
 
@@ -9496,4 +9510,3 @@ def backtest_pitcher_win_walk_forward(pitcher_id: int, season: int,
             "hit": predicted_over == actual_over,
         })
     return pd.DataFrame(rows)
-                                            
