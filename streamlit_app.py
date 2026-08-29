@@ -41,6 +41,12 @@ from prop_model_combined import (
     pull_pitcher_pitches, build_arsenal_profile, pull_batter_pitches,
     build_hitter_profile, build_pitch_crosswalk, pull_pitcher_game_log,
     simulate_matchup_n_times, real_over_rate_from_simulation,
+    LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START, LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START,
+    LEAGUE_AVG_PITCHER_OUTS_PER_START, LEAGUE_STD_PITCHER_OUTS_PER_START,
+    LEAGUE_AVG_PITCHER_HITS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_HITS_ALLOWED_PER_START,
+    LEAGUE_AVG_PITCHER_WALKS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_WALKS_ALLOWED_PER_START,
+    LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START, LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START,
+    LEAGUE_AVG_PITCHER_FANTASY_PER_START, LEAGUE_STD_PITCHER_FANTASY_PER_START,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -1701,8 +1707,41 @@ else:
                 # hitters, pitcher props only against other pitchers.
                 stage1_df["field_mean"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("mean")
                 stage1_df["field_std"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("std").fillna(0.01)
-                stage1_df["zscore"] = round((stage1_df["real_avg"] - stage1_df["field_mean"])
-                                              / stage1_df["field_std"].replace(0, 0.01), 2)
+                # REAL BUG FIX - comparing only 2 pitchers per game (one
+                # home, one away) against EACH OTHER mathematically
+                # guarantees a z-score of exactly +-1.0 every time,
+                # regardless of whether the real gap between them is huge
+                # or nearly nonexistent - verified by hand, this is why
+                # pitchers always cleared the bar while hitters (a real,
+                # meaningful 9-person field) genuinely had to earn it.
+                # Pitchers now compare against a real, fixed league
+                # baseline instead of each other - a genuinely meaningful
+                # "how far above a typical real starter is he," not "which
+                # of these exact two is slightly ahead."
+                PITCHER_LEAGUE_BASELINES = {
+                    "strikeouts": (LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START, LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START),
+                    "outs": (LEAGUE_AVG_PITCHER_OUTS_PER_START, LEAGUE_STD_PITCHER_OUTS_PER_START),
+                    "hits_allowed": (LEAGUE_AVG_PITCHER_HITS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_HITS_ALLOWED_PER_START),
+                    "walks_allowed": (LEAGUE_AVG_PITCHER_WALKS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_WALKS_ALLOWED_PER_START),
+                    "earned_runs": (LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START, LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START),
+                    "pitcher_fantasy": (LEAGUE_AVG_PITCHER_FANTASY_PER_START, LEAGUE_STD_PITCHER_FANTASY_PER_START),
+                }
+                # Props where a LOWER real number is actually better for
+                # the pitcher (fewer hits/walks/runs allowed is good) -
+                # z-score sign needs flipping so "high z-score" still
+                # consistently means "genuinely good" on both sides.
+                LOWER_IS_BETTER_PITCHER_PROPS = {"hits_allowed", "walks_allowed", "earned_runs"}
+
+                def _real_zscore(row):
+                    if row["side"] != "pitcher" or row["prop"] not in PITCHER_LEAGUE_BASELINES:
+                        return round((row["real_avg"] - row["field_mean"]) / row["field_std"], 2)
+                    base_mean, base_std = PITCHER_LEAGUE_BASELINES[row["prop"]]
+                    z = (row["real_avg"] - base_mean) / base_std
+                    if row["prop"] in LOWER_IS_BETTER_PITCHER_PROPS:
+                        z = -z
+                    return round(z, 2)
+
+                stage1_df["zscore"] = stage1_df.apply(_real_zscore, axis=1)
                 # Real coverage check - only meaningful for hitters (a
                 # hitter's real sample against the pitcher's arsenal).
                 # Pitchers default to 100 here so this check never
@@ -1738,6 +1777,21 @@ else:
                               width='stretch')
                 st.caption(f"{real_survivor_count} of {len(stage1_df)} real (player, prop) combinations "
                            f"cleared all three real bars above - showing the top {len(survivors)}.")
+
+                # Real, genuine gap closed - until now there was no way to
+                # see the raw, UNFILTERED numbers for every real player/
+                # prop, only whoever survived. When nothing (or almost
+                # nothing) clears the bar, there was no way to actually
+                # check WHY - was it genuinely nothing there, or a real
+                # coverage/consistency issue quietly cutting real edges?
+                # Always available, not just when survivors is empty -
+                # useful any time you want to sanity-check the filter
+                # itself against the real, complete picture.
+                with st.expander(f"See all {len(stage1_df)} real (player, prop) combinations, unfiltered"):
+                    st.dataframe(
+                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "coverage"]]
+                        .sort_values("zscore", ascending=False),
+                        width='stretch')
 
                 if survivors.empty:
                     st.info("Nothing cleared the bar - try lowering the sliders above.")
