@@ -851,6 +851,33 @@ def wind_hr_read(team_query: str, wind_mph: int, wind_direction: str) -> str:
 LEAGUE_AVG_PITCHER_WHIFF = 11.5   # SwStr%, approx midpoint of TIER_BENCHMARKS whiff_pct elite/poor (15/8)
 LEAGUE_AVG_PITCHER_CSW = 27.5     # midpoint of TIER_BENCHMARKS csw_pct elite/poor (31/24)
 LEAGUE_AVG_PITCHER_HARDHIT_AGAINST = 37.0  # midpoint of hardhit_pct_against elite/poor (32/42)
+# Real, honest approximate per-start averages AND typical real game-to-
+# game spread (std) for a typical MLB starter - used as a fixed,
+# real comparison baseline for pitcher z-scores in the simulation UI.
+# REAL BUG this closes: comparing only 2 pitchers per game (one home,
+# one away) against EACH OTHER mathematically guarantees a z-score of
+# exactly +1.0/-1.0 every single time, regardless of whether the real
+# gap between them is huge or nearly nonexistent (verified by hand:
+# 6.0 vs 3.0 Ks and 5.01 vs 4.99 Ks both produce identical +-1.0). That's
+# not a real quality signal, just "which of these two is slightly ahead"
+# inflated to a fixed number - it's why pitchers always cleared the bar
+# while hitters (compared against a real, meaningful 9-person field)
+# genuinely had to earn it. These constants let pitchers get compared
+# against a real, stable league baseline instead, same as everything
+# else in this file - approximate, not live-validated, same honesty
+# standard as every other LEAGUE_AVG_* constant here.
+LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START = 5.5
+LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START = 2.2
+LEAGUE_AVG_PITCHER_OUTS_PER_START = 16.5
+LEAGUE_STD_PITCHER_OUTS_PER_START = 4.5
+LEAGUE_AVG_PITCHER_HITS_ALLOWED_PER_START = 5.5
+LEAGUE_STD_PITCHER_HITS_ALLOWED_PER_START = 2.3
+LEAGUE_AVG_PITCHER_WALKS_ALLOWED_PER_START = 2.5
+LEAGUE_STD_PITCHER_WALKS_ALLOWED_PER_START = 1.4
+LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START = 3.3
+LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START = 2.3
+LEAGUE_AVG_PITCHER_FANTASY_PER_START = 16.0
+LEAGUE_STD_PITCHER_FANTASY_PER_START = 11.0
 LEAGUE_AVG_PITCHER_GROUNDBALL = 44.0  # midpoint of TIER_BENCHMARKS groundball_pct elite/poor (50/38)
 LEAGUE_AVG_PITCHER_XWOBACON_AGAINST = 0.370  # midpoint of xwobacon_against elite/poor (0.330/0.410)
 LEAGUE_AVG_PITCHER_ZONE = 48.5  # approximate MLB-wide zone% (real, reasonable ballpark - not a live-pulled exact current figure, same honesty standard as every other approximate league constant in this file)
