@@ -1427,10 +1427,32 @@ except Exception as e:
 if sim_games_df is None or sim_games_df.empty:
     st.info("No games found for today.")
 else:
-    sim_game_options = {
-        f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}": row["game_id"]
-        for _, row in sim_games_df.iterrows()
-    }
+    # REAL BUG FIX - a doubleheader produces two rows with the IDENTICAL
+    # "away @ home" label, so building a dict keyed by that string alone
+    # meant the second game silently overwrote the first's real game_id -
+    # selecting the dropdown entry could point at game 2 (maybe not yet
+    # posted) even though game 1 was genuinely ready. Detects any
+    # duplicate label directly (not just ones the API's own doubleheader
+    # flag happens to catch) and disambiguates with the real game_num
+    # when available, falling back to the real game_id otherwise.
+    label_counts = {}
+    sim_game_options = {}
+    for _, row in sim_games_df.iterrows():
+        base_label = f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}"
+        label_counts[base_label] = label_counts.get(base_label, 0) + 1
+    seen_so_far = {}
+    for _, row in sim_games_df.iterrows():
+        base_label = f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}"
+        if label_counts[base_label] > 1:
+            game_num = row.get("game_num")
+            if pd.notna(game_num):
+                label = f"{base_label} (Game {int(game_num)})"
+            else:
+                seen_so_far[base_label] = seen_so_far.get(base_label, 0) + 1
+                label = f"{base_label} (Game {seen_so_far[base_label]})"
+        else:
+            label = base_label
+        sim_game_options[label] = row["game_id"]
     sim_game_label = st.selectbox("Pick a real game", list(sim_game_options.keys()), key="sim_game_select")
     sim_game_pk = sim_game_options[sim_game_label]
     sim_n_games = st.slider("Number of simulated games", 100, 2000, 1000, step=100, key="sim_n_games_slider",
