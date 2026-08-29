@@ -1499,6 +1499,24 @@ else:
                     st.warning(f"No real, confirmed starter found for the {pitching_side} team yet - skipped.")
                     continue
 
+                # Real, direct verification - shown BEFORE the expensive
+                # simulation runs, so a wrong pitcher can be caught and
+                # skipped immediately instead of discovered after 1000
+                # simulated games already ran on the wrong data. The
+                # source tells you which of the 3 real fallback methods
+                # actually resolved this - attempt_3 hasn't been verified
+                # live and deserves real, extra scrutiny if it shows up.
+                pitcher_source = opposing_pitcher.get("source", "unknown")
+                if pitcher_source == "attempt_3_actual_stats":
+                    st.warning(
+                        f"⚠️ {opposing_pitcher['name']} ({pitching_side} starter) was resolved via the "
+                        f"least-verified fallback method (attempt 3) - double check this is genuinely "
+                        f"today's real starter before trusting this simulation."
+                    )
+                else:
+                    st.caption(f"Real {pitching_side} starter resolved: **{opposing_pitcher['name']}** "
+                               f"(via {pitcher_source})")
+
                 pid = opposing_pitcher["player_id"]
                 # Real fix - matches the same, already-established convention
                 # used everywhere else in this file (scan_full_slate_quality_
@@ -1699,11 +1717,27 @@ else:
                     & (stage1_df["cv"].fillna(99) <= max_cv)
                     & (stage1_df["coverage"] >= min_coverage)
                 ].sort_values("zscore", ascending=False)
+                real_survivor_count = len(survivors)
+
+                # Real, practical cap - the three sliders above answer
+                # "how strict," but tuning them to land on a specific,
+                # manageable COUNT is its own separate hassle. This caps
+                # the real survivors to the top N by zscore, so you get a
+                # guaranteed, limited-but-decent list to actually check
+                # real lines for, without needing to keep re-tuning three
+                # sliders every single game.
+                top_n_survivors = st.slider(
+                    "Show only the top N survivors (by real edge)",
+                    3, 40, 12, key="sim_top_n_survivors",
+                    help="Applied after the three sliders above - this doesn't change who "
+                         "qualifies, just how many of the best ones you actually see.",
+                )
+                survivors = survivors.head(top_n_survivors)
 
                 st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "coverage"]],
                               width='stretch')
-                st.caption(f"{len(survivors)} of {len(stage1_df)} real (player, prop) combinations "
-                           f"cleared both bars above.")
+                st.caption(f"{real_survivor_count} of {len(stage1_df)} real (player, prop) combinations "
+                           f"cleared all three real bars above - showing the top {len(survivors)}.")
 
                 if survivors.empty:
                     st.info("Nothing cleared the bar - try lowering the sliders above.")
