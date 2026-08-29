@@ -3320,7 +3320,13 @@ def _pick_weighted_pitch_row(crosswalk_df: pd.DataFrame, rng: random.Random) -> 
     (already the same real weighting used everywhere else in this file).
     Returns the row as a dict for simulate_plate_appearance() to use.
     """
-    if crosswalk_df is None or crosswalk_df.empty:
+    # REAL BUG FIX - a genuinely empty crosswalk_df.empty check isn't
+    # enough. When a pitcher has no pitch type clearing the usage
+    # threshold against a specific batter hand, build_pitch_crosswalk
+    # returns a real, one-row DataFrame with only a "note" column - not
+    # empty, but missing every column this function actually needs. Must
+    # check for the real column directly, not just row count.
+    if crosswalk_df is None or crosswalk_df.empty or "pitcher_usage_pct" not in crosswalk_df.columns:
         return {}
     weights = crosswalk_df["pitcher_usage_pct"].fillna(0).tolist()
     if sum(weights) <= 0:
