@@ -1771,6 +1771,77 @@ else:
                         result_rows.append({"side": row["side"], "player": row["player"], "team": row["team"],
                                              "prop": row["prop"], "line": row["your_line"], **r})
                     result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
+                    # Real, new additions - explicit lean + under_rate, so
+                    # you don't have to mentally compute 100-over_rate
+                    # yourself every time to see which side the sim
+                    # actually favors.
+                    result_df["under_rate"] = round(100 - result_df["over_rate"], 1)
+                    result_df["lean"] = result_df["over_rate"].apply(
+                        lambda v: "OVER" if v > 50 else ("UNDER" if v < 50 else "COIN FLIP"))
+                    # Real, new "best of the best" gap - how far the avg
+                    # actually sits from the real line, as a % of the line
+                    # itself (not a fixed number, since a 34.5 line and a
+                    # 1.5 line aren't comparable on raw difference alone).
+                    result_df["avg_gap_pct"] = round(abs(result_df["avg"] - result_df["line"]) / result_df["line"] * 100, 1)
+                    # Real direction check - the avg gap only counts as
+                    # real confirmation if it's on the SAME side as the
+                    # lean (a below-line avg backing an under, an above-
+                    # line avg backing an over). Catches the real, honest
+                    # skew case (total_bases/fantasy can lean under on the
+                    # real rate while sitting above the line on raw avg -
+                    # that's not genuine confirmation, so it correctly
+                    # won't pass this filter even with a real % lean).
+                    result_df["gap_confirms_lean"] = (
+                        ((result_df["lean"] == "UNDER") & (result_df["avg"] < result_df["line"]))
+                        | ((result_df["lean"] == "OVER") & (result_df["avg"] > result_df["line"]))
+                    )
+
+                    st.subheader("Best of the best - both signals genuinely agreeing")
+                    bcol1, bcol2 = st.columns(2)
+                    with bcol1:
+                        min_rate_gap = st.slider(
+                            "Minimum real rate (% over OR % under)", 50, 95, 65, step=1,
+                            key="sim_min_rate_gap",
+                            help="65 means at least 65% over or at least 65% under - a real, "
+                                 "decisive lean, not just barely past a coin flip.",
+                        )
+                    with bcol2:
+                        min_avg_gap = st.slider(
+                            "Minimum avg-vs-line gap (% of the real line)", 0, 50, 15, step=1,
+                            key="sim_min_avg_gap",
+                            help="How far the real simulated average sits from your line, as a % "
+                                 "of the line itself - real room to spare, not barely squeaking by.",
+                        )
+                    best_of_best = result_df[
+                        ((result_df["over_rate"] >= min_rate_gap) | (result_df["under_rate"] >= min_rate_gap))
+                        & (result_df["avg_gap_pct"] >= min_avg_gap)
+                        & (result_df["gap_confirms_lean"])
+                    ].sort_values("avg_gap_pct", ascending=False)
+                    if best_of_best.empty:
+                        st.info("Nothing clears both real bars right now - lower the sliders above "
+                                "if you want to see more, or trust that nothing's genuinely great tonight.")
+                    else:
+                        st.dataframe(
+                            best_of_best[["side", "player", "team", "prop", "line", "avg",
+                                          "over_rate", "under_rate", "lean", "avg_gap_pct"]],
+                            width='stretch')
+
+                    def _lean_color(row):
+                        if row["lean"] == "OVER":
+                            color = "background-color: rgba(30, 100, 220, 0.35)"  # real, genuine blue
+                        elif row["lean"] == "UNDER":
+                            color = "background-color: rgba(220, 40, 40, 0.35)"  # real, genuine red
+                        else:
+                            color = ""
+                        return [color] * len(row)
+
+                    st.caption("Color-coded at a glance - blue leans over, red leans under, "
+                               "based on the real, empirical rate across the simulated games.")
+                    display_cols = ["side", "player", "team", "prop", "line", "avg",
+                                     "over_rate", "under_rate", "lean"]
+                    display_cols = [c for c in display_cols if c in result_df.columns]
+                    st.dataframe(result_df[display_cols].style.apply(_lean_color, axis=1), width='stretch')
+
                     result_df.insert(0, "Include", False)
                     edited_results = st.data_editor(
                         result_df, key="sim_results_editor", width='stretch', hide_index=True,
