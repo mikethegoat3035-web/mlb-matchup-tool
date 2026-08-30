@@ -7558,6 +7558,27 @@ EXPECTED_PA_BY_ORDER_SLOT = {
 }
 
 
+def pull_historical_games_in_range(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Real, completed games across a real date range - built specifically
+    for the backtest, so you can run a whole real stretch of past games
+    in one go instead of manually typing in one game_pk at a time.
+    Dates in 'YYYY-MM-DD', converted to the real 'MM/DD/YYYY' format
+    statsapi.schedule() actually expects. Only returns real games with a
+    real, final status - anything not yet completed gets filtered out,
+    since a real backtest needs a real, known outcome to check against.
+    """
+    if statsapi is None:
+        raise ImportError("pip install MLB-StatsAPI --break-system-packages")
+    start_fmt = datetime.strptime(start_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+    end_fmt = datetime.strptime(end_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+    games = statsapi.schedule(start_date=start_fmt, end_date=end_fmt)
+    df = pd.DataFrame(games)
+    if df.empty or "status" not in df.columns:
+        return df
+    return df[df["status"] == "Final"].reset_index(drop=True)
+
+
 def pull_todays_games(date: str = None) -> pd.DataFrame:
     """
     Today's (or a given date's) MLB schedule with probable pitchers.
