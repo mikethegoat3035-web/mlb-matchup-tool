@@ -8063,6 +8063,209 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
 # opposing pitcher's arsenal, and screens every batter in the lineup
 # automatically — no names typed in by hand.
 
+# ---------------------------------------------------------------------------
+# Real backtest for the full matchup simulation - "what would the simulation
+# have said before this completed, historical game, and what actually
+# happened?" Built to answer a real, evidence-based version of "what avg-
+# gap-pct threshold genuinely separates real edges from noise" instead of
+# a reasoned-but-unvalidated guess.
+# ---------------------------------------------------------------------------
+
+def pull_historical_actual_lineup(game_pk: int, side: str) -> list:
+    """
+    Real, actual batting order for a COMPLETED game (not a probable/
+    confirmed pregame projection) - pulls from the real box score of what
+    actually happened. Returns the real 9 starters (battingOrder codes
+    "100".."900" mark the real starting 9; substitutes get different,
+    longer codes and are correctly excluded here since they didn't start).
+    """
+    if statsapi is None:
+        raise ImportError("pip install MLB-StatsAPI --break-system-packages")
+    box = statsapi.boxscore_data(game_pk)
+    team_players = box.get(side, {}).get("players", {}) if isinstance(box.get(side), dict) else {}
+    starters = []
+    for pid, pdata in team_players.items():
+        order = pdata.get("battingOrder")
+        if order and len(str(order)) == 3 and str(order).endswith("00"):
+            person = pdata.get("person", {})
+            if person.get("id"):
+                starters.append({"player_id": person["id"], "name": person.get("fullName"),
+                                  "order_slot": int(str(order)[0])})
+    return sorted(starters, key=lambda x: x["order_slot"])
+
+
+def pull_historical_actual_outcome(game_pk: int, side: str) -> dict:
+    """
+    Real, actual box-score outcome stats for every player on one side of
+    a COMPLETED game - what genuinely happened, used to check the
+    simulation's real, pre-game prediction against real reality.
+    Returns {player_name: {hits, total_bases, home_runs, walks,
+    strikeouts, hits_runs_rbi, fantasy}} for hitters, and for the
+    starting pitcher specifically: {strikeouts, outs, hits_allowed,
+    walks_allowed, earned_runs, pitcher_fantasy}.
+    """
+    if statsapi is None:
+        raise ImportError("pip install MLB-StatsAPI --break-system-packages")
+    box = statsapi.boxscore_data(game_pk)
+    team_players = box.get(side, {}).get("players", {}) if isinstance(box.get(side), dict) else {}
+    hitters = {}
+    pitcher_outcome = None
+    for pid, pdata in team_players.items():
+        person = pdata.get("person", {})
+        name = person.get("fullName")
+        bat = pdata.get("stats", {}).get("batting", {})
+        if bat.get("atBats", 0) or bat.get("hits", 0):
+            hits = bat.get("hits", 0)
+            doubles, triples, hr = bat.get("doubles", 0), bat.get("triples", 0), bat.get("homeRuns", 0)
+            singles = hits - doubles - triples - hr
+            total_bases = singles + doubles * 2 + triples * 3 + hr * 4
+            runs, rbi, walks = bat.get("runs", 0), bat.get("rbi", 0), bat.get("baseOnBalls", 0)
+            fantasy = (singles * HITTER_FANTASY_WEIGHTS["single"] + doubles * HITTER_FANTASY_WEIGHTS["double"]
+                       + triples * HITTER_FANTASY_WEIGHTS["triple"] + hr * HITTER_FANTASY_WEIGHTS["home_run"]
+                       + runs * HITTER_FANTASY_WEIGHTS["run"] + rbi * HITTER_FANTASY_WEIGHTS["rbi"]
+                       + walks * HITTER_FANTASY_WEIGHTS["walk"])
+            hitters[name] = {"hits": hits, "singles": singles, "doubles": doubles, "triples": triples,
+                              "home_runs": hr, "walks": walks, "strikeouts": bat.get("strikeOuts", 0),
+                              "total_bases": total_bases, "hits_runs_rbi": hits + runs + rbi, "fantasy": fantasy}
+        pit = pdata.get("stats", {}).get("pitching", {})
+        if pit.get("gamesStarted", 0):
+            k, outs = pit.get("strikeOuts", 0), pit.get("outs", 0)
+            er = pit.get("earnedRuns", 0)
+            qs = 1 if outs >= 18 and er <= 3 else 0
+            pitcher_outcome = {
+                "player_name": name, "strikeouts": k, "outs": outs,
+                "hits_allowed": pit.get("hits", 0), "walks_allowed": pit.get("baseOnBalls", 0),
+                "earned_runs": er, "pitcher_fantasy": k * 3 + outs * 1 - er * 3 + qs * 5,
+            }
+    return {"hitters": hitters, "pitcher": pitcher_outcome}
+
+
+def backtest_simulation_for_historical_game(game_pk: int, historical_date: str, hitting_side: str,
+                                              pitching_side: str, n_simulations: int = 500) -> dict:
+    """
+    Real backtest for the full matchup simulation - for one COMPLETED,
+    historical game, builds crosswalks using ONLY data available before
+    that game (no data leakage - the real, actual game itself is
+    excluded), runs the simulation the exact same way the live tool
+    does, then pulls the real, actual outcome and returns both together
+    for comparison. This is the real, evidence-gathering building block
+    - run across many real historical games, the accumulated results
+    let you check what avg-gap-pct/rate actually separates real edges
+    from noise, instead of trusting a reasoned-but-unvalidated guess.
+
+    Real, honest limitation: pulls the real starting pitcher via the
+    same 3-attempt get_probable_pitcher() logic already used live - for
+    a game that's already completed, attempt 3 (real pitching stats)
+    should always resolve correctly, since the real starter genuinely
+    has real stats by definition once the game's over.
+    """
+    pre_game_end = (datetime.strptime(historical_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    pitcher_recent_start = (datetime.strptime(historical_date, "%Y-%m-%d") - timedelta(days=68)).strftime("%Y-%m-%d")
+    season_start_guess = f"{historical_date[:4]}-03-20"  # real, approximate real season start for that year
+
+    real_lineup = pull_historical_actual_lineup(game_pk, hitting_side)
+    if not real_lineup:
+        return {"error": f"No real, actual lineup found for {hitting_side} in this historical game."}
+
+    opposing_pitcher = get_probable_pitcher(game_pk, pitching_side)
+    if opposing_pitcher is None:
+        return {"error": f"No real starter found for {pitching_side} in this historical game."}
+
+    pid = opposing_pitcher["player_id"]
+    pitcher_pitches = pull_pitcher_pitches(pid, pitcher_recent_start, pre_game_end)
+    pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
+    if not pitcher_arsenal:
+        return {"error": "Not enough real, pre-game pitch data for the real starter."}
+    pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
+                    if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
+    pitcher_game_log = pull_pitcher_game_log(pid, pitcher_recent_start, pre_game_end)
+    starter_avg_outs = (pitcher_game_log["outs"].mean()
+                        if pitcher_game_log is not None and not pitcher_game_log.empty else 15.0)
+
+    lineup_crosswalks = {}
+    for hitter in real_lineup:
+        try:
+            h_pitches = pull_batter_pitches(hitter["player_id"], season_start_guess, pre_game_end)
+            batter_hand = (h_pitches["stand"].mode().iloc[0]
+                          if not h_pitches.empty and "stand" in h_pitches else "R")
+            h_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
+            crosswalk = build_pitch_crosswalk(pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
+            lineup_crosswalks[hitter["name"]] = crosswalk
+        except Exception:
+            continue
+    if not lineup_crosswalks:
+        return {"error": "Couldn't build any real, pre-game crosswalks for this historical lineup."}
+
+    sim_results = simulate_matchup_n_times(lineup_crosswalks, starter_avg_outs, n_simulations=n_simulations)
+    real_outcome = pull_historical_actual_outcome(game_pk, hitting_side)
+
+    return {
+        "game_pk": game_pk, "historical_date": historical_date, "pitcher_name": opposing_pitcher["name"],
+        "sim_hitters": sim_results["hitters"], "sim_pitcher": sim_results["starter"],
+        "actual_hitters": real_outcome["hitters"], "actual_pitcher": real_outcome["pitcher"],
+    }
+
+
+def backtest_comparison_rows(result: dict) -> list:
+    """
+    Real, direct comparison rows from one backtest_simulation_for_
+    historical_game() result - for every real hitter prop (and the real
+    pitcher), uses the simulated average itself (rounded to the nearest
+    half) as a real, honest stand-in line since actual historical book
+    lines for that specific date aren't available here, then checks
+    whether the REAL, ACTUAL outcome cleared it. This is the real,
+    accumulating evidence: run across many real historical games, group
+    by avg_gap_pct range, and see where the real hit-rate genuinely
+    starts dropping off - the actual, evidence-based way to know if 65/
+    15 (or any other threshold) is really the right bar, instead of a
+    reasoned-but-unvalidated guess.
+    """
+    rows = []
+    for name, series in result["sim_hitters"].items():
+        actual = result["actual_hitters"].get(name)
+        if actual is None:
+            continue
+        for prop in ("hits", "total_bases", "hits_runs_rbi", "fantasy"):
+            prop_series = series.get(prop, [])
+            if not prop_series:
+                continue
+            sim_avg = sum(prop_series) / len(prop_series)
+            hypothetical_line = round(sim_avg * 2) / 2
+            over_count = sum(1 for v in prop_series if v > hypothetical_line)
+            rate = round(over_count / len(prop_series) * 100, 1)
+            gap_pct = round(abs(sim_avg - hypothetical_line) / hypothetical_line * 100, 1) if hypothetical_line else 0.0
+            real_value = actual.get(prop)
+            if real_value is None:
+                continue
+            real_cleared = real_value > hypothetical_line
+            rows.append({
+                "side": "hitter", "player": name, "prop": prop, "hypothetical_line": hypothetical_line,
+                "sim_avg": round(sim_avg, 2), "sim_rate": rate, "gap_pct": gap_pct,
+                "real_value": real_value, "real_cleared_line": real_cleared,
+            })
+    pitcher_series = result.get("sim_pitcher", {})
+    actual_pitcher = result.get("actual_pitcher")
+    if actual_pitcher:
+        for prop in ("strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs", "pitcher_fantasy"):
+            prop_series = pitcher_series.get(prop, [])
+            if not prop_series:
+                continue
+            sim_avg = sum(prop_series) / len(prop_series)
+            hypothetical_line = round(sim_avg * 2) / 2
+            over_count = sum(1 for v in prop_series if v > hypothetical_line)
+            rate = round(over_count / len(prop_series) * 100, 1)
+            gap_pct = round(abs(sim_avg - hypothetical_line) / hypothetical_line * 100, 1) if hypothetical_line else 0.0
+            real_value = actual_pitcher.get(prop)
+            if real_value is None:
+                continue
+            rows.append({
+                "side": "pitcher", "player": actual_pitcher.get("player_name"), "prop": prop,
+                "hypothetical_line": hypothetical_line, "sim_avg": round(sim_avg, 2), "sim_rate": rate,
+                "gap_pct": gap_pct, "real_value": real_value, "real_cleared_line": real_value > hypothetical_line,
+            })
+    return rows
+
+
 def run_lineup_matchup_report(game_pk: int, pitching_side: str,
                                season_start: str, recent_start: str = None, today: str = None,
                                days_recent: int = 30) -> pd.DataFrame:
