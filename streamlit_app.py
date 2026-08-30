@@ -22,6 +22,7 @@ http://localhost:8501). Close the terminal window to shut it down.
 import streamlit as st
 import pandas as pd
 import itertools
+import math
 from datetime import datetime, timedelta
 
 from prop_model_combined import (
@@ -508,7 +509,15 @@ else:
                     st.subheader("Stage 2 - enter each real line for the survivors above")
 
                     def _round_half(x):
-                        return round(x * 2) / 2 if x is not None else 1.5
+                        # REAL BUG FIX - round(x*2)/2 could land on a
+                        # WHOLE number (e.g. 0.76 -> 1.0), but real
+                        # sportsbook lines for discrete counting stats
+                        # almost never sit on a whole number specifically
+                        # to avoid pushes - always a real .5 increment.
+                        # This just sets the STARTING suggestion you then
+                        # overwrite with the actual real line anyway, but
+                        # it should still reflect a real, plausible line.
+                        return math.floor(x) + 0.5 if x is not None else 1.5
 
                     base_rows = []
                     for _, srow in survivors.iterrows():
@@ -560,7 +569,7 @@ else:
                     )
 
                     st.subheader("Best of the best - both signals genuinely agreeing")
-                    bcol1, bcol2 = st.columns(2)
+                    bcol1, bcol2, bcol3 = st.columns(3)
                     with bcol1:
                         min_rate_gap = st.slider(
                             "Minimum real rate (% over OR % under)", 50, 95, 65, step=1,
@@ -569,15 +578,29 @@ else:
                                  "decisive lean, not just barely past a coin flip.",
                         )
                     with bcol2:
-                        min_avg_gap = st.slider(
-                            "Minimum avg-vs-line gap (% of the real line)", 0, 50, 15, step=1,
-                            key="sim_min_avg_gap",
-                            help="How far the real simulated average sits from your line, as a % "
-                                 "of the line itself - real room to spare, not barely squeaking by.",
+                        min_avg_gap_hitter = st.slider(
+                            "Minimum avg-vs-line gap - hitters (% of the line)", 0, 50, 8, step=1,
+                            key="sim_min_avg_gap_hitter",
+                            help="Real, separate bar for hitters - hitter stats (fantasy, total_bases, "
+                                 "hits_runs_rbi) are inherently noisier and more bounded game to game "
+                                 "than a pitcher's line, so even a genuine, real edge usually can't push "
+                                 "the average as far from the line in percentage terms. A shared 15% "
+                                 "bar was quietly filtering out real hitter edges - this is a lower, "
+                                 "separately-tuned floor specifically for that real difference.",
                         )
+                    with bcol3:
+                        min_avg_gap_pitcher = st.slider(
+                            "Minimum avg-vs-line gap - pitchers (% of the line)", 0, 50, 15, step=1,
+                            key="sim_min_avg_gap_pitcher",
+                            help="Unchanged from the original, shared bar - pitcher props (outs, "
+                                 "strikeouts, earned runs) showed real, meaningful gaps at this level "
+                                 "already, so this side didn't need adjusting.",
+                        )
+                    result_df["min_avg_gap_for_side"] = result_df["side"].apply(
+                        lambda s: min_avg_gap_hitter if s == "hitter" else min_avg_gap_pitcher)
                     best_of_best = result_df[
                         ((result_df["over_rate"] >= min_rate_gap) | (result_df["under_rate"] >= min_rate_gap))
-                        & (result_df["avg_gap_pct"] >= min_avg_gap)
+                        & (result_df["avg_gap_pct"] >= result_df["min_avg_gap_for_side"])
                         & (result_df["gap_confirms_lean"])
                     ].sort_values("avg_gap_pct", ascending=False)
                     if best_of_best.empty:
@@ -773,54 +796,63 @@ if st.session_state.get("bt_accumulated") is not None and not st.session_state.b
     st.subheader("Real, accumulated evidence")
     st.dataframe(acc, width='stretch')
 
-    # Real, honest bucketing - groups every real row by its gap_pct range
-    # and shows the REAL rate at which the actual outcome cleared the
-    # hypothetical line in each bucket - the real, evidence-based answer
-    # to whether a given gap-pct threshold is actually meaningful.
+    # Real, honest bucketing - groups every real row by BOTH its side
+    # (hitter/pitcher) and its gap_pct range, and shows the REAL rate at
+    # which the actual outcome cleared the hypothetical line in each
+    # bucket. Real bug fix - this used to group by gap_bucket alone,
+    # mixing hitters and pitchers together, exactly the kind of mixing
+    # already caught and fixed for Stage 1's own z-score earlier - hitter
+    # props (fantasy, total_bases) and pitcher props (outs, earned runs)
+    # showed real, different gap behavior once actually compared
+    # side-by-side, so lumping them into one shared recommendation would
+    # have quietly hidden that real difference.
     bins = [0, 5, 10, 15, 20, 30, 1000]
     labels = ["0-5%", "5-10%", "10-15%", "15-20%", "20-30%", "30%+"]
     acc_binned = acc.copy()
     acc_binned["gap_bucket"] = pd.cut(acc_binned["gap_pct"], bins=bins, labels=labels, right=False)
-    summary = acc_binned.groupby("gap_bucket", observed=True).agg(
+    summary = acc_binned.groupby(["side", "gap_bucket"], observed=True).agg(
         n=("real_cleared_line", "size"),
         real_hit_rate=("real_cleared_line", "mean"),
     ).reset_index()
     summary["real_hit_rate"] = round(summary["real_hit_rate"] * 100, 1)
-    st.subheader("Real hit-rate by gap-pct bucket")
+    st.subheader("Real hit-rate by gap-pct bucket, hitters and pitchers separated")
     st.dataframe(summary, width='stretch')
     st.caption("If real_hit_rate climbs meaningfully as the bucket rises, that's real, "
                "direct evidence a bigger gap genuinely predicts a real outcome - and "
                "roughly where it levels off is the real, evidence-based threshold, not "
                "a guessed one. Needs a real, decent sample per bucket before trusting it - "
-               "a bucket with only 2-3 rows isn't enough yet.")
+               "a bucket with only 2-3 rows isn't enough yet. Hitters and pitchers are kept "
+               "separate here specifically because they may need genuinely different real "
+               "thresholds, not one shared number.")
 
-    # Real, direct recommendation - reads the bucket table automatically
-    # instead of making you interpret it yourself every time. Finds the
-    # lowest bucket where the real hit-rate clears a genuinely meaningful
-    # bar (60%+, real separation above a 50% coin flip) with a real,
-    # minimum sample size behind it (10+ rows - fewer than that isn't
-    # trustworthy evidence either way).
+    # Real, direct recommendation - now computed SEPARATELY for hitters
+    # and pitchers, reading each side's own bucket table automatically
+    # instead of making you interpret it yourself or guess at a shared
+    # number that might not fit both sides equally well.
     MIN_SAMPLE_PER_BUCKET = 10
     MEANINGFUL_HIT_RATE = 60.0
-    reliable = summary[summary["n"] >= MIN_SAMPLE_PER_BUCKET]
-    if reliable.empty:
-        st.info(f"Not enough real, accumulated data yet for a reliable recommendation - "
-                f"every bucket needs at least {MIN_SAMPLE_PER_BUCKET} real rows. Run the "
-                f"backtest on a few more real games.")
-    else:
-        qualifying = reliable[reliable["real_hit_rate"] >= MEANINGFUL_HIT_RATE]
-        if qualifying.empty:
-            st.warning(f"Real, accumulated evidence so far doesn't show any bucket clearing "
-                       f"a real {MEANINGFUL_HIT_RATE}% hit-rate yet - the current 15% gap "
-                       f"threshold may genuinely need to be higher than what's been tested, "
-                       f"or more real games are needed before this settles.")
+    for side_label in ["hitter", "pitcher"]:
+        side_summary = summary[summary["side"] == side_label]
+        reliable = side_summary[side_summary["n"] >= MIN_SAMPLE_PER_BUCKET]
+        st.markdown(f"**{side_label.capitalize()} recommendation:**")
+        if reliable.empty:
+            st.info(f"Not enough real, accumulated {side_label} data yet - every bucket needs "
+                    f"at least {MIN_SAMPLE_PER_BUCKET} real rows. Run the backtest on a few more "
+                    f"real games.")
         else:
-            best_bucket = qualifying.iloc[0]
-            st.success(f"**Real recommendation:** based on {int(reliable['n'].sum())} accumulated "
-                       f"real rows, the **{best_bucket['gap_bucket']}** gap range is the lowest one "
-                       f"showing a real, meaningful hit-rate ({best_bucket['real_hit_rate']}% across "
-                       f"{int(best_bucket['n'])} real rows) - that's real, direct evidence for where "
-                       f"the actual gap-pct threshold should sit, not a guessed number.")
+            qualifying = reliable[reliable["real_hit_rate"] >= MEANINGFUL_HIT_RATE]
+            if qualifying.empty:
+                st.warning(f"Real, accumulated {side_label} evidence so far doesn't show any "
+                           f"bucket clearing a real {MEANINGFUL_HIT_RATE}% hit-rate yet - the "
+                           f"current threshold may genuinely need to be higher than what's been "
+                           f"tested, or more real games are needed before this settles.")
+            else:
+                best_bucket = qualifying.iloc[0]
+                st.success(f"Based on {int(reliable['n'].sum())} accumulated real {side_label} rows, "
+                           f"the **{best_bucket['gap_bucket']}** gap range is the lowest one showing "
+                           f"a real, meaningful hit-rate ({best_bucket['real_hit_rate']}% across "
+                           f"{int(best_bucket['n'])} real rows) - real, direct evidence for where "
+                           f"the actual {side_label} gap-pct threshold should sit.")
 
     if st.button("Clear accumulated backtest data", key="bt_clear_button"):
         st.session_state.bt_accumulated = pd.DataFrame()
