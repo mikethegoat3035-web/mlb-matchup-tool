@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import pandas as pd
 import random
+import math
 import statistics
 from datetime import datetime, timedelta
 
@@ -3518,6 +3519,198 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
     return {"starter_stats": starter_stats, "hitter_stats": hitter_stats}
 
 
+def _simulate_half_inning(batting_lineup_names: list, batting_crosswalks: dict,
+                           batting_hitter_stats: dict, batting_lineup_idx: int,
+                           pitching_state: dict, rng: random.Random) -> tuple:
+    """
+    Real, single half-inning - the batting team's own hitters accumulate
+    their own real stats (batting_hitter_stats), while the PITCHING
+    team's own starter workload (pitching_state) is what actually
+    determines whether he or a bullpen arm is on the mound right now.
+    These are genuinely two different teams' own data, kept properly
+    separate - the real bug this replaces had them accidentally merged
+    under one shared "team_state," which meant a team's own pitcher-
+    workload tracking was being updated by the OPPOSING team's at-bats
+    instead of its own, silently breaking every win-eligibility check.
+
+    Returns (runs_scored_this_inning, updated_batting_lineup_idx) - the
+    batting team's own hitter_stats and the pitching team's own
+    pitching_state are both mutated in place.
+    """
+    outs_this_inning = 0
+    runs_this_inning = 0
+    bases = [False, False, False]
+    lineup_idx = batting_lineup_idx
+
+    while outs_this_inning < 3:
+        name = batting_lineup_names[lineup_idx % len(batting_lineup_names)]
+        if pitching_state["starter_active"]:
+            row = _pick_weighted_pitch_row(batting_crosswalks[name], rng)
+        else:
+            row = LEAGUE_AVG_BULLPEN_ROW
+        outcome = simulate_plate_appearance(row, rng)
+
+        hs = batting_hitter_stats[name]
+        if outcome == "strikeout":
+            hs["strikeouts"] += 1
+            outs_this_inning += 1
+            if pitching_state["starter_active"]:
+                pitching_state["starter_stats"]["strikeouts"] += 1
+                pitching_state["starter_stats"]["outs"] += 1
+                pitching_state["starter_outs"] += 1
+        elif outcome == "out":
+            outs_this_inning += 1
+            if pitching_state["starter_active"]:
+                pitching_state["starter_stats"]["outs"] += 1
+                pitching_state["starter_outs"] += 1
+        elif outcome == "walk":
+            hs["walks"] += 1
+            if pitching_state["starter_active"]:
+                pitching_state["starter_stats"]["walks_allowed"] += 1
+            if bases[0]:
+                if bases[1]:
+                    if bases[2]:
+                        hs["rbi"] += 1
+                        runs_this_inning += 1
+                        if pitching_state["starter_active"]:
+                            pitching_state["starter_stats"]["earned_runs"] += 1
+                    else:
+                        bases[2] = True
+                    bases[1] = True
+                else:
+                    bases[1] = True
+            bases[0] = True
+        else:
+            hs["hits"] += 1
+            key = {"single": "singles", "double": "doubles",
+                   "triple": "triples", "home_run": "home_runs"}[outcome]
+            hs[key] += 1
+            if pitching_state["starter_active"]:
+                pitching_state["starter_stats"]["hits_allowed"] += 1
+            real_bases_advanced = {"single": 1, "double": 2, "triple": 3, "home_run": 4}[outcome]
+            runners_scored = 0
+            new_bases = [False, False, False]
+            for i, occupied in enumerate(bases):
+                if occupied:
+                    new_pos = i + real_bases_advanced
+                    if new_pos >= 3:
+                        runners_scored += 1
+                    else:
+                        new_bases[new_pos] = True
+            if outcome == "home_run":
+                runners_scored += 1
+                hs["runs"] += 1
+            else:
+                new_bases[real_bases_advanced - 1] = True
+            hs["rbi"] += runners_scored
+            runs_this_inning += runners_scored
+            if pitching_state["starter_active"] and runners_scored > 0:
+                pitching_state["starter_stats"]["earned_runs"] += runners_scored
+            bases = new_bases
+
+        if pitching_state["starter_active"] and pitching_state["starter_outs"] >= pitching_state["starter_outs_target"]:
+            pitching_state["starter_active"] = False
+        lineup_idx += 1
+
+    return runs_this_inning, lineup_idx
+
+
+def simulate_connected_game(home_crosswalks: dict, away_crosswalks: dict,
+                             home_starter_avg_outs: float, away_starter_avg_outs: float,
+                             rng: random.Random) -> dict:
+    """
+    Real, connected game - both real lineups play a real, full 9-inning
+    game together with a genuine, live, shared score, specifically so a
+    real MLB win can be determined - something the earlier, single-sided
+    simulate_one_game() genuinely couldn't do (it only ever simulated
+    one team in isolation, with no real opposing score to compare
+    against).
+
+    Real bug fixed from the first version of this function: each team's
+    own pitcher-workload tracking was accidentally being updated by the
+    OPPOSING team's at-bats (a naming/ownership mixup), which meant the
+    win-eligibility check never actually saw the real starter get pulled
+    at the right moment. Fixed by keeping each side's own hitting stats
+    and the OTHER side's pitching-workload tracking explicitly separate
+    and correctly paired.
+
+    Real, honest simplification: always plays a full, real 9 innings (no
+    walk-off early ending) - modeling a real walk-off adds a real layer
+    of complexity for a relatively rare real event; doesn't change who
+    wins or the real win-eligibility check below.
+
+    Real MLB win rule applied: the starter gets the real win only if (1)
+    he pitched at least 15 real outs (5 innings), (2) his own team was
+    ahead at the exact moment he left, AND (3) his team's lead was never
+    lost (fell behind or tied) for the rest of the real game. This
+    mirrors the real, official rule - if the starter doesn't qualify,
+    this returns no winner among the two starters (the real rule would
+    hand it to a specific reliever, which isn't modeled here - a real,
+    honest scope limit, not an error).
+    """
+    home_lineup_names = list(home_crosswalks.keys())
+    away_lineup_names = list(away_crosswalks.keys())
+    home_hitter_stats = {name: {"hits": 0, "singles": 0, "doubles": 0, "triples": 0, "home_runs": 0,
+                                  "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0} for name in home_lineup_names}
+    away_hitter_stats = {name: {"hits": 0, "singles": 0, "doubles": 0, "triples": 0, "home_runs": 0,
+                                  "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0} for name in away_lineup_names}
+    # home_pitching_state tracks the HOME starter's own real workload -
+    # updated whenever the AWAY lineup bats (he's the one pitching to them).
+    home_pitching_state = {
+        "starter_active": True, "starter_outs": 0,
+        "starter_outs_target": max(3, min(27, round(rng.gauss(home_starter_avg_outs, 4.5)))),
+        "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0},
+    }
+    away_pitching_state = {
+        "starter_active": True, "starter_outs": 0,
+        "starter_outs_target": max(3, min(27, round(rng.gauss(away_starter_avg_outs, 4.5)))),
+        "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0},
+    }
+    home_lineup_idx, away_lineup_idx = 0, 0
+    home_score, away_score = 0, 0
+    home_starter_left_ahead = None
+    away_starter_left_ahead = None
+    home_lead_ever_lost_after = False
+    away_lead_ever_lost_after = False
+
+    for inning in range(9):
+        home_pitcher_active_before = home_pitching_state["starter_active"]
+        away_pitcher_active_before = away_pitching_state["starter_active"]
+
+        # Top half - away bats, home starter is the one pitching to them
+        runs, away_lineup_idx = _simulate_half_inning(
+            away_lineup_names, away_crosswalks, away_hitter_stats, away_lineup_idx, home_pitching_state, rng)
+        away_score += runs
+        if home_pitcher_active_before and not home_pitching_state["starter_active"] and home_starter_left_ahead is None:
+            home_starter_left_ahead = home_score > away_score
+        if home_starter_left_ahead is True and away_score >= home_score:
+            home_lead_ever_lost_after = True
+
+        # Bottom half - home bats, away starter is the one pitching to them
+        runs, home_lineup_idx = _simulate_half_inning(
+            home_lineup_names, home_crosswalks, home_hitter_stats, home_lineup_idx, away_pitching_state, rng)
+        home_score += runs
+        if away_pitcher_active_before and not away_pitching_state["starter_active"] and away_starter_left_ahead is None:
+            away_starter_left_ahead = away_score > home_score
+        if away_starter_left_ahead is True and home_score >= away_score:
+            away_lead_ever_lost_after = True
+
+    home_won = home_score > away_score
+    away_won = away_score > home_score
+    home_starter_win = bool(home_won and home_starter_left_ahead and not home_lead_ever_lost_after
+                             and home_pitching_state["starter_stats"]["outs"] >= 15)
+    away_starter_win = bool(away_won and away_starter_left_ahead and not away_lead_ever_lost_after
+                             and away_pitching_state["starter_stats"]["outs"] >= 15)
+
+    return {
+        "home_score": home_score, "away_score": away_score,
+        "home_hitter_stats": home_hitter_stats, "away_hitter_stats": away_hitter_stats,
+        "home_starter_stats": home_pitching_state["starter_stats"],
+        "away_starter_stats": away_pitching_state["starter_stats"],
+        "home_starter_win": home_starter_win, "away_starter_win": away_starter_win,
+    }
+
+
 def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
                               n_simulations: int = 100, random_state: int = 42) -> dict:
     """
@@ -3587,6 +3780,84 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
             hitter_series[name]["fantasy"].append(fantasy)
 
     return {"starter": starter_series, "hitters": hitter_series}
+
+
+def simulate_connected_matchup_n_times(home_crosswalks: dict, away_crosswalks: dict,
+                                        home_starter_avg_outs: float, away_starter_avg_outs: float,
+                                        n_simulations: int = 500, random_state: int = 42) -> dict:
+    """
+    Real, connected version of simulate_matchup_n_times() - runs
+    simulate_connected_game() (both real lineups, one real shared score,
+    genuine win-eligibility) n_simulations times, so pitcher_fantasy can
+    finally include the real +5 win bonus - the one piece the original,
+    single-sided simulation genuinely couldn't produce, since it never
+    had access to what the OTHER team was scoring at the same time.
+
+    Returns both sides' real hitter series and starter series (now
+    including a real "win" 0/1 series, and pitcher_fantasy correctly
+    including the +5 when it happened) - same real shape as the
+    original simulate_matchup_n_times()'s hitters dict, doubled for
+    home and away.
+    """
+    rng = random.Random(random_state)
+    home_starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": [],
+                            "earned_runs": [], "quality_start": [], "win": [], "pitcher_fantasy": []}
+    away_starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": [],
+                            "earned_runs": [], "quality_start": [], "win": [], "pitcher_fantasy": []}
+    home_hitter_series = {name: {"hits": [], "singles": [], "doubles": [], "triples": [],
+                                   "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [],
+                                   "hits_runs_rbi": [], "total_bases": [], "fantasy": []}
+                           for name in home_crosswalks.keys()}
+    away_hitter_series = {name: {"hits": [], "singles": [], "doubles": [], "triples": [],
+                                   "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [],
+                                   "hits_runs_rbi": [], "total_bases": [], "fantasy": []}
+                           for name in away_crosswalks.keys()}
+
+    def _append_pitcher(series_dict, stats, win_flag):
+        k, outs, er = stats["strikeouts"], stats["outs"], stats["earned_runs"]
+        qs = 1 if outs >= 18 and er <= 3 else 0
+        win = 1 if win_flag else 0
+        series_dict["strikeouts"].append(k)
+        series_dict["outs"].append(outs)
+        series_dict["hits_allowed"].append(stats["hits_allowed"])
+        series_dict["walks_allowed"].append(stats["walks_allowed"])
+        series_dict["earned_runs"].append(er)
+        series_dict["quality_start"].append(qs)
+        series_dict["win"].append(win)
+        # Real, complete pitcher_fantasy now - the +5 win bonus finally
+        # included, since this connected simulation genuinely knows
+        # whether he earned it, unlike the original single-sided version.
+        series_dict["pitcher_fantasy"].append(k * 3 + outs * 1 - er * 3 + qs * 5 + win * 5)
+
+    def _append_hitters(series_dict, hitter_stats):
+        for name, hs in hitter_stats.items():
+            for k in ("hits", "singles", "doubles", "triples", "home_runs",
+                      "walks", "strikeouts", "runs", "rbi"):
+                series_dict[name][k].append(hs[k])
+            series_dict[name]["hits_runs_rbi"].append(hs["hits"] + hs["runs"] + hs["rbi"])
+            total_bases = hs["singles"] + hs["doubles"] * 2 + hs["triples"] * 3 + hs["home_runs"] * 4
+            series_dict[name]["total_bases"].append(total_bases)
+            fantasy = (hs["singles"] * HITTER_FANTASY_WEIGHTS["single"]
+                       + hs["doubles"] * HITTER_FANTASY_WEIGHTS["double"]
+                       + hs["triples"] * HITTER_FANTASY_WEIGHTS["triple"]
+                       + hs["home_runs"] * HITTER_FANTASY_WEIGHTS["home_run"]
+                       + hs["runs"] * HITTER_FANTASY_WEIGHTS["run"]
+                       + hs["rbi"] * HITTER_FANTASY_WEIGHTS["rbi"]
+                       + hs["walks"] * HITTER_FANTASY_WEIGHTS["walk"])
+            series_dict[name]["fantasy"].append(fantasy)
+
+    for _ in range(n_simulations):
+        game = simulate_connected_game(home_crosswalks, away_crosswalks,
+                                        home_starter_avg_outs, away_starter_avg_outs, rng)
+        _append_pitcher(home_starter_series, game["home_starter_stats"], game["home_starter_win"])
+        _append_pitcher(away_starter_series, game["away_starter_stats"], game["away_starter_win"])
+        _append_hitters(home_hitter_series, game["home_hitter_stats"])
+        _append_hitters(away_hitter_series, game["away_hitter_stats"])
+
+    return {
+        "home_starter": home_starter_series, "away_starter": away_starter_series,
+        "home_hitters": home_hitter_series, "away_hitters": away_hitter_series,
+    }
 
 
 def real_over_rate_from_simulation(series: list, line: float) -> dict:
@@ -8251,7 +8522,13 @@ def backtest_comparison_rows(result: dict) -> list:
             if not prop_series:
                 continue
             sim_avg = sum(prop_series) / len(prop_series)
-            hypothetical_line = round(sim_avg * 2) / 2
+            # REAL BUG FIX - round(avg*2)/2 could land on a WHOLE
+            # number (e.g. avg=0.76 -> 1.0), but real sportsbook lines
+            # for discrete counting stats almost never sit on a whole
+            # number specifically to avoid pushes - they're always at
+            # a real .5 increment. floor(avg)+0.5 guarantees a genuine
+            # .5 line every time, matching real book convention.
+            hypothetical_line = math.floor(sim_avg) + 0.5
             over_count = sum(1 for v in prop_series if v > hypothetical_line)
             rate = round(over_count / len(prop_series) * 100, 1)
             gap_pct = round(abs(sim_avg - hypothetical_line) / hypothetical_line * 100, 1) if hypothetical_line else 0.0
@@ -8272,7 +8549,13 @@ def backtest_comparison_rows(result: dict) -> list:
             if not prop_series:
                 continue
             sim_avg = sum(prop_series) / len(prop_series)
-            hypothetical_line = round(sim_avg * 2) / 2
+            # REAL BUG FIX - round(avg*2)/2 could land on a WHOLE
+            # number (e.g. avg=0.76 -> 1.0), but real sportsbook lines
+            # for discrete counting stats almost never sit on a whole
+            # number specifically to avoid pushes - they're always at
+            # a real .5 increment. floor(avg)+0.5 guarantees a genuine
+            # .5 line every time, matching real book convention.
+            hypothetical_line = math.floor(sim_avg) + 0.5
             over_count = sum(1 for v in prop_series if v > hypothetical_line)
             rate = round(over_count / len(prop_series) * 100, 1)
             gap_pct = round(abs(sim_avg - hypothetical_line) / hypothetical_line * 100, 1) if hypothetical_line else 0.0
