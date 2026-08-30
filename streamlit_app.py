@@ -710,39 +710,44 @@ st.caption(
     "evidence for what gap-pct/rate genuinely separates real edges from noise."
 )
 
-bt_col1, bt_col2, bt_col3 = st.columns(3)
+bt_col1, bt_col2 = st.columns(2)
 with bt_col1:
     bt_game_pk = st.number_input("Real historical game_pk", min_value=1, value=1, step=1, key="bt_game_pk")
 with bt_col2:
     bt_date = st.text_input("Real historical date (YYYY-MM-DD)", key="bt_date")
-with bt_col3:
-    bt_side = st.radio("Which side's real hitters", ["home", "away"], key="bt_side", horizontal=True)
 
 if st.button("Run real backtest for this game", key="bt_run_button"):
     if not bt_date:
         st.warning("Enter the real date this game was played.")
     else:
-        pitching_side = "away" if bt_side == "home" else "home"
-        with st.spinner("Building real, pre-game crosswalks and running the real simulation..."):
-            try:
-                result = backtest_simulation_for_historical_game(
-                    int(bt_game_pk), bt_date, bt_side, pitching_side, n_simulations=500)
-            except Exception as e:
-                result = {"error": f"Real error running the backtest: {e}"}
+        # Real, same fix as the live simulation - both sides have real
+        # hitters worth checking, no real reason to force a choice when
+        # both are just as easy to run together.
+        all_rows = []
+        for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
+            with st.spinner(f"Building real, pre-game crosswalks for the {hitting_side} side..."):
+                try:
+                    result = backtest_simulation_for_historical_game(
+                        int(bt_game_pk), bt_date, hitting_side, pitching_side, n_simulations=500)
+                except Exception as e:
+                    st.error(f"Real error running the {hitting_side}-side backtest: {e}")
+                    continue
 
-        if "error" in result:
-            st.error(result["error"])
-        else:
+            if "error" in result:
+                st.warning(f"{hitting_side}: {result['error']}")
+                continue
             rows = backtest_comparison_rows(result)
-            if not rows:
-                st.warning("No real, comparable rows came back for this game.")
+            all_rows.extend(rows)
+
+        if not all_rows:
+            st.warning("No real, comparable rows came back for this game.")
+        else:
+            if "bt_accumulated" not in st.session_state:
+                st.session_state.bt_accumulated = pd.DataFrame(all_rows)
             else:
-                if "bt_accumulated" not in st.session_state:
-                    st.session_state.bt_accumulated = pd.DataFrame(rows)
-                else:
-                    st.session_state.bt_accumulated = pd.concat(
-                        [st.session_state.bt_accumulated, pd.DataFrame(rows)], ignore_index=True)
-                st.success(f"Added {len(rows)} real comparison rows - "
+                st.session_state.bt_accumulated = pd.concat(
+                    [st.session_state.bt_accumulated, pd.DataFrame(all_rows)], ignore_index=True)
+            st.success(f"Added {len(all_rows)} real comparison rows - "
                            f"{len(st.session_state.bt_accumulated)} total accumulated so far.")
 
 if st.session_state.get("bt_accumulated") is not None and not st.session_state.bt_accumulated.empty:
@@ -770,6 +775,34 @@ if st.session_state.get("bt_accumulated") is not None and not st.session_state.b
                "roughly where it levels off is the real, evidence-based threshold, not "
                "a guessed one. Needs a real, decent sample per bucket before trusting it - "
                "a bucket with only 2-3 rows isn't enough yet.")
+
+    # Real, direct recommendation - reads the bucket table automatically
+    # instead of making you interpret it yourself every time. Finds the
+    # lowest bucket where the real hit-rate clears a genuinely meaningful
+    # bar (60%+, real separation above a 50% coin flip) with a real,
+    # minimum sample size behind it (10+ rows - fewer than that isn't
+    # trustworthy evidence either way).
+    MIN_SAMPLE_PER_BUCKET = 10
+    MEANINGFUL_HIT_RATE = 60.0
+    reliable = summary[summary["n"] >= MIN_SAMPLE_PER_BUCKET]
+    if reliable.empty:
+        st.info(f"Not enough real, accumulated data yet for a reliable recommendation - "
+                f"every bucket needs at least {MIN_SAMPLE_PER_BUCKET} real rows. Run the "
+                f"backtest on a few more real games.")
+    else:
+        qualifying = reliable[reliable["real_hit_rate"] >= MEANINGFUL_HIT_RATE]
+        if qualifying.empty:
+            st.warning(f"Real, accumulated evidence so far doesn't show any bucket clearing "
+                       f"a real {MEANINGFUL_HIT_RATE}% hit-rate yet - the current 15% gap "
+                       f"threshold may genuinely need to be higher than what's been tested, "
+                       f"or more real games are needed before this settles.")
+        else:
+            best_bucket = qualifying.iloc[0]
+            st.success(f"**Real recommendation:** based on {int(reliable['n'].sum())} accumulated "
+                       f"real rows, the **{best_bucket['gap_bucket']}** gap range is the lowest one "
+                       f"showing a real, meaningful hit-rate ({best_bucket['real_hit_rate']}% across "
+                       f"{int(best_bucket['n'])} real rows) - that's real, direct evidence for where "
+                       f"the actual gap-pct threshold should sit, not a guessed number.")
 
     if st.button("Clear accumulated backtest data", key="bt_clear_button"):
         st.session_state.bt_accumulated = pd.DataFrame()
