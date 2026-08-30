@@ -43,6 +43,7 @@ from prop_model_combined import (
     build_hitter_profile, build_pitch_crosswalk, pull_pitcher_game_log,
     simulate_matchup_n_times, real_over_rate_from_simulation,
     backtest_simulation_for_historical_game, backtest_comparison_rows,
+    pull_historical_games_in_range,
     LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START, LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START,
     LEAGUE_AVG_PITCHER_OUTS_PER_START, LEAGUE_STD_PITCHER_OUTS_PER_START,
     LEAGUE_AVG_PITCHER_HITS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_HITS_ALLOWED_PER_START,
@@ -712,35 +713,52 @@ st.caption(
 
 bt_col1, bt_col2 = st.columns(2)
 with bt_col1:
-    bt_game_pk = st.number_input("Real historical game_pk", min_value=1, value=1, step=1, key="bt_game_pk")
+    bt_start_date = st.text_input("Real start date (YYYY-MM-DD)", key="bt_start_date")
 with bt_col2:
-    bt_date = st.text_input("Real historical date (YYYY-MM-DD)", key="bt_date")
+    bt_end_date = st.text_input("Real end date (YYYY-MM-DD)", key="bt_end_date")
+st.caption(
+    "Pulls every real, COMPLETED game in this range automatically - no need to "
+    "look up and type in individual game_pk values one at a time. A real, "
+    "trustworthy sample needs genuine variety (different pitchers, different "
+    "days), so aim for roughly 10-15+ real games, not just one."
+)
 
-if st.button("Run real backtest for this game", key="bt_run_button"):
-    if not bt_date:
-        st.warning("Enter the real date this game was played.")
+if st.button("Run real backtest for every game in this range", key="bt_run_button"):
+    if not bt_start_date or not bt_end_date:
+        st.warning("Enter both a real start and end date.")
     else:
-        # Real, same fix as the live simulation - both sides have real
-        # hitters worth checking, no real reason to force a choice when
-        # both are just as easy to run together.
-        all_rows = []
-        for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
-            with st.spinner(f"Building real, pre-game crosswalks for the {hitting_side} side..."):
-                try:
-                    result = backtest_simulation_for_historical_game(
-                        int(bt_game_pk), bt_date, hitting_side, pitching_side, n_simulations=500)
-                except Exception as e:
-                    st.error(f"Real error running the {hitting_side}-side backtest: {e}")
-                    continue
+        try:
+            games_df = pull_historical_games_in_range(bt_start_date, bt_end_date)
+        except Exception as e:
+            games_df = None
+            st.error(f"Real error pulling the real schedule: {e}")
 
-            if "error" in result:
-                st.warning(f"{hitting_side}: {result['error']}")
-                continue
-            rows = backtest_comparison_rows(result)
-            all_rows.extend(rows)
+        all_rows = []
+        if games_df is None or games_df.empty:
+            st.warning("No real, completed games found in that range.")
+        else:
+            st.info(f"Found {len(games_df)} real, completed games - running the real backtest "
+                    f"on each (both sides automatically).")
+            progress = st.progress(0.0, text="Starting...")
+            for i, (_, game) in enumerate(games_df.iterrows()):
+                game_pk = game.get("game_id")
+                game_date = str(game.get("game_date"))
+                for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
+                    try:
+                        result = backtest_simulation_for_historical_game(
+                            int(game_pk), game_date, hitting_side, pitching_side, n_simulations=500)
+                    except Exception:
+                        continue
+                    if "error" in result:
+                        continue
+                    all_rows.extend(backtest_comparison_rows(result))
+                progress.progress((i + 1) / len(games_df),
+                                   text=f"Backtested {i+1}/{len(games_df)} real games "
+                                        f"({len(all_rows)} real rows so far)...")
+            progress.empty()
 
         if not all_rows:
-            st.warning("No real, comparable rows came back for this game.")
+            st.warning("No real, comparable rows came back for this range.")
         else:
             if "bt_accumulated" not in st.session_state:
                 st.session_state.bt_accumulated = pd.DataFrame(all_rows)
