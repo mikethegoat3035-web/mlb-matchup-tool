@@ -810,49 +810,70 @@ if st.session_state.get("bt_accumulated") is not None and not st.session_state.b
     labels = ["0-5%", "5-10%", "10-15%", "15-20%", "20-30%", "30%+"]
     acc_binned = acc.copy()
     acc_binned["gap_bucket"] = pd.cut(acc_binned["gap_pct"], bins=bins, labels=labels, right=False)
-    summary = acc_binned.groupby(["side", "gap_bucket"], observed=True).agg(
+    # Real, new split by lean direction - per direct request. The old,
+    # pooled real_hit_rate blended real over-leaning and under-leaning
+    # results together, which quietly hid a real, important distinction:
+    # a hitter can keep batting all game against relievers after the
+    # starter's gone, so an under-lean is genuinely riskier to trust than
+    # an over-lean for hitters specifically - a pooled number can look
+    # weak even when a genuine, real over-specific edge exists (or
+    # doesn't), since unders were dragging the pooled average down.
+    group_cols = ["side", "lean", "gap_bucket"] if "lean" in acc_binned.columns else ["side", "gap_bucket"]
+    summary = acc_binned.groupby(group_cols, observed=True).agg(
         n=("real_cleared_line", "size"),
         real_hit_rate=("real_cleared_line", "mean"),
     ).reset_index()
     summary["real_hit_rate"] = round(summary["real_hit_rate"] * 100, 1)
-    st.subheader("Real hit-rate by gap-pct bucket, hitters and pitchers separated")
+    st.subheader("Real hit-rate by gap-pct bucket, hitters/pitchers AND lean direction separated")
     st.dataframe(summary, width='stretch')
     st.caption("If real_hit_rate climbs meaningfully as the bucket rises, that's real, "
                "direct evidence a bigger gap genuinely predicts a real outcome - and "
                "roughly where it levels off is the real, evidence-based threshold, not "
                "a guessed one. Needs a real, decent sample per bucket before trusting it - "
-               "a bucket with only 2-3 rows isn't enough yet. Hitters and pitchers are kept "
-               "separate here specifically because they may need genuinely different real "
-               "thresholds, not one shared number.")
+               "a bucket with only 2-3 rows isn't enough yet. Split by lean now too - check "
+               "the OVER rows specifically if you only want to trust over plays; a pooled "
+               "over+under number can look weak even when a real, genuine over-specific "
+               "edge exists, since under results were dragging the blended average down.")
 
-    # Real, direct recommendation - now computed SEPARATELY for hitters
-    # and pitchers, reading each side's own bucket table automatically
-    # instead of making you interpret it yourself or guess at a shared
-    # number that might not fit both sides equally well.
+    # Real, direct recommendation - now computed SEPARATELY for each real
+    # (side, lean) combination, not just side - per direct request, since
+    # a hitter's real over-specific edge and his real under-specific edge
+    # may need genuinely different thresholds, and blending them together
+    # was hiding a real over-specific signal under a weaker, pooled number.
     MIN_SAMPLE_PER_BUCKET = 10
     MEANINGFUL_HIT_RATE = 60.0
-    for side_label in ["hitter", "pitcher"]:
-        side_summary = summary[summary["side"] == side_label]
+    if "lean" in summary.columns:
+        combos = summary[["side", "lean"]].drop_duplicates().sort_values(["side", "lean"]).values.tolist()
+    else:
+        combos = [[s, None] for s in ["hitter", "pitcher"]]
+    for side_label, lean_label in combos:
+        if lean_label == "COIN FLIP":
+            continue  # real, genuine noise - never worth a recommendation
+        mask = summary["side"] == side_label
+        if lean_label is not None:
+            mask &= summary["lean"] == lean_label
+        side_summary = summary[mask]
         reliable = side_summary[side_summary["n"] >= MIN_SAMPLE_PER_BUCKET]
-        st.markdown(f"**{side_label.capitalize()} recommendation:**")
+        label = f"{side_label.capitalize()}" + (f" ({lean_label})" if lean_label else "")
+        st.markdown(f"**{label} recommendation:**")
         if reliable.empty:
-            st.info(f"Not enough real, accumulated {side_label} data yet - every bucket needs "
+            st.info(f"Not enough real, accumulated {label} data yet - every bucket needs "
                     f"at least {MIN_SAMPLE_PER_BUCKET} real rows. Run the backtest on a few more "
                     f"real games.")
         else:
             qualifying = reliable[reliable["real_hit_rate"] >= MEANINGFUL_HIT_RATE]
             if qualifying.empty:
-                st.warning(f"Real, accumulated {side_label} evidence so far doesn't show any "
+                st.warning(f"Real, accumulated {label} evidence so far doesn't show any "
                            f"bucket clearing a real {MEANINGFUL_HIT_RATE}% hit-rate yet - the "
                            f"current threshold may genuinely need to be higher than what's been "
                            f"tested, or more real games are needed before this settles.")
             else:
                 best_bucket = qualifying.iloc[0]
-                st.success(f"Based on {int(reliable['n'].sum())} accumulated real {side_label} rows, "
+                st.success(f"Based on {int(reliable['n'].sum())} accumulated real {label} rows, "
                            f"the **{best_bucket['gap_bucket']}** gap range is the lowest one showing "
                            f"a real, meaningful hit-rate ({best_bucket['real_hit_rate']}% across "
                            f"{int(best_bucket['n'])} real rows) - real, direct evidence for where "
-                           f"the actual {side_label} gap-pct threshold should sit.")
+                           f"the actual {label} gap-pct threshold should sit.")
 
     if st.button("Clear accumulated backtest data", key="bt_clear_button"):
         st.session_state.bt_accumulated = pd.DataFrame()
