@@ -8536,9 +8536,17 @@ def backtest_comparison_rows(result: dict) -> list:
             if real_value is None:
                 continue
             real_cleared = real_value > hypothetical_line
+            # Real, new lean label - per direct request, over_rate alone
+            # doesn't tell you which side was actually favored (a 30%
+            # over_rate IS a real 70% under lean, just not labeled as
+            # one) - needed to split the backtest bucket summary by
+            # direction, since a hitter's real over-lean edge and his
+            # real under-lean edge may need genuinely different real
+            # gap thresholds, not one number blending both together.
+            lean = "OVER" if rate > 50 else ("UNDER" if rate < 50 else "COIN FLIP")
             rows.append({
                 "side": "hitter", "player": name, "prop": prop, "hypothetical_line": hypothetical_line,
-                "sim_avg": round(sim_avg, 2), "sim_rate": rate, "gap_pct": gap_pct,
+                "sim_avg": round(sim_avg, 2), "sim_rate": rate, "lean": lean, "gap_pct": gap_pct,
                 "real_value": real_value, "real_cleared_line": real_cleared,
             })
     pitcher_series = result.get("sim_pitcher", {})
@@ -8562,10 +8570,12 @@ def backtest_comparison_rows(result: dict) -> list:
             real_value = actual_pitcher.get(prop)
             if real_value is None:
                 continue
+            lean = "OVER" if rate > 50 else ("UNDER" if rate < 50 else "COIN FLIP")
             rows.append({
                 "side": "pitcher", "player": actual_pitcher.get("player_name"), "prop": prop,
                 "hypothetical_line": hypothetical_line, "sim_avg": round(sim_avg, 2), "sim_rate": rate,
-                "gap_pct": gap_pct, "real_value": real_value, "real_cleared_line": real_value > hypothetical_line,
+                "lean": lean, "gap_pct": gap_pct, "real_value": real_value,
+                "real_cleared_line": real_value > hypothetical_line,
             })
     return rows
 
