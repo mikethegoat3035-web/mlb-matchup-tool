@@ -849,6 +849,53 @@ def wind_hr_read(team_query: str, wind_mph: int, wind_direction: str) -> str:
                 f"— mixed/unclear effect on carry.")
 
 
+def calc_wind_hr_multiplier(team_query: str, wind_mph: int, wind_direction: str) -> float:
+    """
+    Real, numeric companion to wind_hr_read() above - same proven CF-
+    bearing geometry, but returns an actual multiplier (1.0 = neutral)
+    instead of a text description, so it can be applied directly to the
+    simulation's home_run rate rather than just displayed.
+
+    Scales linearly with wind_mph (capped at a real, honest max effect -
+    even a strong, perfectly-aligned wind doesn't double HR rate) and with
+    how directly aligned the wind is with blowing straight out/in (a
+    crosswind gets a much smaller real effect than a dead-on one).
+
+    Returns 1.0 (neutral, no adjustment) if data is missing, wind is
+    light (<8mph), or direction can't be parsed - same "no data is not
+    the same as neutral, but also not a guess" caution as everywhere else
+    in this file, just expressed as "don't adjust" rather than "return NaN"
+    since this feeds a multiplication, not a standalone display value.
+    """
+    q = team_query.lower()
+    cf_bearing = next((v for k, v in BALLPARK_CF_BEARING.items() if k in q or q in k), None)
+    if cf_bearing is None or wind_mph is None or wind_mph < 8:
+        return 1.0
+
+    wind_from_deg = _COMPASS_TO_DEGREES.get(wind_direction.upper()) if isinstance(wind_direction, str) else None
+    if wind_from_deg is None:
+        return 1.0
+
+    blowing_out_from = (cf_bearing + 180) % 360
+    diff = min(abs(wind_from_deg - blowing_out_from), 360 - abs(wind_from_deg - blowing_out_from))
+
+    # Real, honest, deliberately modest effect size - a genuine, real wind
+    # effect on HR rate exists, but this is an approximate park-orientation-
+    # based estimate, not a wind-tunnel-verified figure. Capped at +-12%
+    # (mph 8-25 range mapped to 0-12%), scaled down for a crosswind
+    # (full effect only within 45 degrees of dead-on, tapering to zero by
+    # 90 degrees off-axis).
+    speed_factor = min(1.0, max(0.0, (wind_mph - 8) / 17.0))  # 8mph=0, 25mph+=1.0
+    if diff <= 45:
+        angle_factor = 1.0 - (diff / 45.0) * 0.3  # dead-on=1.0, tapering to 0.7 at 45deg
+        return 1.0 + 0.12 * speed_factor * angle_factor
+    elif diff >= 135:
+        angle_factor = 1.0 - ((180 - diff) / 45.0) * 0.3
+        return 1.0 - 0.12 * speed_factor * angle_factor
+    else:
+        return 1.0  # crosswind - genuinely unclear effect, don't guess a direction
+
+
 LEAGUE_AVG_PITCHER_WHIFF = 11.5   # SwStr%, approx midpoint of TIER_BENCHMARKS whiff_pct elite/poor (15/8)
 LEAGUE_AVG_PITCHER_CSW = 27.5     # midpoint of TIER_BENCHMARKS csw_pct elite/poor (31/24)
 LEAGUE_AVG_PITCHER_HARDHIT_AGAINST = 37.0  # midpoint of hardhit_pct_against elite/poor (32/42)
@@ -3175,7 +3222,8 @@ LEAGUE_AVG_BABIP = 0.289
 LEAGUE_HIT_TYPE_SPLIT = {"single": 0.65, "double": 0.20, "triple": 0.02, "home_run": 0.13}
 
 
-def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random) -> str:
+def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random,
+                               park_factor: dict = None, wind_multiplier: float = 1.0) -> str:
     """
     Real, single plate-appearance outcome simulator - the core building
     block everything else in this simulation is built on. Takes ONE real
@@ -3195,6 +3243,21 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random) -> str:
     simulate pitch-by-pitch WITHIN the at-bat (ball one, strike one,
     etc.) that's a real, further layer of detail beyond this first,
     working version.
+
+    REAL FIX (found live - confirmed via direct code check that park
+    factors and weather were completely absent from this entire
+    simulation, despite being correctly wired into the OLDER, separate
+    Poisson-mu system): park_factor (from get_park_factor(), keyed on
+    tonight's HOME team - the park never changes based on which team is
+    hitting) now scales babip (hits_factor - a general contact-to-hit
+    boost, e.g. Coors' thinner air and larger outfield helping balls drop)
+    and, combined with wind_multiplier (from calc_wind_hr_multiplier()),
+    scales the home_run share of the hit-type split specifically -
+    altitude/park dimensions and today's specific wind both act mainly on
+    fly-ball carry, not on whether contact happens at all. Both default to
+    neutral (None / 1.0) so every existing caller keeps working unchanged
+    if it doesn't pass them - same backward-compatible pattern as
+    everywhere else in this file.
     """
     # Real walk adjustment - same signal already proven for the "walks"
     # prop: a wild pitcher (low zone%) facing a disciplined hitter (low
@@ -3280,6 +3343,12 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random) -> str:
     # against delta specifically in his own most-used zone.
     if pd.notna(crosswalk_row.get("pitcher_zone_xba_against_delta")):
         babip = max(0.10, min(0.55, babip + crosswalk_row["pitcher_zone_xba_against_delta"] * 0.5))
+    # REAL FIX - park factor applied here for the first time. hits_factor
+    # of 111 (Coors) means balls in play become hits 11% more often than
+    # league average at this park - same multiplicative convention already
+    # used in the older Poisson-mu system, applied here for consistency.
+    if park_factor:
+        babip = max(0.10, min(0.55, babip * (park_factor.get("hits_factor", 100) / 100.0)))
     hit_rate = bip_rate * babip
     out_rate = bip_rate - hit_rate
 
@@ -3328,6 +3397,15 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random) -> str:
     power_shift = max(-0.6, min(0.6, power_shift))
     hit_split = dict(LEAGUE_HIT_TYPE_SPLIT)
     hit_split["home_run"] = max(0.02, min(0.40, hit_split["home_run"] + power_shift * 0.15))
+    # REAL FIX - park factor + wind applied to home_run share specifically,
+    # not the general hit rate above - altitude/dimensions/wind act on
+    # fly-ball carry, not on whether contact happens. hr_factor of 118
+    # (Coors) plus a real, live wind read (if available) combine
+    # multiplicatively - both defaults are neutral (100/1.0) so this is a
+    # no-op for any caller that doesn't pass them.
+    if park_factor:
+        hit_split["home_run"] *= (park_factor.get("hr_factor", 100) / 100.0)
+    hit_split["home_run"] = max(0.02, min(0.45, hit_split["home_run"] * wind_multiplier))
     hit_split["double"] = max(0.05, min(0.35, hit_split["double"] + power_shift * 0.08))
     remaining = max(0.05, 1.0 - hit_split["home_run"] - hit_split["double"] - hit_split["triple"])
     hit_split["single"] = remaining
@@ -3379,7 +3457,8 @@ LEAGUE_AVG_BULLPEN_ROW = {
 }
 
 
-def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: random.Random) -> dict:
+def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: random.Random,
+                       park_factor: dict = None, wind_multiplier: float = 1.0) -> dict:
     """
     Real, full game simulation - cycles through the actual lineup,
     simulating one plate appearance at a time using simulate_plate_
@@ -3427,7 +3506,7 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
             row = _pick_weighted_pitch_row(lineup_crosswalks[name], rng)
         else:
             row = LEAGUE_AVG_BULLPEN_ROW
-        outcome = simulate_plate_appearance(row, rng)
+        outcome = simulate_plate_appearance(row, rng, park_factor=park_factor, wind_multiplier=wind_multiplier)
 
         hs = hitter_stats[name]
         if outcome == "strikeout":
@@ -3712,7 +3791,8 @@ def simulate_connected_game(home_crosswalks: dict, away_crosswalks: dict,
 
 
 def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
-                              n_simulations: int = 100, random_state: int = 42) -> dict:
+                              n_simulations: int = 100, random_state: int = 42,
+                              park_factor: dict = None, wind_multiplier: float = 1.0) -> dict:
     """
     Real, final piece - runs simulate_one_game() n_simulations times and
     aggregates real, empirical results: for each hitter, across every
@@ -3741,7 +3821,8 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
                       for name in lineup_crosswalks.keys()}
 
     for _ in range(n_simulations):
-        game = simulate_one_game(lineup_crosswalks, starter_avg_outs, rng)
+        game = simulate_one_game(lineup_crosswalks, starter_avg_outs, rng,
+                                  park_factor=park_factor, wind_multiplier=wind_multiplier)
         starter_game_totals = {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0}
         for hitter_line in game["starter_stats"].values():
             for k in starter_game_totals:
