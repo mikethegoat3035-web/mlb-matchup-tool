@@ -23,6 +23,45 @@ import streamlit as st
 import pandas as pd
 import itertools
 import math
+import os
+import concurrent.futures
+
+# Real fix - the actual reported symptom ("loads for a bit then just stops
+# scanning, no error") is the signature of a hung network call, not a
+# crash: pybaseball/MLB-StatsAPI's underlying HTTP requests don't set an
+# explicit timeout anywhere in this codebase, so one slow or stalled
+# request to Baseball Savant/MLB's API can block the entire loop forever -
+# nothing after it ever runs, and nothing raises an exception to even show
+# an error, since the request never actually fails, it just never
+# returns. This wraps one unit of work (one game) in a background thread
+# with a hard wall-clock limit - if it doesn't finish in time, the loop
+# gives up on that one game and moves on, rather than hanging
+# indefinitely.
+BT_PER_GAME_TIMEOUT_SECONDS = 90
+
+
+def _run_with_timeout(fn, args, timeout_seconds):
+    """
+    Runs fn(*args) in a background thread; returns (result, timed_out).
+    Real bug caught and fixed during testing - using the executor as a
+    context manager (`with ThreadPoolExecutor() as executor:`) calls
+    shutdown(wait=True) on exit, which BLOCKS until the hung thread
+    actually finishes - completely defeating the timeout, confirmed by a
+    direct test (a 2-second timeout still took the full 10 seconds of a
+    simulated hang before returning). Fixed by managing the executor
+    manually and calling shutdown(wait=False) - this detaches the still-
+    running thread instead of waiting for it, so a genuinely hung network
+    call is abandoned immediately rather than blocking anyway.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn, *args)
+    try:
+        result = future.result(timeout=timeout_seconds)
+        executor.shutdown(wait=False)
+        return result, False
+    except concurrent.futures.TimeoutError:
+        executor.shutdown(wait=False)
+        return None, True
 from datetime import datetime, timedelta
 
 from prop_model_combined import (
@@ -36,6 +75,7 @@ from prop_model_combined import (
     backtest_pitcher_prop_quality_walk_forward, backtest_quality_score_multi_pitcher,
     get_pitcher_id, backtest_quality_score_all_props,
     get_player_id_from_full_name, pitcher_prop_probabilities, get_park_factor,
+    pull_game_weather, calc_wind_hr_multiplier,
     simulate_combo_hit_rate_from_backtest,
     bootstrap_mu_stability, pull_hitter_game_log, get_mlb_today,
     pull_official_hitter_game_log, HITTER_FANTASY_WEIGHTS,
@@ -153,6 +193,7 @@ else:
     # when available, falling back to the real game_id otherwise.
     label_counts = {}
     sim_game_options = {}
+    sim_game_home_teams = {}
     for _, row in sim_games_df.iterrows():
         base_label = f"{row.get('away_name', '?')} @ {row.get('home_name', '?')}"
         label_counts[base_label] = label_counts.get(base_label, 0) + 1
@@ -169,8 +210,31 @@ else:
         else:
             label = base_label
         sim_game_options[label] = row["game_id"]
+        sim_game_home_teams[label] = row.get("home_name", "")
     sim_game_label = st.selectbox("Pick a real game", list(sim_game_options.keys()), key="sim_game_select")
     sim_game_pk = sim_game_options[sim_game_label]
+    sim_home_team = sim_game_home_teams.get(sim_game_label, "")
+
+    # REAL FIX - park factor and live wind now actually applied to the
+    # simulation, per direct finding that they were completely absent.
+    # Park is determined by the HOME team regardless of which lineup is
+    # hitting right now - the ballpark doesn't change.
+    sim_park_factor = get_park_factor(sim_home_team)
+    st.info(f"⚾ Tonight's park: {sim_park_factor.get('note', 'no specific park data - using neutral')}")
+
+    sim_wind_multiplier = 1.0
+    sim_weather = pull_game_weather(sim_home_team)
+    if "note" in sim_weather and sim_weather.get("wind_mph") is None:
+        st.caption(f"Weather: {sim_weather['note']}")
+    elif sim_weather.get("wind_mph") is not None:
+        sim_wind_multiplier = calc_wind_hr_multiplier(
+            sim_home_team, sim_weather.get("wind_mph"), sim_weather.get("wind_direction"))
+        st.caption(
+            f"🌬️ Live wind: {sim_weather.get('wind_mph')}mph from {sim_weather.get('wind_direction')} "
+            f"({sim_weather.get('short_forecast', '')}) - HR multiplier applied: {sim_wind_multiplier:.3f} "
+            f"({sim_weather.get('note', '')})"
+        )
+
     sim_n_games = st.slider("Number of simulated games", 100, 2000, 1000, step=100, key="sim_n_games_slider",
                              help="1000 is fast (~5 seconds for both lineups combined) and gives real, "
                                   "statistically tighter over_rate/avg estimates than 100 would - "
@@ -194,6 +258,14 @@ else:
             sim_lineup_teams = {}
             sim_pitcher_teams = {}
             combined_lineup_coverage = {}
+            # Real fix - these were already being built (crosswalk has real
+            # xwOBA/xwobacon/whiff/chase per pitch type, pitcher_arsenal has
+            # real usage%/zone%/whiff% per pitch type vs each hand) but
+            # discarded right after feeding the simulation - never saved
+            # anywhere the UI could show them. Captured here so they can be
+            # displayed for real verification below.
+            combined_crosswalks = {}
+            combined_arsenals = {}
 
             # Real, deliberate change - runs BOTH sides automatically
             # instead of making the user pick one. A real game always has
@@ -259,6 +331,7 @@ else:
 
                 if not pitcher_arsenal:
                     continue
+                combined_arsenals[opposing_pitcher["name"]] = pitcher_arsenal
 
                 lineup_crosswalks = {}
                 progress = st.progress(0.0, text=f"Building real crosswalks for the {hitting_side} lineup...")
@@ -274,6 +347,7 @@ else:
                         crosswalk = build_pitch_crosswalk(
                             pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
                         lineup_crosswalks[hitter["name"]] = crosswalk
+                        combined_crosswalks[hitter["name"]] = crosswalk
                         sim_lineup_teams[hitter["name"]] = hitting_side
                         # Real, new check - what real % of the PITCHER'S
                         # actual, usage-weighted arsenal does this hitter
@@ -302,7 +376,8 @@ else:
                 if lineup_crosswalks:
                     with st.spinner(f"Running {sim_n_games} full, real simulated games for the {hitting_side} lineup..."):
                         sim_results = simulate_matchup_n_times(
-                            lineup_crosswalks, starter_avg_outs, n_simulations=sim_n_games)
+                            lineup_crosswalks, starter_avg_outs, n_simulations=sim_n_games,
+                            park_factor=sim_park_factor, wind_multiplier=sim_wind_multiplier)
                     combined_hitters_series.update(sim_results["hitters"])
                     # Real, genuine gap closed - the starter's OWN real
                     # simulated stats (strikeouts/outs/hits_allowed/
@@ -321,6 +396,53 @@ else:
                 st.session_state["sim_lineup_teams"] = sim_lineup_teams
                 st.session_state["sim_pitcher_teams"] = sim_pitcher_teams
                 st.session_state["sim_lineup_coverage"] = combined_lineup_coverage
+                st.session_state["sim_crosswalks"] = combined_crosswalks
+                st.session_state["sim_arsenals"] = combined_arsenals
+
+    if st.session_state.get("sim_crosswalks") or st.session_state.get("sim_arsenals"):
+        st.divider()
+        st.subheader("🔍 Verify real data - see the actual numbers behind the simulation")
+        st.caption(
+            "This is the same real, per-pitch-type data (xwOBA, xwobacon, whiff%, zone%, chase%, "
+            "hardhit%, launch angle, etc.) that just fed the simulation above - shown directly so "
+            "you can confirm real numbers are actually being pulled and used, not just trust the "
+            "final result."
+        )
+        verify_tab1, verify_tab2 = st.tabs(["Hitter crosswalks", "Pitcher arsenals"])
+
+        with verify_tab1:
+            if st.session_state.get("sim_crosswalks"):
+                verify_hitter = st.selectbox(
+                    "Pick a real hitter", list(st.session_state["sim_crosswalks"].keys()),
+                    key="verify_hitter_select",
+                )
+                cw = st.session_state["sim_crosswalks"][verify_hitter]
+                st.dataframe(cw, width='stretch')
+                st.caption(
+                    f"One row per real pitch type this pitcher throws at meaningful usage - "
+                    f"{verify_hitter}'s real, actual numbers against each, from real Statcast "
+                    f"pitch-level data this season."
+                )
+            else:
+                st.info("No hitter crosswalks captured from the last run.")
+
+        with verify_tab2:
+            if st.session_state.get("sim_arsenals"):
+                verify_pitcher = st.selectbox(
+                    "Pick a real pitcher", list(st.session_state["sim_arsenals"].keys()),
+                    key="verify_pitcher_select",
+                )
+                arsenal = st.session_state["sim_arsenals"][verify_pitcher]
+                # PitchProfile is a list of dataclass objects, not a
+                # DataFrame - convert for display.
+                arsenal_df = pd.DataFrame([vars(p) for p in arsenal]) if arsenal else pd.DataFrame()
+                st.dataframe(arsenal_df, width='stretch')
+                st.caption(
+                    f"{verify_pitcher}'s real arsenal - one row per pitch type per batter-hand faced, "
+                    f"from his real, recent (68-day) Statcast pitch-level data."
+                )
+            else:
+                st.info("No pitcher arsenals captured from the last run.")
 
     if "sim_results" in st.session_state:
         st.subheader("Enter each real line to check against the simulated games")
@@ -743,7 +865,48 @@ st.caption(
     "Pulls every real, COMPLETED game in this range automatically - no need to "
     "look up and type in individual game_pk values one at a time. A real, "
     "trustworthy sample needs genuine variety (different pitchers, different "
-    "days), so aim for roughly 10-15+ real games, not just one."
+    "days), so aim for roughly 10-15+ real games for a statistically solid read."
+)
+
+# Real, deliberate speed/rigor tradeoff - added under real time pressure
+# (games starting soon, no time for a full 10-15+ game run). Quick mode
+# caps to the first few real games found and uses fewer simulations per
+# game - genuinely faster, but the tradeoff is real too: a 3-game sample
+# is nowhere near as statistically solid as a 10-15+ game one. This is
+# "get SOME real signal fast," not a replacement for the full run when
+# there's actually time for it.
+bt_quick_mode = st.checkbox(
+    "⚡ Quick mode - fewer games, fewer sims per game, much faster (less statistically solid)",
+    value=False, key="bt_quick_mode",
+)
+if bt_quick_mode:
+    bt_quick_max_games = st.slider("Max real games to backtest", 1, 10, 3, key="bt_quick_max_games")
+    bt_quick_n_sims = st.select_slider("Simulations per game side", options=[50, 100, 200, 300, 500],
+                                        value=100, key="bt_quick_n_sims")
+    st.caption(
+        f"Quick mode: will stop after {bt_quick_max_games} real game(s), "
+        f"{bt_quick_n_sims} simulations per side instead of 500. Real signal, "
+        f"just a much smaller, noisier real sample than a full run."
+    )
+
+BT_RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bt_accumulated_results.csv")
+
+if "bt_accumulated" not in st.session_state:
+    if os.path.exists(BT_RESULTS_FILE):
+        try:
+            st.session_state.bt_accumulated = pd.read_csv(BT_RESULTS_FILE)
+        except Exception:
+            st.session_state.bt_accumulated = pd.DataFrame()
+    else:
+        st.session_state.bt_accumulated = pd.DataFrame()
+
+st.caption(
+    "Results save to disk after every single game - if the app restarts mid-run "
+    "(this platform's free tier can do that under memory pressure on long runs), "
+    "just click Run again with the same dates and it'll pick up only the games "
+    "not already saved. A hung network call on any one game is also abandoned "
+    f"automatically after {BT_PER_GAME_TIMEOUT_SECONDS}s instead of freezing the "
+    "whole run."
 )
 
 if st.button("Run real backtest for every game in this range", key="bt_run_button"):
@@ -756,40 +919,82 @@ if st.button("Run real backtest for every game in this range", key="bt_run_butto
             games_df = None
             st.error(f"Real error pulling the real schedule: {e}")
 
-        all_rows = []
+        total_rows_this_run = 0
         if games_df is None or games_df.empty:
             st.warning("No real, completed games found in that range.")
         else:
-            st.info(f"Found {len(games_df)} real, completed games - running the real backtest "
-                    f"on each (both sides automatically).")
-            progress = st.progress(0.0, text="Starting...")
-            for i, (_, game) in enumerate(games_df.iterrows()):
-                game_pk = game.get("game_id")
-                game_date = str(game.get("game_date"))
-                for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
-                    try:
-                        result = backtest_simulation_for_historical_game(
-                            int(game_pk), game_date, hitting_side, pitching_side, n_simulations=500)
-                    except Exception:
-                        continue
-                    if "error" in result:
-                        continue
-                    all_rows.extend(backtest_comparison_rows(result))
-                progress.progress((i + 1) / len(games_df),
-                                   text=f"Backtested {i+1}/{len(games_df)} real games "
-                                        f"({len(all_rows)} real rows so far)...")
-            progress.empty()
+            already_done_pks = set()
+            if not st.session_state.bt_accumulated.empty and "game_pk" in st.session_state.bt_accumulated.columns:
+                already_done_pks = set(st.session_state.bt_accumulated["game_pk"].dropna().astype(int).tolist())
+            games_to_run = games_df[~games_df["game_id"].astype(int).isin(already_done_pks)] if already_done_pks else games_df
+            skipped_count = len(games_df) - len(games_to_run)
 
-        if not all_rows:
-            st.warning("No real, comparable rows came back for this range.")
-        else:
-            if "bt_accumulated" not in st.session_state:
-                st.session_state.bt_accumulated = pd.DataFrame(all_rows)
+            # Real quick-mode cap - only take the first N games not already
+            # done, and use fewer simulations per side. Genuinely faster,
+            # genuinely noisier - see the checkbox's own caption above.
+            n_sims_to_use = 500
+            if bt_quick_mode:
+                games_to_run = games_to_run.head(bt_quick_max_games)
+                n_sims_to_use = bt_quick_n_sims
+
+            if games_to_run.empty:
+                st.info(f"All {len(games_df)} real games in this range are already saved from a prior run - "
+                        f"nothing new to process. Clear the accumulated data below if you want to re-run them.")
             else:
-                st.session_state.bt_accumulated = pd.concat(
-                    [st.session_state.bt_accumulated, pd.DataFrame(all_rows)], ignore_index=True)
-            st.success(f"Added {len(all_rows)} real comparison rows - "
-                           f"{len(st.session_state.bt_accumulated)} total accumulated so far.")
+                if skipped_count:
+                    st.info(f"Skipping {skipped_count} real game(s) already saved from a prior run - "
+                            f"processing the remaining {len(games_to_run)}.")
+                progress = st.progress(0.0, text="Starting...")
+                timed_out_games = []
+                for i, (_, game) in enumerate(games_to_run.iterrows()):
+                    game_pk = game.get("game_id")
+                    game_date = str(game.get("game_date"))
+                    game_rows = []
+                    for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
+                        try:
+                            result, timed_out = _run_with_timeout(
+                                backtest_simulation_for_historical_game,
+                                (int(game_pk), game_date, hitting_side, pitching_side, n_sims_to_use),
+                                BT_PER_GAME_TIMEOUT_SECONDS,
+                            )
+                        except Exception:
+                            continue
+                        if timed_out:
+                            timed_out_games.append(f"{game_pk} ({hitting_side} lineup)")
+                            continue
+                        if result is None or "error" in result:
+                            continue
+                        game_rows.extend(backtest_comparison_rows(result))
+
+                    if game_rows:
+                        game_df = pd.DataFrame(game_rows)
+                        if st.session_state.bt_accumulated.empty:
+                            st.session_state.bt_accumulated = game_df
+                        else:
+                            st.session_state.bt_accumulated = pd.concat(
+                                [st.session_state.bt_accumulated, game_df], ignore_index=True)
+                        file_exists = os.path.exists(BT_RESULTS_FILE)
+                        game_df.to_csv(BT_RESULTS_FILE, mode="a", header=not file_exists, index=False)
+                        total_rows_this_run += len(game_rows)
+
+                    progress.progress((i + 1) / len(games_to_run),
+                                       text=f"Backtested {i+1}/{len(games_to_run)} real games "
+                                            f"({total_rows_this_run} real rows saved so far"
+                                            + (f", {len(timed_out_games)} timed out" if timed_out_games else "")
+                                            + ")...")
+                progress.empty()
+
+                if timed_out_games:
+                    st.warning(f"{len(timed_out_games)} real (game, side) pair(s) took longer than "
+                               f"{BT_PER_GAME_TIMEOUT_SECONDS}s and were skipped instead of freezing "
+                               f"the whole run: {', '.join(timed_out_games)}")
+
+                if total_rows_this_run == 0:
+                    st.warning("No real, comparable rows came back for the games processed this run.")
+                else:
+                    st.success(f"Added {total_rows_this_run} real comparison rows - "
+                               f"{len(st.session_state.bt_accumulated)} total accumulated so far "
+                               f"(saved to disk, survives an app restart).")
 
 if st.session_state.get("bt_accumulated") is not None and not st.session_state.bt_accumulated.empty:
     acc = st.session_state.bt_accumulated
@@ -877,6 +1082,8 @@ if st.session_state.get("bt_accumulated") is not None and not st.session_state.b
 
     if st.button("Clear accumulated backtest data", key="bt_clear_button"):
         st.session_state.bt_accumulated = pd.DataFrame()
+        if os.path.exists(BT_RESULTS_FILE):
+            os.remove(BT_RESULTS_FILE)
         st.rerun()
 
 
