@@ -3394,7 +3394,24 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random,
         power_shift += crosswalk_row["hitter_zone_barrel_delta"] / 40.0
     if pd.notna(crosswalk_row.get("hitter_zone_ev_delta")):
         power_shift += crosswalk_row["hitter_zone_ev_delta"] / 25.0
-    power_shift = max(-0.6, min(0.6, power_shift))
+    # REAL BUG FOUND AND FIXED (confirmed via a real hitter's real crosswalk
+    # data - Zach Neto vs a real fastball, real 2025 Statcast numbers):
+    # this bound used to be +-0.6, but the raw power_shift for that exact
+    # real, elite matchup computed to 1.47 - meaning 59% of his real,
+    # legitimate power signal (iso=0.284, barrel%=14.8, hardhit%=48.1,
+    # xwobacon=0.437, all genuinely elite) was being silently thrown away.
+    # This wasn't an edge case: iso alone contributed +0.40, more than two
+    # thirds of the OLD cap by itself - any hitter with several real,
+    # above-average power indicators simultaneously would blow past +-0.6.
+    # This is the confirmed root cause of "not a single hitter shows a
+    # favorable mu" - genuinely great matchups were being compressed down
+    # to the same ceiling as merely-decent ones. Loosened to +-2.5, with
+    # comfortable headroom above the real 1.47 case found - the downstream
+    # hit_split clamp (home_run capped at 40% of all hits) already
+    # provides a separate, real sanity ceiling on the final output, so
+    # this specific bound doesn't need to be the only thing preventing a
+    # nonsensical result.
+    power_shift = max(-2.5, min(2.5, power_shift))
     hit_split = dict(LEAGUE_HIT_TYPE_SPLIT)
     hit_split["home_run"] = max(0.02, min(0.40, hit_split["home_run"] + power_shift * 0.15))
     # REAL FIX - park factor + wind applied to home_run share specifically,
