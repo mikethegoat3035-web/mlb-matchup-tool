@@ -91,6 +91,9 @@ from prop_model_combined import (
     LEAGUE_AVG_PITCHER_WALKS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_WALKS_ALLOWED_PER_START,
     LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START, LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START,
     LEAGUE_AVG_PITCHER_FANTASY_PER_START, LEAGUE_STD_PITCHER_FANTASY_PER_START,
+    build_pitcher_tendency_profile, calc_original_method_match, attack_zone_breakdown,
+    calc_lineup_weighted_pitcher_read, calc_prop_lineup_vulnerability,
+    calc_pitcher_fantasy_lineup_read, calc_doubly_confirmed_hitter_signal,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -164,6 +167,218 @@ if "pending_games" in st.session_state:
 
 
 
+st.header("🎯 Original Method Matcher")
+st.caption(
+    "Real, direct implementation of the user's own, historically-proven manual method - "
+    "not the older, looser continuous-blend scoring elsewhere in this app. For a real, "
+    "specific pitcher, builds his real tendency profile (usage%, zone%, CSW%, SwStr%, "
+    "zone-whiff%, chase%, chase-whiff%) with NO league-benchmark judgment attached, then "
+    "checks EVERY real hitter in the opposing lineup individually - hard .360+ xwOBA / "
+    ".450+ xwOBACON thresholds (both adjustable below), checked per pitch type, against "
+    "the pitcher's specific real throwing hand, requiring a real MAJORITY of his "
+    "meaningfully-used pitches to individually clear both bars. This is deliberately "
+    "stricter than the older scoring - fewer real matches showing up here is the "
+    "intended, correct result, not a bug."
+)
+st.caption(
+    "Honest status: mechanically verified against real, hand-built test cases (confirmed "
+    "correct majority-logic and handedness-specificity) but not yet run against a real, "
+    "live slate in this exact app flow - watch the first few real results closely."
+)
+
+omm_col1, omm_col2, omm_col3 = st.columns(3)
+with omm_col1:
+    omm_min_xwoba = st.number_input("Min real xwOBA per pitch", min_value=0.200, max_value=0.500,
+                                      value=0.360, step=0.005, format="%.3f", key="omm_min_xwoba")
+with omm_col2:
+    omm_min_xwobacon = st.number_input("Min real xwOBACON per pitch", min_value=0.250, max_value=0.600,
+                                         value=0.450, step=0.005, format="%.3f", key="omm_min_xwobacon")
+with omm_col3:
+    omm_min_usage = st.number_input("Min real pitch usage% to count as \"meaningfully used\"",
+                                      min_value=0.0, max_value=40.0, value=10.0, step=1.0, key="omm_min_usage")
+
+if st.button("Load today's real games", key="omm_load_games_btn"):
+    with st.spinner("Pulling today's real schedule..."):
+        try:
+            st.session_state.omm_games_df = pull_todays_games()
+        except Exception as e:
+            st.error(f"Couldn't pull today's real schedule: {e}")
+            st.session_state.omm_games_df = pd.DataFrame()
+
+omm_games_df = st.session_state.get("omm_games_df")
+if omm_games_df is None or omm_games_df.empty:
+    st.info("Click \"Load today's real games\" above to pick a real matchup.")
+else:
+    omm_label_col = "matchup" if "matchup" in omm_games_df.columns else omm_games_df.columns[0]
+    omm_game_label = st.selectbox("Pick a real game", omm_games_df[omm_label_col].tolist(), key="omm_game_select")
+    omm_row = omm_games_df[omm_games_df[omm_label_col] == omm_game_label].iloc[0]
+    omm_game_pk = omm_row.get("game_pk")
+
+    if st.button("Run Original Method check for both real pitchers", key="omm_run_btn"):
+        with st.spinner("Pulling real, confirmed lineups and both real starters..."):
+            try:
+                omm_lineup_data = pull_confirmed_lineup(omm_game_pk)
+            except Exception as e:
+                st.error(f"Couldn't pull the real, confirmed lineup: {e}")
+                omm_lineup_data = None
+
+        if omm_lineup_data is None or omm_lineup_data.get("lineup_status") != "confirmed":
+            st.warning("This real game doesn't have a fully confirmed lineup yet (both batting "
+                       "orders + both starting pitchers) - try again closer to first pitch.")
+        else:
+            today_str = get_mlb_today().strftime("%Y-%m-%d")
+            pitcher_recent_start = (datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=68)).strftime("%Y-%m-%d")
+            omm_results = {}
+
+            for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
+                real_lineup = omm_lineup_data.get(hitting_side, [])
+                opposing_pitcher = get_probable_pitcher(omm_game_pk, pitching_side)
+                if not real_lineup or opposing_pitcher is None:
+                    continue
+
+                with st.spinner(f"Building {opposing_pitcher['name']}'s real tendency profile..."):
+                    try:
+                        pid = opposing_pitcher["player_id"]
+                        pitcher_pitches = pull_pitcher_pitches(pid, pitcher_recent_start, today_str)
+                        pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
+                        pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
+                                        if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
+                        pitcher_zone_breakdown = attack_zone_breakdown(pitcher_pitches)
+                        tendency_profile = build_pitcher_tendency_profile(pitcher_arsenal, pitcher_zone_breakdown)
+                    except Exception as e:
+                        st.error(f"Couldn't build {opposing_pitcher['name']}'s real profile: {e}")
+                        continue
+
+                real_matches = []
+                hitter_profiles_by_order_slot = {}
+                hitter_hand_by_order_slot = {}
+                for hitter in real_lineup:
+                    try:
+                        h_pitches = pull_batter_pitches(hitter["player_id"], f"{today_str[:4]}-03-20", today_str)
+                        batter_hand = (h_pitches["stand"].mode().iloc[0]
+                                      if not h_pitches.empty and "stand" in h_pitches else "R")
+                        hitter_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
+                        hitter_profiles_by_order_slot[hitter.get("order_slot")] = hitter_profile
+                        hitter_hand_by_order_slot[hitter.get("order_slot")] = batter_hand
+                        match = calc_original_method_match(
+                            pitcher_arsenal, hitter_profile, pitcher_hand,
+                            min_pitch_usage_pct=omm_min_usage, min_xwoba=omm_min_xwoba,
+                            min_xwobacon=omm_min_xwobacon,
+                        )
+                        if match.get("usable") and match.get("real_majority_match"):
+                            real_matches.append({
+                                "hitter": hitter["name"],
+                                "pitches_qualifying": f"{match['pitches_qualifying']}/{match['pitches_scored']}",
+                                "read": match["read"],
+                            })
+                    except Exception:
+                        continue
+
+                # Real, aggregate, PA-weighted read for pitcher props
+                # specifically - reuses the same per-hitter profiles just
+                # built above, no re-pulling.
+                lineup_weighted_read = calc_lineup_weighted_pitcher_read(
+                    pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot, pitcher_hand,
+                    min_pitch_usage_pct=omm_min_usage, min_xwoba=omm_min_xwoba,
+                    min_xwobacon=omm_min_xwobacon,
+                )
+
+                # Real, prop-specific checks - different question from the
+                # contact-quality read above: for EACH real pitcher prop,
+                # does his identified signature pitch for that specific
+                # prop actually get exploited by MOST of the real, PA-
+                # weighted lineup he'll face tonight, using the metrics
+                # that matter for that specific prop.
+                prop_reads = {}
+                for prop_type in ["strikeouts", "outs", "hits_allowed", "walks_allowed", "pitcher_earned_runs"]:
+                    prop_reads[prop_type] = calc_prop_lineup_vulnerability(
+                        pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
+                        hitter_hand_by_order_slot, prop_type, min_pitch_usage_pct=omm_min_usage,
+                    )
+
+                # Real pitcher fantasy read - combines the outs/K/ER
+                # component reads above using the real point values,
+                # rather than a separate signature-pitch mechanism.
+                pf_read = calc_pitcher_fantasy_lineup_read(
+                    pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
+                    hitter_hand_by_order_slot, min_pitch_usage_pct=omm_min_usage,
+                )
+
+                omm_results[opposing_pitcher["name"]] = {
+                    "tendency_profile": tendency_profile,
+                    "real_matches": real_matches,
+                    "lineup_weighted_read": lineup_weighted_read,
+                    "prop_reads": prop_reads,
+                    "pf_read": pf_read,
+                }
+
+            st.session_state.omm_results = omm_results
+
+    if st.session_state.get("omm_results"):
+        for pitcher_name, data in st.session_state.omm_results.items():
+            st.subheader(f"vs {pitcher_name}")
+            with st.expander("Real pitcher tendency profile (no benchmark judgment attached)"):
+                st.dataframe(pd.DataFrame(data["tendency_profile"]), width="stretch")
+
+            lwr = data.get("lineup_weighted_read", {})
+            if lwr.get("usable"):
+                st.metric(
+                    "Real, PA-weighted share of tonight's lineup that qualifies",
+                    f"{lwr['weighted_qualifying_share']*100:.1f}%",
+                    help="Weighted by real expected plate appearances per batting-order slot - "
+                         "the top of the order counts for more, since he genuinely faces them "
+                         "more often in a real game. This is the real signal for pitcher props "
+                         "(Ks/Outs/Hits-Walks-ERs Allowed/Fantasy) specifically - a whole-game "
+                         "outcome should reflect the WHOLE real lineup, weighted correctly, not "
+                         "just a simple headcount of qualifying hitters.",
+                )
+                with st.expander("Per-hitter real PA weighting detail"):
+                    st.dataframe(pd.DataFrame(lwr["per_hitter"]), width="stretch", hide_index=True)
+
+            st.markdown("**Real, per-prop signature-pitch vulnerability:**")
+            PROP_DISPLAY_LABELS = {
+                "strikeouts": "Strikeouts", "outs": "Outs", "hits_allowed": "Hits Allowed",
+                "walks_allowed": "Walks Allowed", "pitcher_earned_runs": "Earned Runs Allowed",
+            }
+            prop_reads = data.get("prop_reads", {})
+            prop_cols = st.columns(len(PROP_DISPLAY_LABELS))
+            for col, (prop_type, label) in zip(prop_cols, PROP_DISPLAY_LABELS.items()):
+                pr = prop_reads.get(prop_type, {})
+                with col:
+                    if pr.get("usable"):
+                        st.metric(label, f"{pr['weighted_vulnerable_share']*100:.1f}%")
+                    else:
+                        st.metric(label, "—")
+            with st.expander("Per-prop real detail (signature pitch used + per-hitter breakdown)"):
+                for prop_type, label in PROP_DISPLAY_LABELS.items():
+                    pr = prop_reads.get(prop_type, {})
+                    if not pr.get("usable"):
+                        continue
+                    st.markdown(f"**{label}** — {pr['read']}")
+                    for hand, primary in pr.get("primary_pitches_by_hand", {}).items():
+                        if primary.get("usable"):
+                            st.caption(f"Real signature pitch vs {hand}HH: **{primary['primary_pitch'].pitch_type}**")
+                    st.dataframe(pd.DataFrame(pr["per_hitter"]), width="stretch", hide_index=True)
+                    st.divider()
+
+            pf = data.get("pf_read", {})
+            if pf.get("usable"):
+                st.metric(
+                    "Real Pitcher Fantasy net favorability (Outs/K/ER components, real point values)",
+                    f"{pf['net_favorability']:+.2f}",
+                    help=f"Outs share: {pf['outs_share']*100:.1f}% | K share: {pf['k_share']*100:.1f}% | "
+                         f"ER-vulnerable share: {pf['er_vulnerable_share']*100:.1f}%. {pf['excludes']}",
+                )
+                st.caption(f"Excludes: {pf['excludes']}")
+
+            if data["real_matches"]:
+                st.success(f"{len(data['real_matches'])} real hitter(s) clear your Original Method bar:")
+                st.dataframe(pd.DataFrame(data["real_matches"]), width="stretch", hide_index=True)
+            else:
+                st.info("No real hitter in this lineup clears a real majority of the pitcher's "
+                        "meaningfully-used pitches at these thresholds.")
+
+st.divider()
 st.header("🎮 Full Matchup Simulation")
 st.caption(
     "Real, pitch-by-pitch simulation of the actual real lineup against the "
@@ -589,6 +804,10 @@ else:
                     & (stage1_df["coverage"] >= min_coverage)
                 ].sort_values("zscore", ascending=False)
                 real_survivor_count = len(survivors)
+                # Purely additive - lets a separate, new cross-reference
+                # section read this later, without touching any of the
+                # computation above.
+                st.session_state["stage1_survivors"] = survivors
 
                 # Real, practical cap - the three sliders above answer
                 # "how strict," but tuning them to land on a specific,
@@ -1091,3 +1310,48 @@ if st.session_state.get("bt_accumulated") is not None and not st.session_state.b
 
 
 
+
+st.divider()
+st.header("🔗 Combined Verdict — Sim Stage 1 vs Original Method")
+st.caption(
+    "Real, low-risk cross-reference - reads what BOTH sections above already "
+    "computed for the same real game, without touching either one's own "
+    "internal math. Run both sections above first for the same real game, "
+    "then check here for any hitter that shows up in both."
+)
+
+_stage1_survivors = st.session_state.get("stage1_survivors")
+_omm_results = st.session_state.get("omm_results")
+
+if _stage1_survivors is None or _stage1_survivors.empty:
+    st.info("Run the Full Matchup Simulation's Stage 1 above first (for this real game).")
+elif not _omm_results:
+    st.info("Run the Original Method Matcher above first (for this real game).")
+else:
+    # Real, direct cross-reference by player name - both sections show
+    # the same real game's players, so a name match is a genuine match,
+    # not a coincidence.
+    _sim_hitter_names = set(_stage1_survivors[_stage1_survivors["side"] == "hitter"]["player"])
+    combined_rows = []
+    for pitcher_name, data in _omm_results.items():
+        for match in data.get("real_matches", []):
+            hitter_name = match["hitter"]
+            sim_cleared = hitter_name in _sim_hitter_names
+            om_result = {"usable": True, "real_majority_match": True}  # already filtered to real_matches only
+            sim_result = {"cleared_stage1": sim_cleared}
+            blend = calc_doubly_confirmed_hitter_signal(sim_result, om_result)
+            combined_rows.append({
+                "hitter": hitter_name, "vs_pitcher": pitcher_name,
+                "sim_stage1_cleared": sim_cleared, "original_method_cleared": True,
+                "verdict": blend["verdict"],
+            })
+
+    if not combined_rows:
+        st.info("No real hitter cleared the Original Method bar yet for this game - nothing to cross-reference.")
+    else:
+        combined_df = pd.DataFrame(combined_rows)
+        doubly = combined_df[combined_df["verdict"].str.startswith("DOUBLY")]
+        if not doubly.empty:
+            st.success(f"{len(doubly)} real hitter(s) doubly confirmed by both signals:")
+            st.dataframe(doubly, width="stretch", hide_index=True)
+        st.dataframe(combined_df, width="stretch", hide_index=True)
