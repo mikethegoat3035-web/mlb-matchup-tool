@@ -714,10 +714,19 @@ else:
                 hitter_min_zscore = st.slider("Hitter minimum edge (real std devs above tonight's own 9-man field)",
                                         0.0, 2.0, 0.3, step=0.1, key="sim_hitter_min_zscore")
             with fcol2:
+                # REAL FIX - recalibrated using real, live data from an
+                # actual run (2026-09-06). Confirmed directly: real hitter
+                # CVs for these low-count stats (total_bases, hits_runs_rbi)
+                # cluster 0.93-1.53 even for genuinely strong hitters - the
+                # earlier 0.7 guess was still far too strict, not just
+                # slightly off. Real pitcher CVs ran 0.26-1.02 in the same
+                # data, with a real, strong edge (z=0.86) failing only
+                # because it barely missed the old 0.6 cap - raised
+                # slightly to give real, strong edges room.
                 pitcher_max_cv = st.slider("Pitcher maximum coefficient of variation",
-                                    0.1, 1.5, 0.6, step=0.05, key="sim_pitcher_max_cv")
+                                    0.1, 1.5, 0.75, step=0.05, key="sim_pitcher_max_cv")
                 hitter_max_cv = st.slider("Hitter maximum coefficient of variation",
-                                    0.1, 1.5, 0.7, step=0.05, key="sim_hitter_max_cv")
+                                    0.1, 2.0, 1.2, step=0.05, key="sim_hitter_max_cv")
             min_coverage = st.slider(
                 "Minimum real data coverage for hitters (% of the pitcher's real, "
                 "usage-weighted arsenal the hitter has a genuine sample against)",
