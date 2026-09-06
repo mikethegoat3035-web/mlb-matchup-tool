@@ -699,13 +699,25 @@ else:
                 "rest of tonight's own field - genuinely above-average AND consistent "
                 "(not just a few simulated outlier games carrying the number)."
             )
+            st.caption(
+                "Real, reasoned adjustment - hitters are compared against their own real "
+                "9-man lineup (a genuinely harder bar - only the top few can ever clear a "
+                "positive z-score), while pitchers compare against a fixed league baseline "
+                "(an easier bar). Separate, looser defaults for hitters below address this "
+                "real, structural asymmetry - not verified against live data (no network "
+                "access in this environment), so watch the first real day closely."
+            )
             fcol1, fcol2 = st.columns(2)
             with fcol1:
-                min_zscore = st.slider("Minimum edge (real std devs above tonight's own field)",
-                                        0.0, 2.0, 0.5, step=0.1, key="sim_min_zscore")
+                pitcher_min_zscore = st.slider("Pitcher minimum edge (real std devs above league baseline)",
+                                        0.0, 2.0, 0.5, step=0.1, key="sim_pitcher_min_zscore")
+                hitter_min_zscore = st.slider("Hitter minimum edge (real std devs above tonight's own 9-man field)",
+                                        0.0, 2.0, 0.3, step=0.1, key="sim_hitter_min_zscore")
             with fcol2:
-                max_cv = st.slider("Maximum coefficient of variation (lower = more consistent)",
-                                    0.1, 1.5, 0.6, step=0.05, key="sim_max_cv")
+                pitcher_max_cv = st.slider("Pitcher maximum coefficient of variation",
+                                    0.1, 1.5, 0.6, step=0.05, key="sim_pitcher_max_cv")
+                hitter_max_cv = st.slider("Hitter maximum coefficient of variation",
+                                    0.1, 1.5, 0.7, step=0.05, key="sim_hitter_max_cv")
             min_coverage = st.slider(
                 "Minimum real data coverage for hitters (% of the pitcher's real, "
                 "usage-weighted arsenal the hitter has a genuine sample against)",
@@ -799,8 +811,10 @@ else:
                     lambda r: coverage_map.get(r["player"], 100.0) if r["side"] == "hitter" else 100.0, axis=1)
 
                 survivors = stage1_df[
-                    (stage1_df["zscore"] >= min_zscore)
-                    & (stage1_df["cv"].fillna(99) <= max_cv)
+                    (
+                        ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= hitter_min_zscore) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
+                        | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= pitcher_min_zscore) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
+                    )
                     & (stage1_df["coverage"] >= min_coverage)
                 ].sort_values("zscore", ascending=False)
                 real_survivor_count = len(survivors)
