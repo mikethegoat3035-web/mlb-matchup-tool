@@ -167,6 +167,106 @@ if "pending_games" in st.session_state:
 
 
 
+st.header("🔍 League-Wide Pitcher Quality Scan")
+st.caption(
+    "Real, direct scan of every real starting pitcher across today's real games - "
+    "shows his own real, weighted-average key metrics (whiff%, CSW%, putaway%, "
+    "avg velo, avg spin rate) with a real tier grade (Elite/Good/Average/Poor) "
+    "against the same real TIER_BENCHMARKS used elsewhere in this file. Built "
+    "specifically as a fast, real diagnostic - no simulation required, so you can "
+    "quickly see who's genuinely strong or weak today and export the raw numbers "
+    "for review, rather than running a full matchup simulation per game just to "
+    "check pitcher quality."
+)
+st.caption(
+    "Honest, real caveat carried over from the Original Method Matcher above: "
+    "almost every real, rostered MLB starter already clears a competent bar on "
+    "his primary pitches (survivorship bias), so these grades alone won't always "
+    "sharply separate a great matchup from an average one - but they're a real, "
+    "direct, fast way to spot genuine outliers in either direction."
+)
+
+if st.button("Scan all of today's real starting pitchers", key="league_scan_pitchers_btn"):
+    with st.spinner("Pulling today's real schedule..."):
+        try:
+            scan_games_df = pull_todays_games()
+        except Exception as e:
+            st.error(f"Couldn't pull today's real schedule: {e}")
+            scan_games_df = pd.DataFrame()
+
+    if scan_games_df is None or scan_games_df.empty:
+        st.info("No real games found for today.")
+    else:
+        scan_rows = []
+        scan_errors = []
+        progress = st.progress(0.0)
+        for i, (_, g) in enumerate(scan_games_df.iterrows()):
+            game_pk = g.get("game_pk")
+            for side in ["home", "away"]:
+                try:
+                    p_info = get_probable_pitcher(game_pk, side)
+                    if not p_info or not p_info.get("player_id"):
+                        continue
+                    pid = p_info["player_id"]
+                    pname = p_info.get("name", "Unknown")
+                    recent_start = (get_mlb_today() - timedelta(days=68)).strftime("%Y-%m-%d")
+                    today_str = get_mlb_today().strftime("%Y-%m-%d")
+                    pitches = pull_pitcher_pitches(pid, recent_start, today_str)
+                    arsenal = build_arsenal_profile(pitches)
+                    if not arsenal:
+                        continue
+                    # Real, usage%-weighted average across his real
+                    # arsenal (both hands combined) - one real, summary
+                    # row per pitcher rather than one row per pitch type,
+                    # so this stays scannable across a whole day's slate.
+                    total_usage = sum(p.usage_pct for p in arsenal) or 1
+                    w_whiff = sum(p.whiff_pct * p.usage_pct for p in arsenal if pd.notna(p.whiff_pct)) / total_usage
+                    w_csw = sum(p.csw_pct * p.usage_pct for p in arsenal if pd.notna(p.csw_pct)) / total_usage
+                    w_velo = sum(p.avg_velo * p.usage_pct for p in arsenal if pd.notna(p.avg_velo)) / total_usage
+                    w_spin = sum(p.avg_spin_rate * p.usage_pct for p in arsenal if pd.notna(p.avg_spin_rate)) / total_usage
+
+                    def _grade(val, metric):
+                        b = TIER_BENCHMARKS.get(metric)
+                        if b is None or pd.isna(val):
+                            return "n/a"
+                        if b["direction"] == "high":
+                            if val >= b["elite"]:
+                                return "Elite"
+                            if val <= b["poor"]:
+                                return "Poor"
+                        else:
+                            if val <= b["elite"]:
+                                return "Elite"
+                            if val >= b["poor"]:
+                                return "Poor"
+                        return "Average"
+
+                    scan_rows.append({
+                        "team": g.get("home_team") if side == "home" else g.get("away_team"),
+                        "pitcher": pname, "real_whiff_pct": round(w_whiff, 1),
+                        "whiff_grade": _grade(w_whiff, "whiff_pct"),
+                        "real_csw_pct": round(w_csw, 1), "csw_grade": _grade(w_csw, "csw_pct"),
+                        "real_avg_velo": round(w_velo, 1),
+                        "real_avg_spin_rate": round(w_spin, 0),
+                        "spin_grade": _grade(w_spin, "avg_spin_rate"),
+                    })
+                except Exception as e:
+                    scan_errors.append(f"{side} pitcher, game {game_pk}: {type(e).__name__}: {e}")
+            progress.progress((i + 1) / len(scan_games_df))
+
+        if scan_rows:
+            scan_df = pd.DataFrame(scan_rows)
+            st.dataframe(scan_df, width='stretch')
+            st.caption(f"Real pitchers scanned: {len(scan_df)} across {len(scan_games_df)} real games.")
+        else:
+            st.info("No real pitcher data could be pulled for today's games.")
+        if scan_errors:
+            with st.expander(f"{len(scan_errors)} real errors during the scan"):
+                for e in scan_errors:
+                    st.write(e)
+
+
+
 st.header("🎯 Original Method Matcher")
 st.caption(
     "Real, direct implementation of the user's own, historically-proven manual method - "
