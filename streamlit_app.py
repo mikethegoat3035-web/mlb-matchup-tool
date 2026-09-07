@@ -219,11 +219,28 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     # arsenal (both hands combined) - one real, summary
                     # row per pitcher rather than one row per pitch type,
                     # so this stays scannable across a whole day's slate.
+                    # REAL FIX (found via direct user feedback) - the
+                    # first version of this scan only included 4 real
+                    # metrics; expanded here to the same, full set
+                    # already established and used elsewhere in this
+                    # file (build_pitcher_tendency_profile) - chase%,
+                    # zone%, putaway% (the real K-prop signal), chase-
+                    # whiff%, and zone-whiff%, not just whiff/CSW/velo/
+                    # spin alone.
                     total_usage = sum(p.usage_pct for p in arsenal) or 1
-                    w_whiff = sum(p.whiff_pct * p.usage_pct for p in arsenal if pd.notna(p.whiff_pct)) / total_usage
-                    w_csw = sum(p.csw_pct * p.usage_pct for p in arsenal if pd.notna(p.csw_pct)) / total_usage
-                    w_velo = sum(p.avg_velo * p.usage_pct for p in arsenal if pd.notna(p.avg_velo)) / total_usage
-                    w_spin = sum(p.avg_spin_rate * p.usage_pct for p in arsenal if pd.notna(p.avg_spin_rate)) / total_usage
+                    def _wavg(attr):
+                        vals = [(getattr(p, attr), p.usage_pct) for p in arsenal if pd.notna(getattr(p, attr, None))]
+                        return sum(v * w for v, w in vals) / total_usage if vals else float("nan")
+
+                    w_whiff = _wavg("whiff_pct")
+                    w_csw = _wavg("csw_pct")
+                    w_velo = _wavg("avg_velo")
+                    w_spin = _wavg("avg_spin_rate")
+                    w_chase = _wavg("chase_pct")
+                    w_putaway = _wavg("putaway_pct")
+                    w_zone = _wavg("zone_pct")
+                    w_chase_whiff = _wavg("chase_whiff_pct")
+                    w_zone_whiff = _wavg("z_whiff_pct")
 
                     def _grade(val, metric):
                         b = TIER_BENCHMARKS.get(metric)
@@ -243,12 +260,16 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
 
                     scan_rows.append({
                         "team": g.get("home_name") if side == "home" else g.get("away_name"),
-                        "pitcher": pname, "real_whiff_pct": round(w_whiff, 1),
-                        "whiff_grade": _grade(w_whiff, "whiff_pct"),
+                        "pitcher": pname,
+                        "real_whiff_pct": round(w_whiff, 1), "whiff_grade": _grade(w_whiff, "whiff_pct"),
                         "real_csw_pct": round(w_csw, 1), "csw_grade": _grade(w_csw, "csw_pct"),
+                        "real_chase_pct": round(w_chase, 1), "chase_grade": _grade(w_chase, "chase_pct"),
+                        "real_putaway_pct": round(w_putaway, 1), "putaway_grade": _grade(w_putaway, "putaway_pct"),
+                        "real_zone_pct": round(w_zone, 1), "zone_grade": _grade(w_zone, "zone_pct"),
+                        "real_chase_whiff_pct": round(w_chase_whiff, 1), "chase_whiff_grade": _grade(w_chase_whiff, "chase_whiff_pct"),
+                        "real_zone_whiff_pct": round(w_zone_whiff, 1), "zone_whiff_grade": _grade(w_zone_whiff, "z_whiff_pct"),
                         "real_avg_velo": round(w_velo, 1),
-                        "real_avg_spin_rate": round(w_spin, 0),
-                        "spin_grade": _grade(w_spin, "avg_spin_rate"),
+                        "real_avg_spin_rate": round(w_spin, 0), "spin_grade": _grade(w_spin, "avg_spin_rate"),
                     })
                 except Exception as e:
                     scan_errors.append(f"{side} pitcher, game {game_pk}: {type(e).__name__}: {e}")
