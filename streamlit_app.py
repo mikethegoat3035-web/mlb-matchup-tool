@@ -215,6 +215,41 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     arsenal = build_arsenal_profile(pitches)
                     if not arsenal:
                         continue
+                    pitcher_hand = (pitches["p_throws"].mode().iloc[0]
+                                    if not pitches.empty and "p_throws" in pitches else "R")
+
+                    # REAL, NEW - per direct request, cross-references
+                    # this pitcher's real arsenal against the real,
+                    # confirmed top-3 opposing hitters (using the same,
+                    # already-proven calc_original_method_match logic -
+                    # hard xwOBA/xwOBACON thresholds, majority vote
+                    # across his meaningfully-used pitches). Honest, real
+                    # dependency: only runs if the lineup is actually
+                    # confirmed yet - often not true early in the day,
+                    # so this can legitimately show "not confirmed yet"
+                    # for many real games, not a bug.
+                    top3_matches = 0
+                    top3_checked = 0
+                    lineup_status = "not confirmed yet"
+                    try:
+                        opposing_side = "away" if side == "home" else "home"
+                        lineup_info = pull_confirmed_lineup(game_pk)
+                        opp_lineup = lineup_info.get(opposing_side)
+                        if opp_lineup:
+                            lineup_status = "confirmed"
+                            for hitter in opp_lineup[:3]:
+                                h_pitches = pull_batter_pitches(hitter["player_id"], recent_start, today_str)
+                                h_profile = build_hitter_profile(h_pitches)
+                                if not h_profile:
+                                    continue
+                                match_result = calc_original_method_match(arsenal, h_profile, pitcher_hand)
+                                if match_result.get("usable"):
+                                    top3_checked += 1
+                                    if match_result.get("real_majority_match"):
+                                        top3_matches += 1
+                    except Exception:
+                        lineup_status = "error checking lineup"
+
                     # Real, usage%-weighted average across his real
                     # arsenal (both hands combined) - one real, summary
                     # row per pitcher rather than one row per pitch type,
@@ -270,6 +305,8 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                         "real_zone_whiff_pct": round(w_zone_whiff, 1), "zone_whiff_grade": _grade(w_zone_whiff, "z_whiff_pct"),
                         "real_avg_velo": round(w_velo, 1),
                         "real_avg_spin_rate": round(w_spin, 0), "spin_grade": _grade(w_spin, "avg_spin_rate"),
+                        "vs_top3_lineup_status": lineup_status,
+                        "vs_top3_real_matches": f"{top3_matches}/{top3_checked}" if top3_checked else "n/a",
                     })
                 except Exception as e:
                     scan_errors.append(f"{side} pitcher, game {game_pk}: {type(e).__name__}: {e}")
@@ -841,6 +878,31 @@ else:
                 # data point behind this, so keep watching results.
                 pitcher_min_zscore = st.slider("Pitcher minimum edge (real std devs above league baseline)",
                                         0.0, 2.0, 0.8, step=0.1, key="sim_pitcher_min_zscore")
+                # REAL FIX (confirmed mathematically, per direct request -
+                # traced why strikeouts/outs/earned_runs never survived
+                # Stage 1 regardless of the actual pitcher). The shared
+                # 0.80 threshold, combined with these props' real,
+                # established league baselines, requires: 7.26+ real
+                # strikeouts, 20.1+ real outs (6.7 IP), or 1.46-or-fewer
+                # real earned runs just to clear the bar - all three are
+                # genuinely near-ace-level performance, not a normal good
+                # start. That's not a data problem, it's a real math
+                # problem with applying the SAME threshold (tuned
+                # specifically for hits_allowed via the Wrobleski/Alvarez
+                # comparison) to these structurally different, wider-
+                # variance counting stats. Lowered specifically for these
+                # three back toward the original, pre-tuning 0.5 default,
+                # which was never shown to be wrong for THESE props -
+                # only hits_allowed/pitcher_fantasy had real evidence it
+                # needed raising.
+                pitcher_min_zscore_counting = st.slider(
+                    "Pitcher minimum edge - strikeouts/outs/earned_runs specifically",
+                    0.0, 2.0, 0.5, step=0.1, key="sim_pitcher_min_zscore_counting",
+                    help="Separate, lower bar for these three specific props - confirmed "
+                         "mathematically that the shared 0.80 above requires near-ace-level "
+                         "real performance (7.26+ Ks, 20+ outs, sub-1.5 ERs) to ever clear, "
+                         "which is why these never survived regardless of the real pitcher.",
+                )
                 hitter_min_zscore = st.slider("Hitter minimum edge (real std devs above tonight's own 9-man field)",
                                         0.0, 2.0, 0.3, step=0.1, key="sim_hitter_min_zscore")
             with fcol2:
@@ -949,10 +1011,19 @@ else:
                 stage1_df["coverage"] = stage1_df.apply(
                     lambda r: coverage_map.get(r["player"], 100.0) if r["side"] == "hitter" else 100.0, axis=1)
 
+                # REAL FIX - pitcher counting-stat props (strikeouts,
+                # outs, earned_runs) now use their own, separate, lower
+                # z-score floor - confirmed mathematically these were
+                # structurally unable to survive the shared 0.80 bar
+                # regardless of the real pitcher.
+                PITCHER_COUNTING_STAT_PROPS = {"strikeouts", "outs", "earned_runs"}
+                stage1_df["_pitcher_min_zscore_for_prop"] = stage1_df["prop"].apply(
+                    lambda p: pitcher_min_zscore_counting if p in PITCHER_COUNTING_STAT_PROPS else pitcher_min_zscore)
+
                 survivors = stage1_df[
                     (
                         ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= hitter_min_zscore) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
-                        | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= pitcher_min_zscore) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
+                        | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= stage1_df["_pitcher_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
                     )
                     & (stage1_df["coverage"] >= min_coverage)
                 ].sort_values("zscore", ascending=False)
