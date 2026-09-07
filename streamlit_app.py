@@ -84,7 +84,7 @@ from prop_model_combined import (
     build_hitter_profile, build_pitch_crosswalk, pull_pitcher_game_log,
     simulate_matchup_n_times, real_over_rate_from_simulation,
     backtest_simulation_for_historical_game, backtest_comparison_rows,
-    pull_historical_games_in_range,
+    pull_historical_games_in_range, TIER_BENCHMARKS,
     LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START, LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START,
     LEAGUE_AVG_PITCHER_OUTS_PER_START, LEAGUE_STD_PITCHER_OUTS_PER_START,
     LEAGUE_AVG_PITCHER_HITS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_HITS_ALLOWED_PER_START,
