@@ -201,7 +201,7 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
         scan_errors = []
         progress = st.progress(0.0)
         for i, (_, g) in enumerate(scan_games_df.iterrows()):
-            game_pk = g.get("game_pk")
+            game_pk = g.get("game_id")
             for side in ["home", "away"]:
                 try:
                     p_info = get_probable_pitcher(game_pk, side)
@@ -242,7 +242,7 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                         return "Average"
 
                     scan_rows.append({
-                        "team": g.get("home_team") if side == "home" else g.get("away_team"),
+                        "team": g.get("home_name") if side == "home" else g.get("away_name"),
                         "pitcher": pname, "real_whiff_pct": round(w_whiff, 1),
                         "whiff_grade": _grade(w_whiff, "whiff_pct"),
                         "real_csw_pct": round(w_csw, 1), "csw_grade": _grade(w_csw, "csw_pct"),
