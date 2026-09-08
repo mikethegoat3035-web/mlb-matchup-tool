@@ -4049,6 +4049,22 @@ def build_pitcher_tendency_profile(pitcher_arsenal: list, pitcher_zone_breakdown
             # comparison also account for how a specific hitter performs
             # against this real velocity range, not just usage/CSW/whiff%.
             "avg_velo": p.avg_velo,
+            # REAL FIX (found via direct user report - hits_allowed is
+            # driven by what happens ON CONTACT, not strikeout ability;
+            # CSW%/whiff%/putaway% all measure missing bats, which is a
+            # real but different question from "what happens when he
+            # doesn't miss the bat"). groundball_pct/flyball_pct are
+            # real, direct, pure-descriptive facts about batted-ball
+            # type induced - confirmed missing despite already being
+            # tracked in the same real data (same "avg_velo" gap
+            # pattern). Groundballs are real, meaningfully less likely
+            # to become hits than fly balls/line drives in most real
+            # contexts, and flyball_pct carries real HR risk that
+            # groundball_pct alone doesn't capture - both genuinely
+            # relevant to hits_allowed specifically, not to strikeout-
+            # driven props like pitcher_fantasy.
+            "groundball_pct": p.groundball_pct,
+            "flyball_pct": p.flyball_pct,
         }
         if pitcher_zone_breakdown is not None and not pitcher_zone_breakdown.empty:
             zone_rows = pitcher_zone_breakdown[
