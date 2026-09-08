@@ -238,7 +238,13 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                         if opp_lineup:
                             lineup_status = "confirmed"
                             for hitter in opp_lineup[:3]:
-                                h_pitches = pull_batter_pitches(hitter["player_id"], recent_start, today_str)
+                                # REAL FIX - hitters correctly stay on the
+                                # full season here, matching the same
+                                # established convention used by the main
+                                # Full Matchup Simulation tool and Original
+                                # Method Matcher - this was incorrectly
+                                # using the 68-day pitcher-specific window.
+                                h_pitches = pull_batter_pitches(hitter["player_id"], f"{today_str[:4]}-03-20", today_str)
                                 h_profile = build_hitter_profile(h_pitches)
                                 if not h_profile:
                                     continue
