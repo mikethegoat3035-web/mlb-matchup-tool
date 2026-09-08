@@ -1095,12 +1095,18 @@ else:
                         base_rows.append({
                             "side": srow["side"], "player": srow["player"], "team": srow["team"],
                             "prop": srow["prop"], "your_line": _round_half(srow["real_avg"]),
+                            # REAL FIX (per direct request) - carries the
+                            # real zscore/cv/coverage from Stage 1 through
+                            # into Stage 2 and the final kept-legs export,
+                            # so that data is always present without a
+                            # separate ask every time.
+                            "zscore": srow.get("zscore"), "cv": srow.get("cv"), "coverage": srow.get("coverage"),
                         })
                     base_df = pd.DataFrame(base_rows)
 
                     edited_lines = st.data_editor(
                         base_df, key="sim_lines_editor", width='stretch', hide_index=True,
-                        disabled=["side", "player", "team", "prop"],
+                        disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage"],
                         column_config={
                             "your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5),
                         },
@@ -1112,7 +1118,9 @@ else:
                         series = st.session_state["sim_results"].get(source, {}).get(row["player"], {}).get(row["prop"], [])
                         r = real_over_rate_from_simulation(series, row["your_line"])
                         result_rows.append({"side": row["side"], "player": row["player"], "team": row["team"],
-                                             "prop": row["prop"], "line": row["your_line"], **r})
+                                             "prop": row["prop"], "line": row["your_line"],
+                                             "zscore": row.get("zscore"), "cv": row.get("cv"), "coverage": row.get("coverage"),
+                                             **r})
                     result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
                     # Real, new additions - explicit lean + under_rate, so
                     # you don't have to mentally compute 100-over_rate
