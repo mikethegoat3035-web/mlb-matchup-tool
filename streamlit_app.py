@@ -227,32 +227,34 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     # dependency: only runs if the lineup is actually
                     # confirmed yet - often not true early in the day,
                     # so this can legitimately show "not confirmed yet"
-                    # for many real games, not a bug.
-                    top3_matches = 0
-                    top3_checked = 0
+                    # REAL FIX (per direct request - "weigh who they face
+                    # in lineup") - replaced the top-3-only check with a
+                    # real, full, PA-weighted read across the ENTIRE real
+                    # opposing lineup, reusing the same, already-tested
+                    # calc_lineup_weighted_pitcher_read function already
+                    # proven in Original Method Matcher - the real #1-2
+                    # hitters genuinely face this pitcher more times per
+                    # game than the #8-9 spots, and this weights
+                    # accordingly instead of treating a quick top-3 look
+                    # as the full picture.
                     lineup_status = "not confirmed yet"
+                    lineup_weighted_read_text = "n/a"
                     try:
                         opposing_side = "away" if side == "home" else "home"
                         lineup_info = pull_confirmed_lineup(game_pk)
                         opp_lineup = lineup_info.get(opposing_side)
                         if opp_lineup:
                             lineup_status = "confirmed"
-                            for hitter in opp_lineup[:3]:
-                                # REAL FIX - hitters correctly stay on the
-                                # full season here, matching the same
-                                # established convention used by the main
-                                # Full Matchup Simulation tool and Original
-                                # Method Matcher - this was incorrectly
-                                # using the 68-day pitcher-specific window.
+                            hitter_profiles_by_order_slot = {}
+                            for hitter in opp_lineup:
                                 h_pitches = pull_batter_pitches(hitter["player_id"], f"{today_str[:4]}-03-20", today_str)
                                 h_profile = build_hitter_profile(h_pitches)
-                                if not h_profile:
-                                    continue
-                                match_result = calc_original_method_match(arsenal, h_profile, pitcher_hand)
-                                if match_result.get("usable"):
-                                    top3_checked += 1
-                                    if match_result.get("real_majority_match"):
-                                        top3_matches += 1
+                                if h_profile:
+                                    hitter_profiles_by_order_slot[hitter.get("order_slot")] = h_profile
+                            lineup_read = calc_lineup_weighted_pitcher_read(
+                                arsenal, opp_lineup, hitter_profiles_by_order_slot, pitcher_hand,
+                            )
+                            lineup_weighted_read_text = lineup_read.get("read", "n/a")
                     except Exception:
                         lineup_status = "error checking lineup"
 
@@ -282,6 +284,13 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     w_zone = _wavg("zone_pct")
                     w_chase_whiff = _wavg("chase_whiff_pct")
                     w_zone_whiff = _wavg("z_whiff_pct")
+                    # REAL FIX (found via direct user report - hits_allowed
+                    # is driven by contact outcome, not strikeout ability;
+                    # groundball_pct/flyball_pct were confirmed missing
+                    # here too, despite being real, already-tracked data,
+                    # same gap pattern as avg_velo).
+                    w_groundball = _wavg("groundball_pct")
+                    w_flyball = _wavg("flyball_pct")
 
                     def _grade(val, metric):
                         b = TIER_BENCHMARKS.get(metric)
@@ -309,10 +318,12 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                         "real_zone_pct": round(w_zone, 1), "zone_grade": _grade(w_zone, "zone_pct"),
                         "real_chase_whiff_pct": round(w_chase_whiff, 1), "chase_whiff_grade": _grade(w_chase_whiff, "chase_whiff_pct"),
                         "real_zone_whiff_pct": round(w_zone_whiff, 1), "zone_whiff_grade": _grade(w_zone_whiff, "z_whiff_pct"),
+                        "real_groundball_pct": round(w_groundball, 1), "groundball_grade": _grade(w_groundball, "groundball_pct"),
+                        "real_flyball_pct": round(w_flyball, 1) if pd.notna(w_flyball) else float("nan"),
                         "real_avg_velo": round(w_velo, 1),
                         "real_avg_spin_rate": round(w_spin, 0), "spin_grade": _grade(w_spin, "avg_spin_rate"),
                         "vs_top3_lineup_status": lineup_status,
-                        "vs_top3_real_matches": f"{top3_matches}/{top3_checked}" if top3_checked else "n/a",
+                        "real_lineup_weighted_read": lineup_weighted_read_text,
                     })
                 except Exception as e:
                     scan_errors.append(f"{side} pitcher, game {game_pk}: {type(e).__name__}: {e}")
@@ -373,7 +384,25 @@ omm_games_df = st.session_state.get("omm_games_df")
 if omm_games_df is None or omm_games_df.empty:
     st.info("Click \"Load today's real games\" above to pick a real matchup.")
 else:
-    omm_label_col = "matchup" if "matchup" in omm_games_df.columns else omm_games_df.columns[0]
+    # REAL FIX (confirmed bug, found via direct user report - "shows a
+    # number game, not team names") - pull_todays_games() returns raw
+    # MLB-StatsAPI fields directly, which don't include a "matchup"
+    # column, so this was silently falling back to the DataFrame's
+    # first column (likely game_id or similar) instead of anything
+    # readable. Builds a real matchup label from the actual team-name
+    # columns MLB-StatsAPI provides.
+    if "matchup" in omm_games_df.columns:
+        omm_label_col = "matchup"
+    elif "away_name" in omm_games_df.columns and "home_name" in omm_games_df.columns:
+        omm_games_df = omm_games_df.copy()
+        omm_games_df["matchup"] = omm_games_df["away_name"] + " @ " + omm_games_df["home_name"]
+        omm_label_col = "matchup"
+    elif "away_team" in omm_games_df.columns and "home_team" in omm_games_df.columns:
+        omm_games_df = omm_games_df.copy()
+        omm_games_df["matchup"] = omm_games_df["away_team"] + " @ " + omm_games_df["home_team"]
+        omm_label_col = "matchup"
+    else:
+        omm_label_col = omm_games_df.columns[0]
     omm_game_label = st.selectbox("Pick a real game", omm_games_df[omm_label_col].tolist(), key="omm_game_select")
     omm_row = omm_games_df[omm_games_df[omm_label_col] == omm_game_label].iloc[0]
     omm_game_pk = omm_row.get("game_pk")
