@@ -239,6 +239,7 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     # as the full picture.
                     lineup_status = "not confirmed yet"
                     lineup_weighted_read_text = "n/a"
+                    lineup_weighted_share = None
                     try:
                         opposing_side = "away" if side == "home" else "home"
                         lineup_info = pull_confirmed_lineup(game_pk)
@@ -255,6 +256,7 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                                 arsenal, opp_lineup, hitter_profiles_by_order_slot, pitcher_hand,
                             )
                             lineup_weighted_read_text = lineup_read.get("read", "n/a")
+                            lineup_weighted_share = lineup_read.get("weighted_qualifying_share")
                     except Exception:
                         lineup_status = "error checking lineup"
 
@@ -308,22 +310,83 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                                 return "Poor"
                         return "Average"
 
+                    # REAL FIX (caught before shipping) - these grades
+                    # need to exist as real, standalone variables to be
+                    # usable in the new verdict logic below, not just
+                    # computed inline inside the dict literal.
+                    whiff_grade = _grade(w_whiff, "whiff_pct")
+                    csw_grade = _grade(w_csw, "csw_pct")
+                    groundball_grade = _grade(w_groundball, "groundball_pct")
+
+                    # REAL, NEW - per direct request, pitcher_fantasy is
+                    # driven by real, specific components (outs, Ks,
+                    # earned runs, quality start, win) - wins are
+                    # genuinely hard (team run-support/bullpen dependent,
+                    # not just pitcher skill), but quality start has a
+                    # real, simple, direct definition (6+ real innings,
+                    # <=3 real earned runs) that his own actual game log
+                    # this season can directly answer, rather than
+                    # inferring it from pitch-level stuff metrics alone.
+                    real_qs_rate = None
+                    real_qs_starts = 0
+                    try:
+                        official_log = pull_official_pitcher_game_log(pid, int(today_str[:4]))
+                        if not official_log.empty and "quality_start" in official_log.columns:
+                            real_qs_starts = len(official_log)
+                            real_qs_rate = official_log["quality_start"].mean()
+                    except Exception:
+                        pass
+
                     scan_rows.append({
                         "team": g.get("home_name") if side == "home" else g.get("away_name"),
                         "pitcher": pname,
-                        "real_whiff_pct": round(w_whiff, 1), "whiff_grade": _grade(w_whiff, "whiff_pct"),
-                        "real_csw_pct": round(w_csw, 1), "csw_grade": _grade(w_csw, "csw_pct"),
+                        "real_whiff_pct": round(w_whiff, 1), "whiff_grade": whiff_grade,
+                        "real_csw_pct": round(w_csw, 1), "csw_grade": csw_grade,
                         "real_chase_pct": round(w_chase, 1), "chase_grade": _grade(w_chase, "chase_pct"),
                         "real_putaway_pct": round(w_putaway, 1), "putaway_grade": _grade(w_putaway, "putaway_pct"),
                         "real_zone_pct": round(w_zone, 1), "zone_grade": _grade(w_zone, "zone_pct"),
                         "real_chase_whiff_pct": round(w_chase_whiff, 1), "chase_whiff_grade": _grade(w_chase_whiff, "chase_whiff_pct"),
                         "real_zone_whiff_pct": round(w_zone_whiff, 1), "zone_whiff_grade": _grade(w_zone_whiff, "z_whiff_pct"),
-                        "real_groundball_pct": round(w_groundball, 1), "groundball_grade": _grade(w_groundball, "groundball_pct"),
+                        "real_groundball_pct": round(w_groundball, 1), "groundball_grade": groundball_grade,
                         "real_flyball_pct": round(w_flyball, 1) if pd.notna(w_flyball) else float("nan"),
                         "real_avg_velo": round(w_velo, 1),
                         "real_avg_spin_rate": round(w_spin, 0), "spin_grade": _grade(w_spin, "avg_spin_rate"),
                         "vs_top3_lineup_status": lineup_status,
                         "real_lineup_weighted_read": lineup_weighted_read_text,
+                        # REAL, NEW - per direct request, prop-specific
+                        # verdicts using the metrics that actually matter
+                        # for each real prop, not a single generic grade.
+                        # hits_allowed depends on contact suppression
+                        # (groundball rate + how much of the real lineup's
+                        # expected PA volume comes from hitters who beat
+                        # him) - confirmed, real, usable signal. pitcher_
+                        # fantasy under requires a real short/bad outing,
+                        # which elite whiff%/CSW% actually argue AGAINST
+                        # (better stuff predicts a BETTER outing, not a
+                        # worse one) - explicitly flagged as unconfirmable
+                        # here rather than guessed at, since the real
+                        # driver (workload/pitch-count limits) isn't data
+                        # this tool has access to.
+                        "hits_allowed_verdict": (
+                            "Real concern - fly-ball prone (Poor groundball grade)" if groundball_grade == "Poor"
+                            else (f"Real support - {round(lineup_weighted_share*100,1)}% real lineup PA match, {groundball_grade} groundball rate"
+                                  if lineup_weighted_share is not None and lineup_weighted_share < 0.15 and groundball_grade in ("Elite", "Average")
+                                  else "Ordinary - no standout real support either way")
+                        ),
+                        "real_quality_start_rate": round(real_qs_rate * 100, 1) if real_qs_rate is not None else None,
+                        "real_qs_sample_starts": real_qs_starts,
+                        "pitcher_fantasy_verdict": (
+                            f"Real, direct QS rate: {round(real_qs_rate*100,1)}% over {real_qs_starts} real starts this season - "
+                            + ("supports OVER (goes deep, limits runs)" if real_qs_rate >= 0.5
+                               else "supports UNDER (real, actual short/bad outings, not just inferred)")
+                            if real_qs_rate is not None and real_qs_starts >= 5
+                            else (
+                                "Stuff argues AGAINST a fantasy under (Elite whiff/CSW predict a GOOD outing) - "
+                                "real QS sample too thin to confirm either way; wins remain unpredictable regardless"
+                                if whiff_grade == "Elite" or csw_grade == "Elite"
+                                else "No real signal either way - real QS sample too thin, and no standout stuff grade"
+                            )
+                        ),
                     })
                 except Exception as e:
                     scan_errors.append(f"{side} pitcher, game {game_pk}: {type(e).__name__}: {e}")
@@ -872,7 +935,11 @@ else:
             default=["strikeouts", "outs", "earned_runs", "pitcher_fantasy"],
             key="sim_pitcher_props_multiselect",
             help="The starter's own real simulated stats. pitcher_fantasy uses the real "
-                 "scoring: 3pts/K, 1pt/out, -3pts/earned run, +5pts/quality start. Win isn't "
+                 "scoring: 3pts/K, 1pt/out, -3pts/earned run, +5pts/quality start - quality_start "
+                 "is already baked into this real formula per simulated game (6+ simulated "
+                 "innings, <=3 simulated earned runs, computed from the same real, tonight-"
+                 "specific, opponent-adjusted games), not exposed as a separate prop of its own. "
+                 "Win isn't "
                  "included - it genuinely depends on the opposing team's own score, which this "
                  "simulation doesn't model (only one lineup vs one starter at a time).",
         )
