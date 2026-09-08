@@ -4039,6 +4039,16 @@ def build_pitcher_tendency_profile(pitcher_arsenal: list, pitcher_zone_breakdown
             "whiff_per_swing_pct": p.whiff_per_swing_pct,  # real whiff rate restricted to swings only - a cleaner "quality of stuff when he gets a swing" read than swstr_pct, which is diluted by real takes/non-swings
             "putaway_pct": p.putaway_pct,              # real, 2-strike-specific swinging-K rate - completes the real "how does he get outs" picture together with the next field
             "two_strike_called_pct": p.two_strike_called_pct,  # real, 2-strike-specific CALLED-strike rate (the "backward K") - a real chunk of real strikeouts that putaway_pct (swing-based) misses entirely
+            # REAL FIX (found via direct user report - Misiorowski's real,
+            # defining 100+ MPH fastball wasn't represented anywhere in
+            # this profile, despite avg_velo already being tracked
+            # elsewhere in the same real data). A pure, descriptive fact
+            # (how hard does he actually throw this pitch), not a quality
+            # judgment - consistent with this function's real, established
+            # "no benchmark" philosophy, and lets the downstream hitter-
+            # comparison also account for how a specific hitter performs
+            # against this real velocity range, not just usage/CSW/whiff%.
+            "avg_velo": p.avg_velo,
         }
         if pitcher_zone_breakdown is not None and not pitcher_zone_breakdown.empty:
             zone_rows = pitcher_zone_breakdown[
