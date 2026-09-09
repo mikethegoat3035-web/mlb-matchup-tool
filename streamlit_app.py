@@ -1001,23 +1001,31 @@ else:
         )
         sim_props_wanted = st.multiselect(
             "Which hitter props to show", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
-                                            "strikeouts", "total_bases", "hits_runs_rbi", "fantasy"],
+                                            "strikeouts", "total_bases", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"],
             default=["hits", "total_bases", "home_runs", "hits_runs_rbi", "fantasy"],
             key="sim_props_multiselect",
+            help="'fantasy' uses Underdog's real scoring (walk 3pts, double 6pts, HBP 3pts). "
+                 "'fantasy_prizepicks' is the SAME simulated games, re-weighted per PrizePicks' "
+                 "real, different scoring (walk 2pts, double 5pts, HBP 2pts) - added per direct "
+                 "request so both books' real lines can be checked separately instead of one "
+                 "generic 'fantasy' number standing in for both.",
         )
         sim_pitcher_props_wanted = st.multiselect(
             "Which pitcher props to show",
-            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs", "pitcher_fantasy"],
+            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs",
+             "pitcher_fantasy", "pitcher_fantasy_prizepicks"],
             default=["strikeouts", "outs", "earned_runs", "pitcher_fantasy"],
             key="sim_pitcher_props_multiselect",
-            help="The starter's own real simulated stats. pitcher_fantasy uses the real "
-                 "scoring: 3pts/K, 1pt/out, -3pts/earned run, +5pts/quality start - quality_start "
-                 "is already baked into this real formula per simulated game (6+ simulated "
+            help="The starter's own real simulated stats. pitcher_fantasy uses Underdog's real "
+                 "scoring: 3pts/K, 1pt/out, -3pts/earned run, +5pts win, +5pts/quality start. "
+                 "pitcher_fantasy_prizepicks is the SAME simulated games, re-weighted per "
+                 "PrizePicks' own real, different scoring (+6pts win, +4pts/quality start) - "
+                 "confirmed against PrizePicks' own official chart. quality_start "
+                 "is already baked into both formulas per simulated game (6+ simulated "
                  "innings, <=3 simulated earned runs, computed from the same real, tonight-"
                  "specific, opponent-adjusted games), not exposed as a separate prop of its own. "
-                 "Win isn't "
-                 "included - it genuinely depends on the opposing team's own score, which this "
-                 "simulation doesn't model (only one lineup vs one starter at a time).",
+                 "Win is included in the connected (both-team) simulation only - the single-"
+                 "sided version genuinely can't know if he won.",
         )
         if not sim_props_wanted and not sim_pitcher_props_wanted:
             st.info("Pick at least one prop above.")
@@ -1250,6 +1258,14 @@ else:
                     st.info("Nothing cleared the bar - try lowering the sliders above.")
                 else:
                     st.subheader("Stage 2 - enter each real line for the survivors above")
+                    st.caption(
+                        "Split into separate sections per book, per direct request - fantasy "
+                        "scoring genuinely differs between PrizePicks and Underdog (confirmed "
+                        "against each app's own real, official scoring chart), so a line entered "
+                        "under the wrong book's fantasy prop would be checked against the wrong "
+                        "real point values entirely. Every other prop here scores identically on "
+                        "both books, so those stay in one shared section."
+                    )
 
                     def _round_half(x):
                         # REAL BUG FIX - round(x*2)/2 could land on a
@@ -1262,27 +1278,38 @@ else:
                         # it should still reflect a real, plausible line.
                         return math.floor(x) + 0.5 if x is not None else 1.5
 
-                    base_rows = []
-                    for _, srow in survivors.iterrows():
-                        base_rows.append({
-                            "side": srow["side"], "player": srow["player"], "team": srow["team"],
-                            "prop": srow["prop"], "your_line": _round_half(srow["real_avg"]),
-                            # REAL FIX (per direct request) - carries the
-                            # real zscore/cv/coverage from Stage 1 through
-                            # into Stage 2 and the final kept-legs export,
-                            # so that data is always present without a
-                            # separate ask every time.
-                            "zscore": srow.get("zscore"), "cv": srow.get("cv"), "coverage": srow.get("coverage"),
-                        })
-                    base_df = pd.DataFrame(base_rows)
+                    def _build_editor(section_survivors, key_suffix, label):
+                        if section_survivors.empty:
+                            return pd.DataFrame()
+                        rows = []
+                        for _, srow in section_survivors.iterrows():
+                            rows.append({
+                                "side": srow["side"], "player": srow["player"], "team": srow["team"],
+                                "prop": srow["prop"], "your_line": _round_half(srow["real_avg"]),
+                                "zscore": srow.get("zscore"), "cv": srow.get("cv"), "coverage": srow.get("coverage"),
+                            })
+                        df = pd.DataFrame(rows)
+                        st.write(label)
+                        return st.data_editor(
+                            df, key=f"sim_lines_editor_{key_suffix}", width='stretch', hide_index=True,
+                            disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage"],
+                            column_config={"your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5)},
+                        )
 
-                    edited_lines = st.data_editor(
-                        base_df, key="sim_lines_editor", width='stretch', hide_index=True,
-                        disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage"],
-                        column_config={
-                            "your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5),
-                        },
-                    )
+                    pp_survivors = survivors[survivors["prop"].isin(["fantasy_prizepicks", "pitcher_fantasy_prizepicks"])]
+                    ud_survivors = survivors[survivors["prop"].isin(["fantasy", "pitcher_fantasy"])]
+                    shared_survivors = survivors[~survivors["prop"].isin(
+                        ["fantasy", "fantasy_prizepicks", "pitcher_fantasy", "pitcher_fantasy_prizepicks"])]
+
+                    edited_pp = _build_editor(pp_survivors, "pp", "🟣 PrizePicks-specific")
+                    edited_ud = _build_editor(ud_survivors, "ud", "🟢 Underdog-specific")
+                    edited_shared = _build_editor(shared_survivors, "shared", "Shared (scores the same on both books)")
+
+                    edited_lines = pd.concat(
+                        [df for df in (edited_pp, edited_ud, edited_shared) if not df.empty],
+                        ignore_index=True,
+                    ) if any(not df.empty for df in (edited_pp, edited_ud, edited_shared)) else pd.DataFrame(
+                        columns=["side", "player", "team", "prop", "your_line", "zscore", "cv", "coverage"])
 
                     result_rows = []
                     for _, row in edited_lines.iterrows():
@@ -1402,6 +1429,45 @@ else:
                                      "over_rate", "under_rate", "lean"]
                     display_cols = [c for c in display_cols if c in result_df.columns]
                     st.dataframe(result_df[display_cols].style.apply(_lean_color, axis=1), width='stretch')
+
+                    # REAL, NEW (per direct request) - for any player who
+                    # has BOTH a PrizePicks and Underdog fantasy result in
+                    # this same Stage 2 run, shows which book's real hit
+                    # rate is actually better for that entered line -
+                    # color-coded so the better book jumps out immediately
+                    # instead of needing to manually compare two separate
+                    # rows in two separate sections.
+                    fantasy_pairs = [("fantasy_prizepicks", "fantasy"), ("pitcher_fantasy_prizepicks", "pitcher_fantasy")]
+                    comparison_rows = []
+                    for pp_prop, ud_prop in fantasy_pairs:
+                        pp_rows = result_df[result_df["prop"] == pp_prop]
+                        ud_rows = result_df[result_df["prop"] == ud_prop]
+                        for _, pp_row in pp_rows.iterrows():
+                            match = ud_rows[ud_rows["player"] == pp_row["player"]]
+                            if match.empty:
+                                continue
+                            ud_row = match.iloc[0]
+                            better = "PrizePicks" if pp_row["over_rate"] >= ud_row["over_rate"] else "Underdog"
+                            comparison_rows.append({
+                                "player": pp_row["player"], "team": pp_row["team"],
+                                "PrizePicks line": pp_row["line"], "PrizePicks real hit rate": pp_row["over_rate"],
+                                "Underdog line": ud_row["line"], "Underdog real hit rate": ud_row["over_rate"],
+                                "Better book": better,
+                            })
+
+                    if comparison_rows:
+                        st.subheader("PrizePicks vs Underdog - which book's real hit rate is better")
+                        comparison_df = pd.DataFrame(comparison_rows)
+
+                        def _better_book_color(row):
+                            color = "background-color: rgba(147, 51, 234, 0.35)" if row["Better book"] == "PrizePicks" \
+                                else "background-color: rgba(34, 197, 94, 0.35)"
+                            return [color] * len(row)
+
+                        st.caption("Purple = PrizePicks has the better real hit rate for this line. "
+                                   "Green = Underdog does. Only shown for players with BOTH a real "
+                                   "PrizePicks and Underdog fantasy line entered above.")
+                        st.dataframe(comparison_df.style.apply(_better_book_color, axis=1), width='stretch')
 
                     result_df.insert(0, "Include", False)
                     edited_results = st.data_editor(
