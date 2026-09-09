@@ -2287,8 +2287,26 @@ HITTER_FANTASY_WEIGHTS = {
     "run": 2, "rbi": 2, "walk": 3, "hbp": 3, "stolen_base": 4,
 }
 
+# REAL, NEW (per direct request) - PrizePicks' real, DIFFERENT hitter
+# fantasy scoring, kept as a separate weights dict rather than
+# overwriting Underdog's - confirmed real point differences: walk 2pts
+# (UD: 3), double 5pts (UD: 6), HBP 2pts (UD: 3). Everything else
+# assumed the same as Underdog unless corrected.
+HITTER_FANTASY_WEIGHTS_PRIZEPICKS = {
+    "single": 3, "double": 5, "triple": 8, "home_run": 10,
+    "run": 2, "rbi": 2, "walk": 2, "hbp": 2, "stolen_base": 5,
+}
+
 PITCHER_FANTASY_WEIGHTS = {
     "out": 1, "strikeout": 3, "earned_run": -3, "win": 5, "quality_start": 5,
+}
+
+# REAL, NEW (per direct request, confirmed against PrizePicks' own real,
+# official pitcher scoring chart) - Win and Quality Start genuinely
+# differ from Underdog (6/4 here vs 5/5 for Underdog); Out/Strikeout/
+# Earned Run match exactly.
+PITCHER_FANTASY_WEIGHTS_PRIZEPICKS = {
+    "out": 1, "strikeout": 3, "earned_run": -3, "win": 6, "quality_start": 4,
 }
 
 
@@ -3869,6 +3887,15 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
                             - starter_game_totals["earned_runs"] * 3
                             + quality_start * 5)
         starter_series["pitcher_fantasy"].append(pitcher_fantasy)
+        # REAL, NEW (per direct request) - same real outcomes, re-weighted
+        # per PrizePicks' official pitcher chart (Win/QS differ; no win
+        # bonus here either, same honest scope limit as Underdog's
+        # version above - this single-sided sim can't know if he won).
+        pitcher_fantasy_pp = (starter_game_totals["strikeouts"] * 3
+                               + starter_game_totals["outs"] * 1
+                               - starter_game_totals["earned_runs"] * 3
+                               + quality_start * 4)
+        starter_series.setdefault("pitcher_fantasy_prizepicks", []).append(pitcher_fantasy_pp)
 
         for name, hs in game["hitter_stats"].items():
             for k in ("hits", "singles", "doubles", "triples", "home_runs",
@@ -3885,6 +3912,18 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
                        + hs["rbi"] * HITTER_FANTASY_WEIGHTS["rbi"]
                        + hs["walks"] * HITTER_FANTASY_WEIGHTS["walk"])
             hitter_series[name]["fantasy"].append(fantasy)
+            # REAL, NEW (per direct request) - PrizePicks-specific real
+            # fantasy score, computed from the SAME simulated outcome
+            # counts as "fantasy" above (Underdog), just re-weighted per
+            # PrizePicks' own real, different scoring.
+            fantasy_pp = (hs["singles"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["single"]
+                          + hs["doubles"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["double"]
+                          + hs["triples"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["triple"]
+                          + hs["home_runs"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["home_run"]
+                          + hs["runs"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["run"]
+                          + hs["rbi"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["rbi"]
+                          + hs["walks"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["walk"])
+            hitter_series[name].setdefault("fantasy_prizepicks", []).append(fantasy_pp)
 
     return {"starter": starter_series, "hitters": hitter_series}
 
@@ -3935,6 +3974,13 @@ def simulate_connected_matchup_n_times(home_crosswalks: dict, away_crosswalks: d
         # included, since this connected simulation genuinely knows
         # whether he earned it, unlike the original single-sided version.
         series_dict["pitcher_fantasy"].append(k * 3 + outs * 1 - er * 3 + qs * 5 + win * 5)
+        # REAL, NEW (per direct request, confirmed against PrizePicks'
+        # own official pitcher scoring chart) - same real outcomes as
+        # Underdog's pitcher_fantasy above, re-weighted per PrizePicks'
+        # real, different Win/Quality Start values (6/4 vs Underdog's 5/5).
+        series_dict.setdefault("pitcher_fantasy_prizepicks", []).append(
+            k * 3 + outs * 1 - er * 3 + qs * 4 + win * 6
+        )
 
     def _append_hitters(series_dict, hitter_stats):
         for name, hs in hitter_stats.items():
@@ -3952,6 +3998,18 @@ def simulate_connected_matchup_n_times(home_crosswalks: dict, away_crosswalks: d
                        + hs["rbi"] * HITTER_FANTASY_WEIGHTS["rbi"]
                        + hs["walks"] * HITTER_FANTASY_WEIGHTS["walk"])
             series_dict[name]["fantasy"].append(fantasy)
+            # REAL, NEW (per direct request) - same real PrizePicks
+            # re-weighting as the other simulator location, applied here
+            # too since this is a separate function (simulate_connected_
+            # matchup_n_times) with its own copy of this same real logic.
+            fantasy_pp = (hs["singles"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["single"]
+                          + hs["doubles"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["double"]
+                          + hs["triples"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["triple"]
+                          + hs["home_runs"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["home_run"]
+                          + hs["runs"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["run"]
+                          + hs["rbi"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["rbi"]
+                          + hs["walks"] * HITTER_FANTASY_WEIGHTS_PRIZEPICKS["walk"])
+            series_dict[name].setdefault("fantasy_prizepicks", []).append(fantasy_pp)
 
     for _ in range(n_simulations):
         game = simulate_connected_game(home_crosswalks, away_crosswalks,
