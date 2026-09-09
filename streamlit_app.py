@@ -93,6 +93,7 @@ from prop_model_combined import (
     LEAGUE_AVG_PITCHER_FANTASY_PER_START, LEAGUE_STD_PITCHER_FANTASY_PER_START,
     build_pitcher_tendency_profile, calc_original_method_match, attack_zone_breakdown,
     calc_lineup_weighted_pitcher_read, calc_prop_lineup_vulnerability,
+    get_batter_hand, EXPECTED_PA_BY_ORDER_SLOT,
     calc_pitcher_fantasy_lineup_read, calc_doubly_confirmed_hitter_signal,
 )
 
@@ -240,6 +241,7 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     lineup_status = "not confirmed yet"
                     lineup_weighted_read_text = "n/a"
                     lineup_weighted_share = None
+                    opp_lineup = None
                     try:
                         opposing_side = "away" if side == "home" else "home"
                         lineup_info = pull_confirmed_lineup(game_pk)
@@ -277,6 +279,17 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                         vals = [(getattr(p, attr), p.usage_pct) for p in arsenal if pd.notna(getattr(p, attr, None))]
                         return sum(v * w for v, w in vals) / total_usage if vals else float("nan")
 
+                    # REAL, NEW - same real weighting logic as _wavg above,
+                    # but filtered to the pitcher's real arsenal entries
+                    # against ONE specific batter hand, giving his true,
+                    # split-specific metric (e.g. real groundball% vs LHH
+                    # specifically) instead of a blended, both-hands average.
+                    def _wavg_by_hand(attr, hand):
+                        hand_arsenal = [p for p in arsenal if p.vs_hand == hand]
+                        hand_usage = sum(p.usage_pct for p in hand_arsenal) or 1
+                        vals = [(getattr(p, attr), p.usage_pct) for p in hand_arsenal if pd.notna(getattr(p, attr, None))]
+                        return sum(v * w for v, w in vals) / hand_usage if vals else float("nan")
+
                     w_whiff = _wavg("whiff_pct")
                     w_csw = _wavg("csw_pct")
                     w_velo = _wavg("avg_velo")
@@ -293,6 +306,59 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                     # same gap pattern as avg_velo).
                     w_groundball = _wavg("groundball_pct")
                     w_flyball = _wavg("flyball_pct")
+
+                    # REAL, NEW (per direct request) - lineup-handedness-
+                    # weighted versions of the metrics that actually drive
+                    # hits_allowed/BB-allowed/Ks. A pitcher's BLENDED
+                    # groundball%/whiff%/CSW% (both hands combined, above)
+                    # doesn't reflect that tonight's REAL, specific lineup
+                    # might be mostly one hand - if the real top of the
+                    # order is mostly LHH, his real vs-LHH splits matter
+                    # far more than his vs-RHH numbers, and vice versa.
+                    # Reuses the SAME real, established, already-tested
+                    # PA-weighting (EXPECTED_PA_BY_ORDER_SLOT) already used
+                    # for the lineup_weighted_read above, and the same
+                    # real get_batter_hand lookup already used elsewhere
+                    # in this file - not reinvented, just applied here too.
+                    handedness_weighted_read = "n/a"
+                    hw_groundball = hw_whiff = hw_csw = None
+                    if opp_lineup:
+                        try:
+                            total_pa_weight = 0.0
+                            weighted_gb = weighted_whiff = weighted_csw = 0.0
+                            hand_breakdown = []
+                            for hitter in opp_lineup:
+                                order_slot = hitter.get("order_slot")
+                                pa_weight = EXPECTED_PA_BY_ORDER_SLOT.get(order_slot, 4.0)
+                                real_hand = get_batter_hand(hitter["player_id"])
+                                if real_hand == "S":
+                                    # Real switch hitter - assumes the real,
+                                    # standard platoon choice (bats opposite
+                                    # the pitcher's own throwing hand).
+                                    real_hand = "R" if pitcher_hand == "L" else "L"
+                                gb_this_hand = _wavg_by_hand("groundball_pct", real_hand)
+                                whiff_this_hand = _wavg_by_hand("whiff_pct", real_hand)
+                                csw_this_hand = _wavg_by_hand("csw_pct", real_hand)
+                                if pd.notna(gb_this_hand):
+                                    weighted_gb += pa_weight * gb_this_hand
+                                if pd.notna(whiff_this_hand):
+                                    weighted_whiff += pa_weight * whiff_this_hand
+                                if pd.notna(csw_this_hand):
+                                    weighted_csw += pa_weight * csw_this_hand
+                                total_pa_weight += pa_weight
+                                hand_breakdown.append(f"{hitter.get('name', '?')} ({real_hand})")
+                            if total_pa_weight > 0:
+                                hw_groundball = round(weighted_gb / total_pa_weight, 1)
+                                hw_whiff = round(weighted_whiff / total_pa_weight, 1)
+                                hw_csw = round(weighted_csw / total_pa_weight, 1)
+                                handedness_weighted_read = (
+                                    f"Real lineup: {', '.join(hand_breakdown)}. Handedness-weighted "
+                                    f"(PA-weighted by real batting order): GB% {hw_groundball}, "
+                                    f"whiff% {hw_whiff}, CSW% {hw_csw} - vs blended (both hands) "
+                                    f"GB% {round(w_groundball, 1)}, whiff% {round(w_whiff, 1)}, CSW% {round(w_csw, 1)}."
+                                )
+                        except Exception:
+                            handedness_weighted_read = "error computing handedness-weighted read"
 
                     def _grade(val, metric):
                         b = TIER_BENCHMARKS.get(metric)
@@ -351,6 +417,16 @@ if st.button("Scan all of today's real starting pitchers", key="league_scan_pitc
                         "real_flyball_pct": round(w_flyball, 1) if pd.notna(w_flyball) else float("nan"),
                         "real_avg_velo": round(w_velo, 1),
                         "real_avg_spin_rate": round(w_spin, 0), "spin_grade": _grade(w_spin, "avg_spin_rate"),
+                        # REAL, NEW (per direct request) - handedness-
+                        # weighted versions of the metrics driving hits_
+                        # allowed/BB-allowed/Ks, using the real, confirmed
+                        # lineup's actual batting-side composition (PA-
+                        # weighted by real batting order) instead of a
+                        # blended, both-hands average.
+                        "handedness_weighted_groundball_pct": hw_groundball,
+                        "handedness_weighted_whiff_pct": hw_whiff,
+                        "handedness_weighted_csw_pct": hw_csw,
+                        "handedness_weighted_read": handedness_weighted_read,
                         "vs_top3_lineup_status": lineup_status,
                         "real_lineup_weighted_read": lineup_weighted_read_text,
                         # REAL, NEW - per direct request, prop-specific
