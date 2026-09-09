@@ -1448,16 +1448,29 @@ else:
                                 continue
                             ud_row = match.iloc[0]
                             better = "PrizePicks" if pp_row["over_rate"] >= ud_row["over_rate"] else "Underdog"
+                            # REAL, NEW (per direct request) - direct line
+                            # and hit-rate gaps, so a genuine market
+                            # discrepancy between the two books' real
+                            # lines pops out immediately instead of
+                            # needing a manual side-by-side read.
+                            line_diff = round(pp_row["line"] - ud_row["line"], 2)
+                            hit_rate_diff = round(abs(pp_row["over_rate"] - ud_row["over_rate"]), 1)
                             comparison_rows.append({
                                 "player": pp_row["player"], "team": pp_row["team"],
                                 "PrizePicks line": pp_row["line"], "PrizePicks real hit rate": pp_row["over_rate"],
                                 "Underdog line": ud_row["line"], "Underdog real hit rate": ud_row["over_rate"],
+                                "Line gap (PP - UD)": line_diff, "Hit rate gap": hit_rate_diff,
                                 "Better book": better,
                             })
 
                     if comparison_rows:
                         st.subheader("PrizePicks vs Underdog - which book's real hit rate is better")
-                        comparison_df = pd.DataFrame(comparison_rows)
+                        st.caption(
+                            "Sorted by the biggest real discrepancy first - a large line gap or hit "
+                            "rate gap here is a genuine, direct signal one book's real line is softer "
+                            "than the other's for this exact player and prop."
+                        )
+                        comparison_df = pd.DataFrame(comparison_rows).sort_values("Hit rate gap", ascending=False)
 
                         def _better_book_color(row):
                             color = "background-color: rgba(147, 51, 234, 0.35)" if row["Better book"] == "PrizePicks" \
