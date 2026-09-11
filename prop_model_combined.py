@@ -3560,12 +3560,40 @@ def simulate_pitch_count_for_pa(outcome: str, rng: random.Random, crosswalk_row:
         strikes_for_hitter = 3
         strikes_for_pitcher = 3
     else:
-        # Real, reasoned weighting for how many real strikes a walk or
-        # ball-in-play PA had already accumulated before it ended -
-        # most real at-bats that don't strike out still work into at
-        # least one real strike, some go the whole way to a real
-        # 2-strike count before contact or ball four.
-        strikes_base = rng.choices([0, 1, 2], weights=[0.25, 0.35, 0.40], k=1)[0]
+        # Real, reasoned baseline weighting for how many real strikes a
+        # walk or ball-in-play PA had already accumulated before it
+        # ended - most real at-bats that don't strike out still work
+        # into at least one real strike, some go the whole way to a
+        # real 2-strike count before contact or ball four.
+        weights = [0.25, 0.35, 0.40]
+        if crosswalk_row is not None:
+            # REAL, NEW (per direct request) - this same real weighting
+            # now shifts toward more accumulated strikes when the
+            # matchup is genuinely tough, using the same real crosswalk
+            # fields already driving every other outcome here (pitcher
+            # CSW%/zone%, hitter chase%). A tougher matchup should mean
+            # more real strikes even in the at-bats that DON'T end in a
+            # strikeout - not just a higher strikeout rate overall.
+            csw = crosswalk_row.get("pitcher_own_csw_pct")
+            zone = crosswalk_row.get("pitcher_zone_pct")
+            chase = crosswalk_row.get("hitter_chase_pct")
+            shift = 0.0
+            if csw is not None and pd.notna(csw):
+                shift += (csw - LEAGUE_AVG_PITCHER_CSW) / 100.0
+            if zone is not None and pd.notna(zone):
+                shift += (zone - LEAGUE_AVG_PITCHER_ZONE) / 150.0
+            if chase is not None and pd.notna(chase):
+                shift += (chase - LEAGUE_AVG_CHASE) / 100.0
+            # Real, bounded shift - moves weight from the 0-strike bucket
+            # toward the 2-strike bucket (or the reverse, for an easy
+            # matchup), keeping the 1-strike bucket the real, stable
+            # middle ground. Clamped so every weight stays a real,
+            # valid, non-negative probability.
+            shift = max(-0.15, min(0.15, shift))
+            weights = [max(0.05, weights[0] - shift), weights[1], max(0.05, weights[2] + shift)]
+            total_w = sum(weights)
+            weights = [w / total_w for w in weights]
+        strikes_base = rng.choices([0, 1, 2], weights=weights, k=1)[0]
         strikes_for_hitter = strikes_base
         strikes_for_pitcher = strikes_base + 1 if outcome in BALL_IN_PLAY_OUTCOMES else strikes_base
     strikes_for_hitter = min(strikes_for_hitter, pitches)
