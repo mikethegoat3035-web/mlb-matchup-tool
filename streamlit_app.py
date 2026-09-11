@@ -1107,6 +1107,25 @@ else:
                 )
                 hitter_min_zscore = st.slider("Hitter minimum edge (real std devs above tonight's own 9-man field)",
                                         0.0, 2.0, 0.3, step=0.1, key="sim_hitter_min_zscore")
+                # REAL FIX (confirmed bug, found via direct user report -
+                # too many strikes_seen/plate_appearances survivors) -
+                # these newer props have real, confirmed, meaningfully
+                # LOWER variance than established props (0.32 avg CV vs
+                # 0.92), which let far more of them clear the SAME flat
+                # 0.3 threshold than genuinely warranted - a low-CV prop
+                # produces an inflated z-score for the same real gap
+                # size. Mirrors the same real pattern already
+                # established on the pitcher side (counting-stat props
+                # get their own, different threshold).
+                hitter_min_zscore_low_variance = st.slider(
+                    "Hitter minimum edge for low-variance/new props (strikes_seen, plate_appearances, etc.)",
+                    0.0, 3.0, 1.5, step=0.1, key="sim_hitter_min_zscore_low_variance",
+                    help="These props (confirmed real avg CV ~0.32, vs ~0.92 for hits/RBI/fantasy) "
+                         "clear the standard 0.3 threshold far too easily, since a naturally tighter, "
+                         "less volatile stat produces an inflated z-score for the same real gap size. "
+                         "A real, separate, stricter bar keeps these as selective as your established "
+                         "props instead of flooding the results.",
+                )
             with fcol2:
                 # REAL FIX - recalibrated using real, live data from an
                 # actual run (2026-09-06). Confirmed directly: real hitter
@@ -1196,7 +1215,19 @@ else:
 
                 def _real_zscore(row):
                     if row["side"] != "pitcher" or row["prop"] not in PITCHER_LEAGUE_BASELINES:
-                        return round((row["real_avg"] - row["field_mean"]) / row["field_std"], 2)
+                        # REAL FIX (confirmed bug, found via direct user
+                        # report - a real ZeroDivisionError crashed the
+                        # whole app) - field_std can genuinely be zero
+                        # when a prop's real comparison population for
+                        # this specific matchup is too thin or has
+                        # identical values (e.g. a small/short roster
+                        # game). Returns a real, honest NaN instead of
+                        # crashing - this row just won't have a usable
+                        # z-score, same as any other missing-data case.
+                        field_std = row.get("field_std")
+                        if field_std is None or pd.isna(field_std) or field_std == 0:
+                            return float("nan")
+                        return round((row["real_avg"] - row["field_mean"]) / field_std, 2)
                     base_mean, base_std = PITCHER_LEAGUE_BASELINES[row["prop"]]
                     z = (row["real_avg"] - base_mean) / base_std
                     if row["prop"] in LOWER_IS_BETTER_PITCHER_PROPS:
@@ -1222,9 +1253,19 @@ else:
                 stage1_df["_pitcher_min_zscore_for_prop"] = stage1_df["prop"].apply(
                     lambda p: pitcher_min_zscore_counting if p in PITCHER_COUNTING_STAT_PROPS else pitcher_min_zscore)
 
+                # REAL FIX (confirmed bug, found via direct user report) -
+                # same real pattern as the pitcher counting-stat fix
+                # above, applied to hitters - these newer, confirmed
+                # lower-variance props need their own, stricter z-score
+                # floor instead of sharing the standard 0.3 bar.
+                HITTER_LOW_VARIANCE_PROPS = {"strikes_seen", "plate_appearances", "batters_faced",
+                                              "pitches_thrown", "strikes_thrown"}
+                stage1_df["_hitter_min_zscore_for_prop"] = stage1_df["prop"].apply(
+                    lambda p: hitter_min_zscore_low_variance if p in HITTER_LOW_VARIANCE_PROPS else hitter_min_zscore)
+
                 survivors = stage1_df[
                     (
-                        ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= hitter_min_zscore) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
+                        ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= stage1_df["_hitter_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
                         | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= stage1_df["_pitcher_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
                     )
                     & (stage1_df["coverage"] >= min_coverage)
