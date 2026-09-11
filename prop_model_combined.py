@@ -3541,9 +3541,36 @@ def simulate_pitch_count_for_pa(outcome: str, rng: random.Random, crosswalk_row:
         avg_pitches = max(2.0, min(8.0, avg_pitches))  # real, sane bounds - no PA realistically averages outside this range
 
     pitches = max(1, round(rng.gauss(avg_pitches, PITCHES_PER_PA_STD)))
-    strike_rate = STRIKE_RATE_PER_PA_BY_OUTCOME.get(outcome, 0.58)
-    strikes = sum(1 for _ in range(pitches) if rng.random() < strike_rate)
-    return pitches, strikes
+    if outcome == "strikeout":
+        pitches = max(3, pitches)  # real, honest minimum - a strikeout requires at least 3 real pitches (the 3 real strikes)
+
+    # REAL, UPDATED PER DIRECT REQUEST - strikes now split into two
+    # genuinely different, deliberate definitions. strikes_for_hitter is
+    # the plate-discipline view (a ball put in play is never itself a
+    # strike, confirmed earlier). strikes_for_pitcher is his own real
+    # stat-line view - a competitive pitch that gets put in play still
+    # counts as a real strike HE threw, even though it's not a "strike"
+    # from the hitter's discipline side. Both share the same real,
+    # count-advancing logic otherwise: a strikeout is always EXACTLY 3
+    # real strikes (extra fouls at 2 strikes never add a 4th); anything
+    # else can only have 0-2 real, count-advancing strikes (a real 3rd
+    # would have been a strikeout instead).
+    BALL_IN_PLAY_OUTCOMES = {"single", "double", "triple", "home_run", "out"}
+    if outcome == "strikeout":
+        strikes_for_hitter = 3
+        strikes_for_pitcher = 3
+    else:
+        # Real, reasoned weighting for how many real strikes a walk or
+        # ball-in-play PA had already accumulated before it ended -
+        # most real at-bats that don't strike out still work into at
+        # least one real strike, some go the whole way to a real
+        # 2-strike count before contact or ball four.
+        strikes_base = rng.choices([0, 1, 2], weights=[0.25, 0.35, 0.40], k=1)[0]
+        strikes_for_hitter = strikes_base
+        strikes_for_pitcher = strikes_base + 1 if outcome in BALL_IN_PLAY_OUTCOMES else strikes_base
+    strikes_for_hitter = min(strikes_for_hitter, pitches)
+    strikes_for_pitcher = min(strikes_for_pitcher, pitches)
+    return pitches, strikes_for_pitcher, strikes_for_hitter
 
 
 def _pick_weighted_pitch_row(crosswalk_df: pd.DataFrame, rng: random.Random) -> dict:
@@ -3636,15 +3663,15 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
         else:
             row = LEAGUE_AVG_BULLPEN_ROW
         outcome = simulate_plate_appearance(row, rng, park_factor=park_factor, wind_multiplier=wind_multiplier)
-        pa_pitches, pa_strikes = simulate_pitch_count_for_pa(outcome, rng, crosswalk_row=row)
+        pa_pitches, pa_strikes_pitcher, pa_strikes_hitter = simulate_pitch_count_for_pa(outcome, rng, crosswalk_row=row)
         if starter_active:
             starter_stats[name]["batters_faced"] += 1
             starter_stats[name]["pitches_thrown"] += pa_pitches
-            starter_stats[name]["strikes_thrown"] += pa_strikes
+            starter_stats[name]["strikes_thrown"] += pa_strikes_pitcher
 
         hs = hitter_stats[name]
         hs["plate_appearances"] += 1
-        hs["strikes_seen"] += pa_strikes
+        hs["strikes_seen"] += pa_strikes_hitter
         if outcome == "strikeout":
             hs["strikeouts"] += 1
             total_outs += 1
@@ -3764,15 +3791,15 @@ def _simulate_half_inning(batting_lineup_names: list, batting_crosswalks: dict,
         else:
             row = LEAGUE_AVG_BULLPEN_ROW
         outcome = simulate_plate_appearance(row, rng)
-        pa_pitches, pa_strikes = simulate_pitch_count_for_pa(outcome, rng, crosswalk_row=row)
+        pa_pitches, pa_strikes_pitcher, pa_strikes_hitter = simulate_pitch_count_for_pa(outcome, rng, crosswalk_row=row)
         if pitching_state["starter_active"]:
             pitching_state["starter_stats"]["batters_faced"] += 1
             pitching_state["starter_stats"]["pitches_thrown"] += pa_pitches
-            pitching_state["starter_stats"]["strikes_thrown"] += pa_strikes
+            pitching_state["starter_stats"]["strikes_thrown"] += pa_strikes_pitcher
 
         hs = batting_hitter_stats[name]
         hs["plate_appearances"] += 1
-        hs["strikes_seen"] += pa_strikes
+        hs["strikes_seen"] += pa_strikes_hitter
         if outcome == "strikeout":
             hs["strikeouts"] += 1
             outs_this_inning += 1
