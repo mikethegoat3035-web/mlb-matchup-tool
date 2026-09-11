@@ -1001,19 +1001,27 @@ else:
         )
         sim_props_wanted = st.multiselect(
             "Which hitter props to show", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
-                                            "strikeouts", "total_bases", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"],
+                                            "strikeouts", "runs", "rbi", "plate_appearances", "strikes_seen",
+                                            "total_bases", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"],
             default=["hits", "total_bases", "home_runs", "hits_runs_rbi", "fantasy"],
             key="sim_props_multiselect",
             help="'fantasy' uses Underdog's real scoring (walk 3pts, double 6pts, HBP 3pts). "
                  "'fantasy_prizepicks' is the SAME simulated games, re-weighted per PrizePicks' "
                  "real, different scoring (walk 2pts, double 5pts, HBP 2pts) - added per direct "
                  "request so both books' real lines can be checked separately instead of one "
-                 "generic 'fantasy' number standing in for both.",
+                 "generic 'fantasy' number standing in for both. 'runs'/'rbi' (per direct request) "
+                 "were already being simulated the whole time as part of hits_runs_rbi - now also "
+                 "exposed on their own for real 0.5-line props. 'plate_appearances' (per direct "
+                 "request) is a real, direct count of every time he comes to bat in a simulated "
+                 "game, correctly weighted by his real batting-order slot. 'strikes_seen' (per "
+                 "direct request) uses the same reasoned pitch-count APPROXIMATION as the "
+                 "pitcher-side pitches/strikes thrown - a real, credible estimate, not true "
+                 "pitch-by-pitch simulation.",
         )
         sim_pitcher_props_wanted = st.multiselect(
             "Which pitcher props to show",
-            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs",
-             "pitcher_fantasy", "pitcher_fantasy_prizepicks"],
+            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs", "batters_faced",
+             "pitches_thrown", "strikes_thrown", "pitcher_fantasy", "pitcher_fantasy_prizepicks"],
             default=["strikeouts", "outs", "earned_runs", "pitcher_fantasy"],
             key="sim_pitcher_props_multiselect",
             help="The starter's own real simulated stats. pitcher_fantasy uses Underdog's real "
@@ -1025,7 +1033,15 @@ else:
                  "innings, <=3 simulated earned runs, computed from the same real, tonight-"
                  "specific, opponent-adjusted games), not exposed as a separate prop of its own. "
                  "Win is included in the connected (both-team) simulation only - the single-"
-                 "sided version genuinely can't know if he won.",
+                 "sided version genuinely can't know if he won. 'batters_faced' (per direct "
+                 "request) is a real, direct derivation - every real PA he's involved in while "
+                 "active, regardless of outcome. 'pitches_thrown'/'strikes_thrown' (per direct "
+                 "request) use a real, reasoned APPROXIMATION, not true pitch-by-pitch "
+                 "simulation - real, credible per-outcome pitch-count averages (strikeouts take "
+                 "more pitches than balls in play, walks take the most), with genuine game-to-"
+                 "game variance. Honest limitation: this simulator decides PA outcomes directly, "
+                 "it doesn't model individual pitches, so treat these two as a defensible "
+                 "estimate, not as precise as the other props here.",
         )
         if not sim_props_wanted and not sim_pitcher_props_wanted:
             st.info("Pick at least one prop above.")
