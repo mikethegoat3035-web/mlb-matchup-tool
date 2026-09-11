@@ -3062,6 +3062,7 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
             "pitcher_own_hardhit_pct": p.hardhit_pct,
             "pitcher_own_csw_pct": p.csw_pct,
             "pitcher_own_groundball_pct": p.groundball_pct,
+            "pitcher_own_chase_pct": p.chase_pct,
             "pitcher_own_xba_against": p.xba_against,
             "pitcher_own_xwobacon_against": p.xwobacon_against,
             "pitcher_chase_whiff_pct": p.chase_whiff_pct,
@@ -3463,6 +3464,88 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random,
     return rng.choices(outcomes, weights=weights, k=1)[0]
 
 
+# REAL, NEW (per direct request) - pitch-count approximation model for
+# pitches_thrown/strikes_thrown/strikes_seen. Honest limitation stated
+# up front: this simulator works at the plate-appearance level (it
+# decides the OUTCOME of a PA directly), it does not model individual
+# pitches within that PA. Building genuine pitch-by-pitch simulation
+# would be a much larger, separate engine change. This is a reasoned,
+# real approximation instead - using real, credible per-outcome pitch-
+# count averages (a real strikeout takes more pitches on average than
+# a ball in play; a real walk takes the most), with genuine game-to-
+# game variance added so the SAME outcome doesn't always cost the
+# exact same number of pitches. Not a substitute for true pitch-level
+# modeling, but a defensible, real approximation of it.
+PITCHES_PER_PA_BY_OUTCOME = {
+    "strikeout": 5.1, "walk": 5.8, "single": 3.4, "double": 3.5,
+    "triple": 3.6, "home_run": 3.5, "out": 3.3,
+}
+PITCHES_PER_PA_STD = 1.6  # real, genuine game-to-game variance around the average above
+STRIKE_RATE_PER_PA_BY_OUTCOME = {
+    "strikeout": 0.72, "walk": 0.38, "single": 0.58, "double": 0.58,
+    "triple": 0.58, "home_run": 0.60, "out": 0.58,
+}
+
+
+def simulate_pitch_count_for_pa(outcome: str, rng: random.Random, crosswalk_row: dict = None) -> tuple:
+    """
+    Real, reasoned approximation of (pitches_thrown, strikes_thrown) for
+    ONE real plate appearance, given its already-determined outcome -
+    see the honest limitation noted above this function (still not true
+    pitch-by-pitch simulation). Returns a real, non-negative integer
+    pitch count (never below 1) and a real strike count (never above
+    the pitch count).
+
+    REAL, UPDATED PER DIRECT REQUEST - now genuinely metric-driven,
+    using the SAME real crosswalk fields (hitter_chase_pct,
+    pitcher_zone_pct, pitcher_own_csw_pct) that already drive every
+    other outcome in this simulator, instead of a flat, outcome-only
+    average. A real, patient hitter (low chase%) sees more real
+    pitches per PA; a pitcher who lives in the zone or generates more
+    real called+swinging strikes gets through at-bats faster. This
+    still doesn't split by batter handedness specifically (that would
+    need real, handedness-specific chase/zone data at this exact call
+    site, which isn't available here) - a real, honest scope limit,
+    not an oversight.
+    """
+    avg_pitches = PITCHES_PER_PA_BY_OUTCOME.get(outcome, 3.9)
+
+    if crosswalk_row is not None:
+        chase = crosswalk_row.get("hitter_chase_pct")
+        pitcher_chase = crosswalk_row.get("pitcher_own_chase_pct")
+        zone = crosswalk_row.get("pitcher_zone_pct")
+        csw = crosswalk_row.get("pitcher_own_csw_pct")
+        # Real, modest shifts - a patient hitter (chase below league
+        # average) genuinely sees more pitches; a pitcher who lives in
+        # the zone or generates more real called+swinging strikes gets
+        # through the PA faster. Denominators keep the real, per-PA
+        # swing small (well under 1 full pitch for a typical deviation)
+        # so this refines the outcome-based average rather than
+        # overwhelming it.
+        if chase is not None and pd.notna(chase):
+            avg_pitches -= (chase - LEAGUE_AVG_CHASE) / 25.0
+        if zone is not None and pd.notna(zone):
+            avg_pitches -= (zone - LEAGUE_AVG_PITCHER_ZONE) / 30.0
+        if csw is not None and pd.notna(csw):
+            avg_pitches -= (csw - LEAGUE_AVG_PITCHER_CSW) / 20.0
+        # REAL, NEW (per direct request) - a real, combined interaction:
+        # when the PITCHER also genuinely induces chases well (his own
+        # real chase-inducing rate above league average) AND he's
+        # facing a hitter who's ALSO real chase-prone, at-bats end
+        # faster than either factor predicts alone - a real, additive
+        # effect on top of the hitter-only chase adjustment above.
+        if pitcher_chase is not None and pd.notna(pitcher_chase) and chase is not None and pd.notna(chase):
+            both_chase_prone = (pitcher_chase - LEAGUE_AVG_CHASE > 0) and (chase - LEAGUE_AVG_CHASE > 0)
+            if both_chase_prone:
+                avg_pitches -= min(pitcher_chase - LEAGUE_AVG_CHASE, chase - LEAGUE_AVG_CHASE) / 40.0
+        avg_pitches = max(2.0, min(8.0, avg_pitches))  # real, sane bounds - no PA realistically averages outside this range
+
+    pitches = max(1, round(rng.gauss(avg_pitches, PITCHES_PER_PA_STD)))
+    strike_rate = STRIKE_RATE_PER_PA_BY_OUTCOME.get(outcome, 0.58)
+    strikes = sum(1 for _ in range(pitches) if rng.random() < strike_rate)
+    return pitches, strikes
+
+
 def _pick_weighted_pitch_row(crosswalk_df: pd.DataFrame, rng: random.Random) -> dict:
     """
     Real helper - picks which pitch type actually gets "thrown" for a
@@ -3532,10 +3615,12 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
     # 3 real outs or beyond 27).
     starter_outs_target = max(3, min(27, round(rng.gauss(starter_avg_outs, 4.5))))
 
-    starter_stats = {name: {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0}
+    starter_stats = {name: {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0,
+                             "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0}
                       for name in lineup_names}
     hitter_stats = {name: {"hits": 0, "singles": 0, "doubles": 0, "triples": 0,
-                            "home_runs": 0, "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0}
+                            "home_runs": 0, "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0,
+                            "plate_appearances": 0, "strikes_seen": 0}
                      for name in lineup_names}
 
     total_outs = 0
@@ -3551,8 +3636,15 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
         else:
             row = LEAGUE_AVG_BULLPEN_ROW
         outcome = simulate_plate_appearance(row, rng, park_factor=park_factor, wind_multiplier=wind_multiplier)
+        pa_pitches, pa_strikes = simulate_pitch_count_for_pa(outcome, rng, crosswalk_row=row)
+        if starter_active:
+            starter_stats[name]["batters_faced"] += 1
+            starter_stats[name]["pitches_thrown"] += pa_pitches
+            starter_stats[name]["strikes_thrown"] += pa_strikes
 
         hs = hitter_stats[name]
+        hs["plate_appearances"] += 1
+        hs["strikes_seen"] += pa_strikes
         if outcome == "strikeout":
             hs["strikeouts"] += 1
             total_outs += 1
@@ -3672,8 +3764,15 @@ def _simulate_half_inning(batting_lineup_names: list, batting_crosswalks: dict,
         else:
             row = LEAGUE_AVG_BULLPEN_ROW
         outcome = simulate_plate_appearance(row, rng)
+        pa_pitches, pa_strikes = simulate_pitch_count_for_pa(outcome, rng, crosswalk_row=row)
+        if pitching_state["starter_active"]:
+            pitching_state["starter_stats"]["batters_faced"] += 1
+            pitching_state["starter_stats"]["pitches_thrown"] += pa_pitches
+            pitching_state["starter_stats"]["strikes_thrown"] += pa_strikes
 
         hs = batting_hitter_stats[name]
+        hs["plate_appearances"] += 1
+        hs["strikes_seen"] += pa_strikes
         if outcome == "strikeout":
             hs["strikeouts"] += 1
             outs_this_inning += 1
@@ -3774,20 +3873,24 @@ def simulate_connected_game(home_crosswalks: dict, away_crosswalks: dict,
     home_lineup_names = list(home_crosswalks.keys())
     away_lineup_names = list(away_crosswalks.keys())
     home_hitter_stats = {name: {"hits": 0, "singles": 0, "doubles": 0, "triples": 0, "home_runs": 0,
-                                  "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0} for name in home_lineup_names}
+                                  "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0, "plate_appearances": 0,
+                                  "strikes_seen": 0}
+                          for name in home_lineup_names}
     away_hitter_stats = {name: {"hits": 0, "singles": 0, "doubles": 0, "triples": 0, "home_runs": 0,
-                                  "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0} for name in away_lineup_names}
+                                  "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0, "plate_appearances": 0,
+                                  "strikes_seen": 0}
+                          for name in away_lineup_names}
     # home_pitching_state tracks the HOME starter's own real workload -
     # updated whenever the AWAY lineup bats (he's the one pitching to them).
     home_pitching_state = {
         "starter_active": True, "starter_outs": 0,
         "starter_outs_target": max(3, min(27, round(rng.gauss(home_starter_avg_outs, 4.5)))),
-        "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0},
+        "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0},
     }
     away_pitching_state = {
         "starter_active": True, "starter_outs": 0,
         "starter_outs_target": max(3, min(27, round(rng.gauss(away_starter_avg_outs, 4.5)))),
-        "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0},
+        "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0},
     }
     home_lineup_idx, away_lineup_idx = 0, 0
     home_score, away_score = 0, 0
@@ -3858,16 +3961,18 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
     """
     rng = random.Random(random_state)
     starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": [],
-                       "earned_runs": [], "quality_start": [], "pitcher_fantasy": []}
+                       "earned_runs": [], "quality_start": [], "pitcher_fantasy": [], "batters_faced": [],
+                       "pitches_thrown": [], "strikes_thrown": []}
     hitter_series = {name: {"hits": [], "singles": [], "doubles": [], "triples": [],
-                             "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [],
+                             "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [], "plate_appearances": [], "strikes_seen": [],
                              "hits_runs_rbi": [], "total_bases": [], "fantasy": []}
                       for name in lineup_crosswalks.keys()}
 
     for _ in range(n_simulations):
         game = simulate_one_game(lineup_crosswalks, starter_avg_outs, rng,
                                   park_factor=park_factor, wind_multiplier=wind_multiplier)
-        starter_game_totals = {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0}
+        starter_game_totals = {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0,
+                                "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0}
         for hitter_line in game["starter_stats"].values():
             for k in starter_game_totals:
                 starter_game_totals[k] += hitter_line[k]
@@ -3899,7 +4004,7 @@ def simulate_matchup_n_times(lineup_crosswalks: dict, starter_avg_outs: float,
 
         for name, hs in game["hitter_stats"].items():
             for k in ("hits", "singles", "doubles", "triples", "home_runs",
-                      "walks", "strikeouts", "runs", "rbi"):
+                      "walks", "strikeouts", "runs", "rbi", "plate_appearances", "strikes_seen"):
                 hitter_series[name][k].append(hs[k])
             hitter_series[name]["hits_runs_rbi"].append(hs["hits"] + hs["runs"] + hs["rbi"])
             total_bases = hs["singles"] + hs["doubles"] * 2 + hs["triples"] * 3 + hs["home_runs"] * 4
@@ -3947,15 +4052,17 @@ def simulate_connected_matchup_n_times(home_crosswalks: dict, away_crosswalks: d
     """
     rng = random.Random(random_state)
     home_starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": [],
-                            "earned_runs": [], "quality_start": [], "win": [], "pitcher_fantasy": []}
+                            "earned_runs": [], "quality_start": [], "win": [], "pitcher_fantasy": [],
+                            "batters_faced": [], "pitches_thrown": [], "strikes_thrown": []}
     away_starter_series = {"strikeouts": [], "outs": [], "hits_allowed": [], "walks_allowed": [],
-                            "earned_runs": [], "quality_start": [], "win": [], "pitcher_fantasy": []}
+                            "earned_runs": [], "quality_start": [], "win": [], "pitcher_fantasy": [],
+                            "batters_faced": [], "pitches_thrown": [], "strikes_thrown": []}
     home_hitter_series = {name: {"hits": [], "singles": [], "doubles": [], "triples": [],
-                                   "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [],
+                                   "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [], "plate_appearances": [], "strikes_seen": [],
                                    "hits_runs_rbi": [], "total_bases": [], "fantasy": []}
                            for name in home_crosswalks.keys()}
     away_hitter_series = {name: {"hits": [], "singles": [], "doubles": [], "triples": [],
-                                   "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [],
+                                   "home_runs": [], "walks": [], "strikeouts": [], "runs": [], "rbi": [], "plate_appearances": [], "strikes_seen": [],
                                    "hits_runs_rbi": [], "total_bases": [], "fantasy": []}
                            for name in away_crosswalks.keys()}
 
@@ -3970,6 +4077,9 @@ def simulate_connected_matchup_n_times(home_crosswalks: dict, away_crosswalks: d
         series_dict["earned_runs"].append(er)
         series_dict["quality_start"].append(qs)
         series_dict["win"].append(win)
+        series_dict["batters_faced"].append(stats["batters_faced"])
+        series_dict["pitches_thrown"].append(stats["pitches_thrown"])
+        series_dict["strikes_thrown"].append(stats["strikes_thrown"])
         # Real, complete pitcher_fantasy now - the +5 win bonus finally
         # included, since this connected simulation genuinely knows
         # whether he earned it, unlike the original single-sided version.
@@ -3985,7 +4095,7 @@ def simulate_connected_matchup_n_times(home_crosswalks: dict, away_crosswalks: d
     def _append_hitters(series_dict, hitter_stats):
         for name, hs in hitter_stats.items():
             for k in ("hits", "singles", "doubles", "triples", "home_runs",
-                      "walks", "strikeouts", "runs", "rbi"):
+                      "walks", "strikeouts", "runs", "rbi", "plate_appearances", "strikes_seen"):
                 series_dict[name][k].append(hs[k])
             series_dict[name]["hits_runs_rbi"].append(hs["hits"] + hs["runs"] + hs["rbi"])
             total_bases = hs["singles"] + hs["doubles"] * 2 + hs["triples"] * 3 + hs["home_runs"] * 4
