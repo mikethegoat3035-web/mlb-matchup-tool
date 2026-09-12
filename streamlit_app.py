@@ -1001,27 +1001,19 @@ else:
         )
         sim_props_wanted = st.multiselect(
             "Which hitter props to show", ["hits", "singles", "doubles", "triples", "home_runs", "walks",
-                                            "strikeouts", "runs", "rbi", "plate_appearances", "strikes_seen",
-                                            "total_bases", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"],
+                                            "strikeouts", "total_bases", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"],
             default=["hits", "total_bases", "home_runs", "hits_runs_rbi", "fantasy"],
             key="sim_props_multiselect",
             help="'fantasy' uses Underdog's real scoring (walk 3pts, double 6pts, HBP 3pts). "
                  "'fantasy_prizepicks' is the SAME simulated games, re-weighted per PrizePicks' "
                  "real, different scoring (walk 2pts, double 5pts, HBP 2pts) - added per direct "
                  "request so both books' real lines can be checked separately instead of one "
-                 "generic 'fantasy' number standing in for both. 'runs'/'rbi' (per direct request) "
-                 "were already being simulated the whole time as part of hits_runs_rbi - now also "
-                 "exposed on their own for real 0.5-line props. 'plate_appearances' (per direct "
-                 "request) is a real, direct count of every time he comes to bat in a simulated "
-                 "game, correctly weighted by his real batting-order slot. 'strikes_seen' (per "
-                 "direct request) uses the same reasoned pitch-count APPROXIMATION as the "
-                 "pitcher-side pitches/strikes thrown - a real, credible estimate, not true "
-                 "pitch-by-pitch simulation.",
+                 "generic 'fantasy' number standing in for both.",
         )
         sim_pitcher_props_wanted = st.multiselect(
             "Which pitcher props to show",
-            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs", "batters_faced",
-             "pitches_thrown", "strikes_thrown", "pitcher_fantasy", "pitcher_fantasy_prizepicks"],
+            ["strikeouts", "outs", "hits_allowed", "walks_allowed", "earned_runs",
+             "pitcher_fantasy", "pitcher_fantasy_prizepicks"],
             default=["strikeouts", "outs", "earned_runs", "pitcher_fantasy"],
             key="sim_pitcher_props_multiselect",
             help="The starter's own real simulated stats. pitcher_fantasy uses Underdog's real "
@@ -1033,15 +1025,7 @@ else:
                  "innings, <=3 simulated earned runs, computed from the same real, tonight-"
                  "specific, opponent-adjusted games), not exposed as a separate prop of its own. "
                  "Win is included in the connected (both-team) simulation only - the single-"
-                 "sided version genuinely can't know if he won. 'batters_faced' (per direct "
-                 "request) is a real, direct derivation - every real PA he's involved in while "
-                 "active, regardless of outcome. 'pitches_thrown'/'strikes_thrown' (per direct "
-                 "request) use a real, reasoned APPROXIMATION, not true pitch-by-pitch "
-                 "simulation - real, credible per-outcome pitch-count averages (strikeouts take "
-                 "more pitches than balls in play, walks take the most), with genuine game-to-"
-                 "game variance. Honest limitation: this simulator decides PA outcomes directly, "
-                 "it doesn't model individual pitches, so treat these two as a defensible "
-                 "estimate, not as precise as the other props here.",
+                 "sided version genuinely can't know if he won.",
         )
         if not sim_props_wanted and not sim_pitcher_props_wanted:
             st.info("Pick at least one prop above.")
@@ -1107,25 +1091,6 @@ else:
                 )
                 hitter_min_zscore = st.slider("Hitter minimum edge (real std devs above tonight's own 9-man field)",
                                         0.0, 2.0, 0.3, step=0.1, key="sim_hitter_min_zscore")
-                # REAL FIX (confirmed bug, found via direct user report -
-                # too many strikes_seen/plate_appearances survivors) -
-                # these newer props have real, confirmed, meaningfully
-                # LOWER variance than established props (0.32 avg CV vs
-                # 0.92), which let far more of them clear the SAME flat
-                # 0.3 threshold than genuinely warranted - a low-CV prop
-                # produces an inflated z-score for the same real gap
-                # size. Mirrors the same real pattern already
-                # established on the pitcher side (counting-stat props
-                # get their own, different threshold).
-                hitter_min_zscore_low_variance = st.slider(
-                    "Hitter minimum edge for low-variance/new props (strikes_seen, plate_appearances, etc.)",
-                    0.0, 3.0, 1.5, step=0.1, key="sim_hitter_min_zscore_low_variance",
-                    help="These props (confirmed real avg CV ~0.32, vs ~0.92 for hits/RBI/fantasy) "
-                         "clear the standard 0.3 threshold far too easily, since a naturally tighter, "
-                         "less volatile stat produces an inflated z-score for the same real gap size. "
-                         "A real, separate, stricter bar keeps these as selective as your established "
-                         "props instead of flooding the results.",
-                )
             with fcol2:
                 # REAL FIX - recalibrated using real, live data from an
                 # actual run (2026-09-06). Confirmed directly: real hitter
@@ -1253,19 +1218,9 @@ else:
                 stage1_df["_pitcher_min_zscore_for_prop"] = stage1_df["prop"].apply(
                     lambda p: pitcher_min_zscore_counting if p in PITCHER_COUNTING_STAT_PROPS else pitcher_min_zscore)
 
-                # REAL FIX (confirmed bug, found via direct user report) -
-                # same real pattern as the pitcher counting-stat fix
-                # above, applied to hitters - these newer, confirmed
-                # lower-variance props need their own, stricter z-score
-                # floor instead of sharing the standard 0.3 bar.
-                HITTER_LOW_VARIANCE_PROPS = {"strikes_seen", "plate_appearances", "batters_faced",
-                                              "pitches_thrown", "strikes_thrown"}
-                stage1_df["_hitter_min_zscore_for_prop"] = stage1_df["prop"].apply(
-                    lambda p: hitter_min_zscore_low_variance if p in HITTER_LOW_VARIANCE_PROPS else hitter_min_zscore)
-
                 survivors = stage1_df[
                     (
-                        ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= stage1_df["_hitter_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
+                        ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= hitter_min_zscore) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
                         | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= stage1_df["_pitcher_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
                     )
                     & (stage1_df["coverage"] >= min_coverage)
