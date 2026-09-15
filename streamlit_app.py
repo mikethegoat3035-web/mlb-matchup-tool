@@ -68,6 +68,7 @@ from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
     match_book_line_to_player, get_unconfirmed_games_today, get_already_started_games,
+    get_one_sided_pitcher_props,
     pull_todays_games,
     backtest_full_season_mlb, PITCHER_BACKTEST_LINES, HITTER_BACKTEST_LINES,
     backtest_hitter_prop_quality_walk_forward, get_batter_id,
@@ -165,6 +166,42 @@ if "pending_games" in st.session_state:
         st.dataframe(pending[display_cols], width='stretch', hide_index=True)
         st.caption("Rescan closer to first pitch for these specific games once their "
                    "lineups post — usually 1-3 hours before game time.")
+
+st.divider()
+st.subheader("🎯 One-Sided Pitcher Check")
+st.caption(
+    "For a game still showing as not fully confirmed above: a pitcher's own props "
+    "(strikeouts, outs, hits allowed, earned runs) only ever depend on the OPPOSING "
+    "team's real, confirmed lineup - never his own team's hitters. This runs that "
+    "check directly, without waiting for both sides to post."
+)
+one_sided_game_pk = st.number_input("Game PK", min_value=0, step=1, key="one_sided_game_pk")
+one_sided_side = st.selectbox("Which side is the pitcher on?", ["home", "away"], key="one_sided_side")
+one_sided_lines_str = st.text_input(
+    "Lines to check (e.g. outs:15.5, strikeouts:5.5, hits_allowed:4.5)",
+    value="outs:15.5, strikeouts:5.5, hits_allowed:4.5", key="one_sided_lines",
+)
+if st.button("Run one-sided pitcher check", key="one_sided_btn"):
+    try:
+        lines = {}
+        for part in one_sided_lines_str.split(","):
+            k, v = part.split(":")
+            lines[k.strip()] = float(v.strip())
+    except Exception:
+        st.error("Couldn't parse the lines - use the format 'outs:15.5, strikeouts:5.5'.")
+        lines = None
+    if lines:
+        with st.spinner("Checking the opposing lineup and pulling this pitcher's real props..."):
+            try:
+                result = get_one_sided_pitcher_props(int(one_sided_game_pk), one_sided_side, lines)
+                if not result.get("usable"):
+                    st.warning(f"Not ready yet: {result.get('reason')}")
+                else:
+                    st.success(f"{result['pitcher_name']} — {result['note']}")
+                    st.caption(f"Opposing lineup: {result['opposing_lineup_size']} real hitters pulled.")
+                    st.dataframe(result["probabilities"], width='stretch')
+            except Exception as e:
+                st.error(f"One-sided check failed: {e}")
 
 
 
