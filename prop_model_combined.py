@@ -11041,3 +11041,144 @@ def backtest_pitcher_win_walk_forward(pitcher_id: int, season: int,
         })
     return pd.DataFrame(rows)
                                             
+
+
+# =============================================================================
+# ONE-SIDED PITCHER EVALUATION - per direct request. The main scan
+# requires BOTH teams' lineups AND both starting pitchers confirmed
+# before running anything, but that's a batch-processing convenience,
+# not a real logical requirement: a pitcher's own props (his real
+# strikeouts/outs/hits allowed/earned runs) only ever depend on the
+# OPPOSING team's lineup being confirmed - never his own team's
+# hitters, which pitcher_prop_probabilities() never even takes as an
+# argument. This lets a specific pitcher be evaluated the moment the
+# team he's facing has a real, posted lineup, even if his own team's
+# hitters haven't posted yet.
+# =============================================================================
+
+def get_one_sided_pitcher_props(game_pk: int, pitcher_side: str, lines: dict,
+                                  pitcher_start: str = None, today_str: str = None,
+                                  hitter_start: str = None) -> dict:
+    """
+    Real, direct one-sided pitcher evaluation - mirrors the exact same
+    real logic already proven in the main scan loop (arsenal profile,
+    zone breakdown, season-blend, opposing lineup hitter profiles,
+    lineup_adjustment, handedness-aware park factor), but gates ONLY
+    on what this specific pitcher's props actually need: his own
+    confirmed starting spot, and the OPPOSING team's real, confirmed
+    9-man lineup - NOT his own team's hitters, which this calculation
+    never touches at all.
+
+    pitcher_side: 'home' or 'away' - which team this pitcher is on.
+    lines: {'outs': 15.5, 'strikeouts': 5.5, ...} - same shape as
+    pitcher_prop_probabilities().
+
+    Returns {"usable": False, "reason": ...} if the OPPOSING lineup
+    isn't confirmed yet or this pitcher isn't confirmed, or
+    {"usable": True, "probabilities": <DataFrame>, "pitcher_name": ...,
+    "note": "one-sided evaluation - opposing team's own lineup not
+    yet required to be confirmed"} once real data is available.
+    """
+    if today_str is None:
+        today_str = get_mlb_today().strftime("%Y-%m-%d")
+    if pitcher_start is None:
+        pitcher_start = (get_mlb_today() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    if hitter_start is None:
+        hitter_start = (get_mlb_today() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+
+    pitcher_info = get_probable_pitcher(game_pk, pitcher_side)
+    if not pitcher_info:
+        return {"usable": False, "reason": f"no confirmed starting pitcher yet for the {pitcher_side} side"}
+    pid = pitcher_info["player_id"]
+    pitcher_name = pitcher_info.get("name", "Unknown")
+
+    # Real, direct check of ONLY the opposing lineup - the actual
+    # requirement, not the full both-sides gate the main scan uses.
+    opposing_side = "away" if pitcher_side == "home" else "home"
+    try:
+        raw = statsapi.get("schedule", {"sportId": 1, "gamePk": game_pk, "hydrate": "lineups"})
+        game = raw.get("dates", [{}])[0].get("games", [{}])[0]
+        lineup_raw = game.get("lineups", {}).get(f"{opposing_side}Players", [])
+    except (KeyError, IndexError, AttributeError):
+        lineup_raw = []
+
+    if len(lineup_raw) < 9:
+        # Real fallback - try the boxscore path, same real logic
+        # pull_confirmed_lineup() itself uses for its own fallback.
+        try:
+            box = statsapi.boxscore_data(game_pk)
+            team_players = box.get(opposing_side, {}).get("players", {})
+            lineup_raw = []
+            for pid_key, pdata in team_players.items():
+                order = pdata.get("battingOrder")
+                if order:
+                    lineup_raw.append({
+                        "id": pdata.get("person", {}).get("id"),
+                        "fullName": pdata.get("person", {}).get("fullName"),
+                        "_order": int(str(order)[0]),
+                    })
+            lineup_raw.sort(key=lambda x: x["_order"])
+        except Exception:
+            lineup_raw = []
+
+    if len(lineup_raw) < 9:
+        return {"usable": False,
+                "reason": f"opposing ({opposing_side}) lineup not confirmed yet - real 9-man batting "
+                          "order hasn't posted, so this pitcher's real matchup context isn't available yet"}
+
+    opposing_lineup = [{
+        "player_id": p.get("id"), "name": p.get("fullName"),
+        "order_slot": i + 1, "expected_pa": EXPECTED_PA_BY_ORDER_SLOT.get(i + 1, 4.0),
+    } for i, p in enumerate(lineup_raw[:9])]
+
+    # Real park factor for tonight - always the HOME team's park,
+    # same real convention used throughout.
+    try:
+        game_info = statsapi.schedule(game_id=game_pk)[0]
+        home_name = game_info.get("home_name", "")
+    except Exception:
+        home_name = ""
+    game_park_factor = get_park_factor(home_name)
+
+    pitcher_raw_pitches = pull_pitcher_pitches(pid, pitcher_start, today_str)
+    pitcher_recent_raw = build_arsenal_profile(pitcher_raw_pitches)
+    if not pitcher_recent_raw:
+        return {"usable": False, "reason": f"not enough real, recent pitch data for {pitcher_name}"}
+
+    pitcher_season_start = (get_mlb_today() - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+    try:
+        pitcher_season_profile = build_arsenal_profile(pull_pitcher_pitches(pid, pitcher_season_start, today_str))
+        pitcher_recent = (blend_profiles(pitcher_recent_raw, pitcher_season_profile)
+                           if pitcher_season_profile else pitcher_recent_raw)
+    except Exception:
+        pitcher_recent = pitcher_recent_raw
+
+    opposing_hitters = []
+    for hitter in opposing_lineup:
+        try:
+            hbid = hitter["player_id"]
+            hhand = get_batter_hand(hbid)
+            hhand = hhand if hhand in ("L", "R") else "R"
+            hh_raw_pitches = pull_batter_pitches(hbid, hitter_start, today_str)
+            hh_recent = build_hitter_profile(hh_raw_pitches, batter_hand=hhand)
+            if hh_recent:
+                opposing_hitters.append((hh_recent, hhand, hitter["expected_pa"]))
+        except Exception:
+            continue
+
+    if not opposing_hitters:
+        return {"usable": False,
+                "reason": "opposing lineup posted, but no real, usable hitter pitch data could be pulled yet"}
+
+    lineup_adj = opponent_lineup_strength(pitcher_recent, opposing_hitters)
+    probabilities = pitcher_prop_probabilities(
+        pid, pitcher_start, today_str, lines,
+        park_factor=game_park_factor, lineup_adjustment=lineup_adj,
+    )
+
+    return {
+        "usable": True, "pitcher_name": pitcher_name, "probabilities": probabilities,
+        "opposing_lineup_size": len(opposing_hitters),
+        "note": "One-sided evaluation - only the opposing lineup needed to be confirmed, "
+                f"not {pitcher_name}'s own team's hitters.",
+    }
