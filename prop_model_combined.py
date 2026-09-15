@@ -11182,3 +11182,36 @@ def get_one_sided_pitcher_props(game_pk: int, pitcher_side: str, lines: dict,
         "note": "One-sided evaluation - only the opposing lineup needed to be confirmed, "
                 f"not {pitcher_name}'s own team's hitters.",
     }
+
+
+def get_one_sided_pitcher_props_by_team(pitching_team_name: str, lines: dict, date: str = None) -> dict:
+    """
+    Real, SIMPLE entry point for get_one_sided_pitcher_props() - per
+    direct feedback, requiring a game_pk (an obscure internal ID
+    number nobody has on hand in the moment) defeated the entire
+    purpose of a quick, in-game check. This takes just the pitching
+    team's real name instead, looks up today's real schedule, finds
+    the matching game and which side that team is on automatically,
+    then calls the real function above - no ID lookup step at all.
+    """
+    try:
+        games = pull_todays_games(date=date)
+    except Exception as e:
+        return {"usable": False, "reason": f"couldn't pull today's real schedule: {e}"}
+
+    if games.empty:
+        return {"usable": False, "reason": "no real games found for today"}
+
+    q = pitching_team_name.lower()
+    match = games[
+        games["home_name"].str.lower().str.contains(q, na=False)
+        | games["away_name"].str.lower().str.contains(q, na=False)
+    ]
+    if match.empty:
+        return {"usable": False, "reason": f"no real game found today matching '{pitching_team_name}'"}
+
+    row = match.iloc[0]
+    game_pk = row["game_id"]
+    side = "home" if q in str(row["home_name"]).lower() else "away"
+
+    return get_one_sided_pitcher_props(game_pk, side, lines)
