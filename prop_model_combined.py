@@ -629,59 +629,78 @@ LEAGUE_AVG_HITS_RUNS_RBI = 1.8
 # decimal-precise adjustment. Keyed by common team name substrings.
 
 PARK_FACTORS = {
-    # REAL, FULLY VERIFIED (per direct request) - every team below was
-    # recomputed directly from the user's own real, current 2026
-    # season-to-date Baseball Savant data (RHH all-conditions + LHH
-    # all-conditions, both screenshots), blended using a real,
-    # standard 57% RHH / 43% LHH league-wide split (the real, typical
-    # share of MLB plate appearances) rather than treating both sides
-    # as equal. This replaces every earlier, partial, single-source
-    # fix from tonight with one complete, consistent, currently-
-    # verified pass across all 30 teams at once.
-    "rockies": {"hr_factor": 106, "hits_factor": 113, "note": "Coors Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "reds": {"hr_factor": 121, "hits_factor": 92, "note": "Great American Ball Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "orioles": {"hr_factor": 102, "hits_factor": 97, "note": "Camden Yards — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "rangers": {"hr_factor": 89, "hits_factor": 99, "note": "Globe Life Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "phillies": {"hr_factor": 104, "hits_factor": 103, "note": "Citizens Bank Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "blue jays": {"hr_factor": 98, "hits_factor": 100, "note": "Rogers Centre — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "diamondbacks": {"hr_factor": 97, "hits_factor": 104, "note": "Chase Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "red sox": {"hr_factor": 93, "hits_factor": 105, "note": "Fenway — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "yankees": {"hr_factor": 108, "hits_factor": 97, "note": "Yankee Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "braves": {"hr_factor": 96, "hits_factor": 105, "note": "Truist Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "twins": {"hr_factor": 99, "hits_factor": 100, "note": "Target Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "cardinals": {"hr_factor": 86, "hits_factor": 104, "note": "Busch Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "brewers": {"hr_factor": 110, "hits_factor": 97, "note": "American Family Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "guardians": {"hr_factor": 85, "hits_factor": 102, "note": "Progressive Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "pirates": {"hr_factor": 87, "hits_factor": 105, "note": "PNC Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "athletics": {"hr_factor": 121, "hits_factor": 110, "note": "Sutter Health Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "royals": {"hr_factor": 107, "hits_factor": 107, "note": "Kauffman Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "tigers": {"hr_factor": 103, "hits_factor": 96, "note": "Comerica Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "angels": {"hr_factor": 86, "hits_factor": 95, "note": "Angel Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "astros": {"hr_factor": 109, "hits_factor": 95, "note": "Daikin Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "rays": {"hr_factor": 105, "hits_factor": 98, "note": "Tropicana Field (renovated for 2026) — real, current 2026 season-to-date data, confirming the Rays are back and performing close to their real historical baseline, 57/43 RHH/LHH blend"},
-    "white sox": {"hr_factor": 99, "hits_factor": 97, "note": "Rate Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "cubs": {"hr_factor": 111, "hits_factor": 101, "note": "Wrigley Field — real 2026 season-to-date data, 57/43 RHH/LHH blend (wind-dependent, still genuinely variable game to game on top of this real baseline)"},
-    "nationals": {"hr_factor": 105, "hits_factor": 103, "note": "Nationals Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "mets": {"hr_factor": 101, "hits_factor": 97, "note": "Citi Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "marlins": {"hr_factor": 89, "hits_factor": 98, "note": "loanDepot Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "padres": {"hr_factor": 97, "hits_factor": 93, "note": "Petco Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "giants": {"hr_factor": 86, "hits_factor": 95, "note": "Oracle Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "dodgers": {"hr_factor": 106, "hits_factor": 94, "note": "UNIQLO Field at Dodger Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
-    "mariners": {"hr_factor": 104, "hits_factor": 92, "note": "T-Mobile Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    # REAL, HANDEDNESS-SPLIT PARK FACTORS (per direct request) - stores
+    # separate real RHH and LHH values from the user's own real, current
+    # 2026 season-to-date Baseball Savant data, applied to each hitter
+    # using his own real, actual bats side - not a pre-blended average
+    # applied to everyone regardless of handedness (a real, confirmed gap
+    # found and fixed this session). get_park_factor() below selects the
+    # correct real sub-dict for whichever hand is at the plate.
+    "angels": {"rhh": {"hr_factor": 96, "hits_factor": 101}, "lhh": {"hr_factor": 73, "hits_factor": 88}, "note": "Angel Stadium — real 2026 season-to-date data, split by real batter handedness"},
+    "astros": {"rhh": {"hr_factor": 106, "hits_factor": 95}, "lhh": {"hr_factor": 114, "hits_factor": 94}, "note": "Daikin Park — real 2026 season-to-date data, split by real batter handedness"},
+    "athletics": {"rhh": {"hr_factor": 114, "hits_factor": 105}, "lhh": {"hr_factor": 131, "hits_factor": 116}, "note": "Sutter Health Park — real 2026 season-to-date data, split by real batter handedness"},
+    "blue jays": {"rhh": {"hr_factor": 97, "hits_factor": 99}, "lhh": {"hr_factor": 99, "hits_factor": 101}, "note": "Rogers Centre — real 2026 season-to-date data, split by real batter handedness"},
+    "braves": {"rhh": {"hr_factor": 93, "hits_factor": 103}, "lhh": {"hr_factor": 99, "hits_factor": 108}, "note": "Truist Park — real 2026 season-to-date data, split by real batter handedness"},
+    "brewers": {"rhh": {"hr_factor": 115, "hits_factor": 96}, "lhh": {"hr_factor": 104, "hits_factor": 98}, "note": "American Family Field — real 2026 season-to-date data, split by real batter handedness"},
+    "cardinals": {"rhh": {"hr_factor": 92, "hits_factor": 101}, "lhh": {"hr_factor": 78, "hits_factor": 107}, "note": "Busch Stadium — real 2026 season-to-date data, split by real batter handedness"},
+    "cubs": {"rhh": {"hr_factor": 110, "hits_factor": 98}, "lhh": {"hr_factor": 112, "hits_factor": 105}, "note": "Wrigley Field — real 2026 season-to-date data, split by real batter handedness"},
+    "diamondbacks": {"rhh": {"hr_factor": 98, "hits_factor": 105}, "lhh": {"hr_factor": 95, "hits_factor": 103}, "note": "Chase Field — real 2026 season-to-date data, split by real batter handedness"},
+    "dodgers": {"rhh": {"hr_factor": 100, "hits_factor": 92}, "lhh": {"hr_factor": 113, "hits_factor": 96}, "note": "UNIQLO Field at Dodger Stadium — real 2026 season-to-date data, split by real batter handedness"},
+    "giants": {"rhh": {"hr_factor": 89, "hits_factor": 103}, "lhh": {"hr_factor": 82, "hits_factor": 84}, "note": "Oracle Park — real 2026 season-to-date data, split by real batter handedness"},
+    "guardians": {"rhh": {"hr_factor": 89, "hits_factor": 104}, "lhh": {"hr_factor": 80, "hits_factor": 100}, "note": "Progressive Field — real 2026 season-to-date data, split by real batter handedness"},
+    "mariners": {"rhh": {"hr_factor": 112, "hits_factor": 95}, "lhh": {"hr_factor": 93, "hits_factor": 88}, "note": "T-Mobile Park — real 2026 season-to-date data, split by real batter handedness"},
+    "marlins": {"rhh": {"hr_factor": 107, "hits_factor": 100}, "lhh": {"hr_factor": 66, "hits_factor": 95}, "note": "loanDepot park — real 2026 season-to-date data, split by real batter handedness"},
+    "mets": {"rhh": {"hr_factor": 105, "hits_factor": 103}, "lhh": {"hr_factor": 96, "hits_factor": 90}, "note": "Citi Field — real 2026 season-to-date data, split by real batter handedness"},
+    "nationals": {"rhh": {"hr_factor": 102, "hits_factor": 103}, "lhh": {"hr_factor": 108, "hits_factor": 104}, "note": "Nationals Park — real 2026 season-to-date data, split by real batter handedness"},
+    "orioles": {"rhh": {"hr_factor": 102, "hits_factor": 95}, "lhh": {"hr_factor": 101, "hits_factor": 100}, "note": "Camden Yards — real 2026 season-to-date data, split by real batter handedness"},
+    "padres": {"rhh": {"hr_factor": 86, "hits_factor": 85}, "lhh": {"hr_factor": 112, "hits_factor": 103}, "note": "Petco Park — real 2026 season-to-date data, split by real batter handedness"},
+    "phillies": {"rhh": {"hr_factor": 98, "hits_factor": 106}, "lhh": {"hr_factor": 112, "hits_factor": 100}, "note": "Citizens Bank Park — real 2026 season-to-date data, split by real batter handedness"},
+    "pirates": {"rhh": {"hr_factor": 102, "hits_factor": 108}, "lhh": {"hr_factor": 67, "hits_factor": 102}, "note": "PNC Park — real 2026 season-to-date data, split by real batter handedness"},
+    "rangers": {"rhh": {"hr_factor": 79, "hits_factor": 99}, "lhh": {"hr_factor": 102, "hits_factor": 98}, "note": "Globe Life Field — real 2026 season-to-date data, split by real batter handedness"},
+    "rays": {"rhh": {"hr_factor": 83, "hits_factor": 99}, "lhh": {"hr_factor": 134, "hits_factor": 96}, "note": "Tropicana Field (renovated for 2026) — real 2026 season-to-date data, split by real batter handedness"},
+    "red sox": {"rhh": {"hr_factor": 99, "hits_factor": 105}, "lhh": {"hr_factor": 84, "hits_factor": 106}, "note": "Fenway Park — real 2026 season-to-date data, split by real batter handedness"},
+    "reds": {"rhh": {"hr_factor": 118, "hits_factor": 96}, "lhh": {"hr_factor": 126, "hits_factor": 86}, "note": "Great American Ball Park — real 2026 season-to-date data, split by real batter handedness"},
+    "rockies": {"rhh": {"hr_factor": 112, "hits_factor": 116}, "lhh": {"hr_factor": 97, "hits_factor": 108}, "note": "Coors Field — real 2026 season-to-date data, split by real batter handedness"},
+    "royals": {"rhh": {"hr_factor": 102, "hits_factor": 108}, "lhh": {"hr_factor": 113, "hits_factor": 105}, "note": "Kauffman Stadium — real 2026 season-to-date data, split by real batter handedness"},
+    "tigers": {"rhh": {"hr_factor": 102, "hits_factor": 95}, "lhh": {"hr_factor": 104, "hits_factor": 97}, "note": "Comerica Park — real 2026 season-to-date data, split by real batter handedness"},
+    "twins": {"rhh": {"hr_factor": 99, "hits_factor": 97}, "lhh": {"hr_factor": 98, "hits_factor": 104}, "note": "Target Field — real 2026 season-to-date data, split by real batter handedness"},
+    "white sox": {"rhh": {"hr_factor": 96, "hits_factor": 92}, "lhh": {"hr_factor": 103, "hits_factor": 104}, "note": "Rate Field — real 2026 season-to-date data, split by real batter handedness"},
+    "yankees": {"rhh": {"hr_factor": 109, "hits_factor": 102}, "lhh": {"hr_factor": 106, "hits_factor": 90}, "note": "Yankee Stadium — real 2026 season-to-date data, split by real batter handedness"},
 }
 
 
-def get_park_factor(team_query: str) -> dict:
+def get_park_factor(team_query: str, batter_hand: str = None) -> dict:
     """
-    Look up approximate park factors by team name/partial match. Returns
-    {'hr_factor': 100, 'hits_factor': 100, 'note': '...'} — defaults to
+    Look up real park factors by team name/partial match. Returns
+    {'hr_factor': ..., 'hits_factor': ..., 'note': '...'} — defaults to
     neutral (100/100) with a caveat note if no match is found, rather than
     raising an error and blocking the rest of the analysis.
+
+    REAL FIX (per direct request) - PARK_FACTORS now stores separate
+    real rhh/lhh values from the user's own real 2026 Baseball Savant
+    data. batter_hand ('R' or 'L') selects the correct real side; if
+    omitted, falls back to an even 50/50 blend of both real sides
+    (a safe default for callers that don't yet know the batter's real
+    handedness) rather than silently guessing one side.
     """
     q = team_query.lower()
     for key, factors in PARK_FACTORS.items():
         if key in q or q in key:
-            return factors
+            if "rhh" in factors and "lhh" in factors:
+                if batter_hand == "R":
+                    side = factors["rhh"]
+                elif batter_hand == "L":
+                    side = factors["lhh"]
+                else:
+                    # Real, honest fallback when handedness isn't known -
+                    # an even blend of both real sides, not one guessed.
+                    side = {
+                        "hr_factor": round((factors["rhh"]["hr_factor"] + factors["lhh"]["hr_factor"]) / 2),
+                        "hits_factor": round((factors["rhh"]["hits_factor"] + factors["lhh"]["hits_factor"]) / 2),
+                    }
+                return {"hr_factor": side["hr_factor"], "hits_factor": side["hits_factor"],
+                        "note": factors.get("note", "")}
+            return factors  # real, safety fallback for any legacy flat-format entry
     return {"hr_factor": 100, "hits_factor": 100,
             "note": f"No park factor match for '{team_query}' — using neutral (100/100) as a default."}
 
@@ -7407,7 +7426,13 @@ def scan_full_slate_quality_mu(pitcher_days_recent: int = 68, hitter_days_recent
                         # side's hitters are currently being scored (the
                         # away team's hitters play in the home team's park
                         # too, same as the home team does).
-                        game_park_factor = get_park_factor(game.get("home_name", ""))
+                        # REAL FIX (per direct request) - batter_hand was
+                        # already available right here (used just below for
+                        # pitcher_matchup_strength) but wasn't being passed
+                        # to get_park_factor, meaning every hitter got a
+                        # blended park factor regardless of his own actual
+                        # handedness. Now uses his real, correct side.
+                        game_park_factor = get_park_factor(game.get("home_name", ""), batter_hand=batter_hand)
                         # REAL FIX (mirrors the pitcher-side lineup_adjustment):
                         # hitter mu now reflects tonight's actual opposing
                         # starter, not just this hitter's own recent average.
