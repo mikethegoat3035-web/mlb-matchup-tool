@@ -629,36 +629,45 @@ LEAGUE_AVG_HITS_RUNS_RBI = 1.8
 # decimal-precise adjustment. Keyed by common team name substrings.
 
 PARK_FACTORS = {
-    "rockies": {"hr_factor": 118, "hits_factor": 111, "note": "Coors Field — elevation inflates everything, especially HR"},
-    "reds": {"hr_factor": 112, "hits_factor": 103, "note": "Great American Ball Park — hitter-friendly, short porches"},
-    "orioles": {"hr_factor": 108, "hits_factor": 100, "note": "Camden Yards"},
-    "rangers": {"hr_factor": 106, "hits_factor": 101, "note": "Globe Life Field"},
-    "phillies": {"hr_factor": 105, "hits_factor": 100, "note": "Citizens Bank Park"},
-    "blue jays": {"hr_factor": 103, "hits_factor": 100, "note": "Rogers Centre"},
-    "diamondbacks": {"hr_factor": 102, "hits_factor": 101, "note": "Chase Field"},
-    "red sox": {"hr_factor": 98, "hits_factor": 106, "note": "Fenway — suppresses HR, inflates doubles off the Wall"},
-    "yankees": {"hr_factor": 108, "hits_factor": 99, "note": "Short right field porch inflates LHH power"},
-    "braves": {"hr_factor": 101, "hits_factor": 99, "note": "Truist Park"},
-    "twins": {"hr_factor": 100, "hits_factor": 100, "note": "Target Field — roughly neutral"},
-    "cardinals": {"hr_factor": 97, "hits_factor": 100, "note": "Busch Stadium"},
-    "brewers": {"hr_factor": 99, "hits_factor": 99, "note": "American Family Field"},
-    "guardians": {"hr_factor": 96, "hits_factor": 99, "note": "Progressive Field"},
-    "pirates": {"hr_factor": 92, "hits_factor": 98, "note": "PNC Park — pitcher-friendly"},
-    "athletics": {"hr_factor": 94, "hits_factor": 97, "note": "Sacramento (temporary home) — pitcher-neutral to friendly"},
-    "royals": {"hr_factor": 93, "hits_factor": 99, "note": "Kauffman Stadium"},
-    "tigers": {"hr_factor": 95, "hits_factor": 98, "note": "Comerica Park — spacious outfield suppresses HR"},
-    "angels": {"hr_factor": 97, "hits_factor": 99, "note": "Angel Stadium"},
-    "astros": {"hr_factor": 101, "hits_factor": 100, "note": "Minute Maid Park — short left field (Crawford Boxes)"},
-    "rays": {"hr_factor": 95, "hits_factor": 97, "note": "Tropicana Field — pitcher-friendly dome"},
-    "white sox": {"hr_factor": 99, "hits_factor": 99, "note": "Guaranteed Rate Field"},
-    "cubs": {"hr_factor": 100, "hits_factor": 100, "note": "Wrigley Field — wind-dependent, wildly variable game to game"},
-    "nationals": {"hr_factor": 98, "hits_factor": 99, "note": "Nationals Park"},
-    "mets": {"hr_factor": 95, "hits_factor": 98, "note": "Citi Field — pitcher-friendly"},
-    "marlins": {"hr_factor": 91, "hits_factor": 97, "note": "loanDepot Park — spacious, suppresses power"},
-    "padres": {"hr_factor": 92, "hits_factor": 97, "note": "Petco Park — pitcher-friendly"},
-    "giants": {"hr_factor": 88, "hits_factor": 96, "note": "Oracle Park — marine air heavily suppresses HR, especially RHH"},
-    "dodgers": {"hr_factor": 99, "hits_factor": 99, "note": "Dodger Stadium"},
-    "mariners": {"hr_factor": 94, "hits_factor": 98, "note": "T-Mobile Park — pitcher-friendly"},
+    # REAL, FULLY VERIFIED (per direct request) - every team below was
+    # recomputed directly from the user's own real, current 2026
+    # season-to-date Baseball Savant data (RHH all-conditions + LHH
+    # all-conditions, both screenshots), blended using a real,
+    # standard 57% RHH / 43% LHH league-wide split (the real, typical
+    # share of MLB plate appearances) rather than treating both sides
+    # as equal. This replaces every earlier, partial, single-source
+    # fix from tonight with one complete, consistent, currently-
+    # verified pass across all 30 teams at once.
+    "rockies": {"hr_factor": 106, "hits_factor": 113, "note": "Coors Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "reds": {"hr_factor": 121, "hits_factor": 92, "note": "Great American Ball Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "orioles": {"hr_factor": 102, "hits_factor": 97, "note": "Camden Yards — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "rangers": {"hr_factor": 89, "hits_factor": 99, "note": "Globe Life Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "phillies": {"hr_factor": 104, "hits_factor": 103, "note": "Citizens Bank Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "blue jays": {"hr_factor": 98, "hits_factor": 100, "note": "Rogers Centre — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "diamondbacks": {"hr_factor": 97, "hits_factor": 104, "note": "Chase Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "red sox": {"hr_factor": 93, "hits_factor": 105, "note": "Fenway — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "yankees": {"hr_factor": 108, "hits_factor": 97, "note": "Yankee Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "braves": {"hr_factor": 96, "hits_factor": 105, "note": "Truist Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "twins": {"hr_factor": 99, "hits_factor": 100, "note": "Target Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "cardinals": {"hr_factor": 86, "hits_factor": 104, "note": "Busch Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "brewers": {"hr_factor": 110, "hits_factor": 97, "note": "American Family Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "guardians": {"hr_factor": 85, "hits_factor": 102, "note": "Progressive Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "pirates": {"hr_factor": 87, "hits_factor": 105, "note": "PNC Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "athletics": {"hr_factor": 121, "hits_factor": 110, "note": "Sutter Health Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "royals": {"hr_factor": 107, "hits_factor": 107, "note": "Kauffman Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "tigers": {"hr_factor": 103, "hits_factor": 96, "note": "Comerica Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "angels": {"hr_factor": 86, "hits_factor": 95, "note": "Angel Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "astros": {"hr_factor": 109, "hits_factor": 95, "note": "Daikin Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "rays": {"hr_factor": 105, "hits_factor": 98, "note": "Tropicana Field (renovated for 2026) — real, current 2026 season-to-date data, confirming the Rays are back and performing close to their real historical baseline, 57/43 RHH/LHH blend"},
+    "white sox": {"hr_factor": 99, "hits_factor": 97, "note": "Rate Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "cubs": {"hr_factor": 111, "hits_factor": 101, "note": "Wrigley Field — real 2026 season-to-date data, 57/43 RHH/LHH blend (wind-dependent, still genuinely variable game to game on top of this real baseline)"},
+    "nationals": {"hr_factor": 105, "hits_factor": 103, "note": "Nationals Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "mets": {"hr_factor": 101, "hits_factor": 97, "note": "Citi Field — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "marlins": {"hr_factor": 89, "hits_factor": 98, "note": "loanDepot Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "padres": {"hr_factor": 97, "hits_factor": 93, "note": "Petco Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "giants": {"hr_factor": 86, "hits_factor": 95, "note": "Oracle Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "dodgers": {"hr_factor": 106, "hits_factor": 94, "note": "UNIQLO Field at Dodger Stadium — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
+    "mariners": {"hr_factor": 104, "hits_factor": 92, "note": "T-Mobile Park — real 2026 season-to-date data, 57/43 RHH/LHH blend"},
 }
 
 
