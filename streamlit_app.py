@@ -92,6 +92,9 @@ from prop_model_combined import (
     LEAGUE_AVG_PITCHER_WALKS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_WALKS_ALLOWED_PER_START,
     LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START, LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START,
     LEAGUE_AVG_PITCHER_FANTASY_PER_START, LEAGUE_STD_PITCHER_FANTASY_PER_START,
+    LEAGUE_AVG_HITTER_HRR_PER_GAME, LEAGUE_STD_HITTER_HRR_PER_GAME,
+    LEAGUE_AVG_HITTER_FANTASY_UD_PER_GAME, LEAGUE_STD_HITTER_FANTASY_UD_PER_GAME,
+    LEAGUE_AVG_HITTER_FANTASY_PP_PER_GAME, LEAGUE_STD_HITTER_FANTASY_PP_PER_GAME,
     build_pitcher_tendency_profile, calc_original_method_match, attack_zone_breakdown,
     calc_lineup_weighted_pitcher_read, calc_prop_lineup_vulnerability,
     get_batter_hand, EXPECTED_PA_BY_ORDER_SLOT,
@@ -1191,25 +1194,17 @@ else:
                 # hitters, pitcher props only against other pitchers.
                 stage1_df["field_mean"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("mean")
                 stage1_df["field_std"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("std").fillna(0.01)
-                # REAL BUG FIX - comparing only 2 pitchers per game (one
-                # home, one away) against EACH OTHER mathematically
-                # guarantees a z-score of exactly +-1.0 every time,
-                # regardless of whether the real gap between them is huge
-                # or nearly nonexistent - verified by hand, this is why
-                # pitchers always cleared the bar while hitters (a real,
-                # meaningful 9-person field) genuinely had to earn it.
-                # Pitchers now compare against a real, fixed league
-                # baseline instead of each other - a genuinely meaningful
-                # "how far above a typical real starter is he," not "which
-                # of these exact two is slightly ahead."
-                PITCHER_LEAGUE_BASELINES = {
-                    "strikeouts": (LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START, LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START),
-                    "outs": (LEAGUE_AVG_PITCHER_OUTS_PER_START, LEAGUE_STD_PITCHER_OUTS_PER_START),
-                    "hits_allowed": (LEAGUE_AVG_PITCHER_HITS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_HITS_ALLOWED_PER_START),
-                    "walks_allowed": (LEAGUE_AVG_PITCHER_WALKS_ALLOWED_PER_START, LEAGUE_STD_PITCHER_WALKS_ALLOWED_PER_START),
-                    "earned_runs": (LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START, LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START),
-                    "pitcher_fantasy": (LEAGUE_AVG_PITCHER_FANTASY_PER_START, LEAGUE_STD_PITCHER_FANTASY_PER_START),
-                }
+                # REAL FIX (per direct clarification) - removed the fixed
+                # league-baseline branch entirely. The original "only 2
+                # pitchers per game" problem this was meant to solve only
+                # happens when the scan is restricted to a single game -
+                # on a real, full-slate scan, groupby(["side","prop"])
+                # above already pools EVERY pitcher scanned that night
+                # across every real game, a genuine, meaningful field the
+                # same way hitters already get one. No fixed/hardcoded
+                # number is used anywhere now - purely each pitcher's own
+                # real, simulated average compared against that night's
+                # real field of other simulated pitchers.
                 # Props where a LOWER real number is actually better for
                 # the pitcher (fewer hits/walks/runs allowed is good) -
                 # z-score sign needs flipping so "high z-score" still
@@ -1217,27 +1212,45 @@ else:
                 LOWER_IS_BETTER_PITCHER_PROPS = {"hits_allowed", "walks_allowed", "earned_runs"}
 
                 def _real_zscore(row):
-                    if row["side"] != "pitcher" or row["prop"] not in PITCHER_LEAGUE_BASELINES:
-                        # REAL FIX (confirmed bug, found via direct user
-                        # report - a real ZeroDivisionError crashed the
-                        # whole app) - field_std can genuinely be zero
-                        # when a prop's real comparison population for
-                        # this specific matchup is too thin or has
-                        # identical values (e.g. a small/short roster
-                        # game). Returns a real, honest NaN instead of
-                        # crashing - this row just won't have a usable
-                        # z-score, same as any other missing-data case.
-                        field_std = row.get("field_std")
-                        if field_std is None or pd.isna(field_std) or field_std == 0:
-                            return float("nan")
-                        return round((row["real_avg"] - row["field_mean"]) / field_std, 2)
-                    base_mean, base_std = PITCHER_LEAGUE_BASELINES[row["prop"]]
-                    z = (row["real_avg"] - base_mean) / base_std
-                    if row["prop"] in LOWER_IS_BETTER_PITCHER_PROPS:
+                    field_std = row.get("field_std")
+                    if field_std is None or pd.isna(field_std) or field_std == 0:
+                        return float("nan")
+                    z = (row["real_avg"] - row["field_mean"]) / field_std
+                    if row["side"] == "pitcher" and row["prop"] in LOWER_IS_BETTER_PITCHER_PROPS:
                         z = -z
                     return round(z, 2)
 
+                # REAL, HONEST GUARD - if fewer than 3 real pitchers are
+                # in tonight's scanned field for a given prop (e.g. a
+                # single-game scan), the field-relative comparison isn't
+                # meaningful yet - flags this directly instead of
+                # silently returning a misleading number.
+                pitcher_field_counts = stage1_df[stage1_df["side"] == "pitcher"].groupby("prop")["real_avg"].transform("count")
+                stage1_df["_thin_pitcher_field"] = (stage1_df["side"] == "pitcher") & (pitcher_field_counts < 3)
+
+                # Real, fixed, absolute-baseline z-score for hitters,
+                # added ALONGSIDE the field-relative one above - per
+                # direct request after a real, direct audit. Confirmed:
+                # the relative version can score a genuinely solid
+                # matchup lower purely because the whole field that
+                # night was unusually strong. This fixed version checks
+                # against a stable, real league baseline instead, so
+                # both numbers together give more real signal than
+                # either alone.
+                HITTER_LEAGUE_BASELINES = {
+                    "hits_runs_rbi": (LEAGUE_AVG_HITTER_HRR_PER_GAME, LEAGUE_STD_HITTER_HRR_PER_GAME),
+                    "fantasy": (LEAGUE_AVG_HITTER_FANTASY_UD_PER_GAME, LEAGUE_STD_HITTER_FANTASY_UD_PER_GAME),
+                    "fantasy_prizepicks": (LEAGUE_AVG_HITTER_FANTASY_PP_PER_GAME, LEAGUE_STD_HITTER_FANTASY_PP_PER_GAME),
+                }
+
+                def _real_zscore_fixed(row):
+                    if row["side"] != "hitter" or row["prop"] not in HITTER_LEAGUE_BASELINES:
+                        return float("nan")
+                    base_mean, base_std = HITTER_LEAGUE_BASELINES[row["prop"]]
+                    return round((row["real_avg"] - base_mean) / base_std, 2)
+
                 stage1_df["zscore"] = stage1_df.apply(_real_zscore, axis=1)
+                stage1_df["zscore_fixed_baseline"] = stage1_df.apply(_real_zscore_fixed, axis=1)
                 # Real coverage check - only meaningful for hitters (a
                 # hitter's real sample against the pitcher's arsenal).
                 # Pitchers default to 100 here so this check never
@@ -1262,7 +1275,16 @@ else:
                         | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= stage1_df["_pitcher_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
                     )
                     & (stage1_df["coverage"] >= min_coverage)
+                    & (~stage1_df["_thin_pitcher_field"])
                 ].sort_values("zscore", ascending=False)
+                thin_field_count = int(stage1_df["_thin_pitcher_field"].sum())
+                if thin_field_count > 0:
+                    st.caption(
+                        f"⚠️ {thin_field_count} real pitcher row(s) excluded from survivors - fewer than 3 "
+                        "real pitchers were in tonight's scanned field for that specific prop, so a field-"
+                        "relative comparison isn't meaningful yet (this happens on a single-game or very "
+                        "small scan - scan more real games at once to get a real, usable pitcher field)."
+                    )
                 real_survivor_count = len(survivors)
                 # Purely additive - lets a separate, new cross-reference
                 # section read this later, without touching any of the
@@ -1284,7 +1306,7 @@ else:
                 )
                 survivors = survivors.head(top_n_survivors)
 
-                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "coverage"]],
+                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "zscore_fixed_baseline", "coverage"]],
                               width='stretch')
                 st.caption(f"{real_survivor_count} of {len(stage1_df)} real (player, prop) combinations "
                            f"cleared all three real bars above - showing the top {len(survivors)}.")
@@ -1300,7 +1322,7 @@ else:
                 # itself against the real, complete picture.
                 with st.expander(f"See all {len(stage1_df)} real (player, prop) combinations, unfiltered"):
                     st.dataframe(
-                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "coverage"]]
+                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "zscore_fixed_baseline", "coverage"]]
                         .sort_values("zscore", ascending=False),
                         width='stretch')
 
