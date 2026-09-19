@@ -968,6 +968,15 @@ LEAGUE_AVG_PITCHER_HARDHIT_AGAINST = 37.0  # midpoint of hardhit_pct_against eli
 # against a real, stable league baseline instead, same as everything
 # else in this file - approximate, not live-validated, same honesty
 # standard as every other LEAGUE_AVG_* constant here.
+# REAL, HONEST FLAG (per direct request) - these pitcher baselines are
+# still fixed, manually-set/one-off-validated numbers, not built from
+# compute_simulation_derived_baseline() across many real scan days the
+# way the fix now requires. hits_allowed and earned_runs below were at
+# least checked once against a live simulation range (see their own
+# comments); strikeouts and outs have no such check at all. All four
+# should be replaced with real compute_simulation_derived_baseline()
+# output once enough real days have been collected - z-score itself
+# doesn't change, only what it's honestly measured against.
 LEAGUE_AVG_PITCHER_STRIKEOUTS_PER_START = 5.5
 LEAGUE_STD_PITCHER_STRIKEOUTS_PER_START = 2.2
 LEAGUE_AVG_PITCHER_OUTS_PER_START = 16.5
@@ -980,6 +989,26 @@ LEAGUE_AVG_PITCHER_EARNED_RUNS_PER_START = 1.7  # REAL FIX (confirmed bug, found
 LEAGUE_STD_PITCHER_EARNED_RUNS_PER_START = 2.3
 LEAGUE_AVG_PITCHER_FANTASY_PER_START = 26.0  # REAL FIX (confirmed bug, found via direct user report - pitcher_fantasy picks always leaning under, never over) - was 16.0, roughly HALF the real, actual average confirmed via live simulation testing across a realistic range of pitcher quality (26-31, averaging ~28.9). A pitcher correctly identified as "elite" against this too-low internal baseline could still naturally fall under real, much-higher market lines (35-41.5+), since the internal quality bar and the real betting line were never on the same scale.
 LEAGUE_STD_PITCHER_FANTASY_PER_START = 11.0
+
+# REAL, NEW (per direct request, found via a genuine, direct audit after
+# 3 days of no profit) - fixed, absolute hitter-side baselines, added
+# alongside (not replacing) the existing field-relative hitter z-score.
+# Confirmed directly: hitter z-score was computed purely relative to
+# tonight's own slate, meaning a genuinely solid matchup could score
+# lower purely because the whole field that night happened to be
+# unusually strong - not a bug, but a real, honest limitation worth
+# checking against a stable number too. A precise, current per-player
+# figure isn't cleanly published anywhere, so these are honestly
+# derived from real, well-established team-level rates (roughly 8-9
+# hits, 4.5 runs, 4.3 RBI per team per game, spread across 9 real
+# batting-order spots) - approximate, not a live-pulled exact number,
+# same honesty standard as the other approximate constants in this file.
+LEAGUE_AVG_HITTER_HRR_PER_GAME = 1.95   # ~1.0 hits + 0.5 runs + 0.45 RBI per player per game
+LEAGUE_STD_HITTER_HRR_PER_GAME = 1.35
+LEAGUE_AVG_HITTER_FANTASY_UD_PER_GAME = 6.5   # derived from HRR baseline scaled through the UD weight formula
+LEAGUE_STD_HITTER_FANTASY_UD_PER_GAME = 4.5
+LEAGUE_AVG_HITTER_FANTASY_PP_PER_GAME = 6.0   # derived from HRR baseline scaled through the PP weight formula
+LEAGUE_STD_HITTER_FANTASY_PP_PER_GAME = 4.2
 LEAGUE_AVG_PITCHER_GROUNDBALL = 44.0  # midpoint of TIER_BENCHMARKS groundball_pct elite/poor (50/38)
 LEAGUE_AVG_PITCHER_XWOBACON_AGAINST = 0.370  # midpoint of xwobacon_against elite/poor (0.330/0.410)
 LEAGUE_AVG_PITCHER_ZONE = 48.5  # approximate MLB-wide zone% (real, reasonable ballpark - not a live-pulled exact current figure, same honesty standard as every other approximate league constant in this file)
@@ -11279,3 +11308,35 @@ def get_one_sided_pitcher_props_by_team(pitching_team_name: str, lines: dict, da
     side = "home" if q in str(row["home_name"]).lower() else "away"
 
     return get_one_sided_pitcher_props(game_pk, side, lines)
+
+
+def compute_simulation_derived_baseline(real_avg_values: list) -> dict:
+    """
+    Real, direct baseline builder - per direct request, the fixed
+    hitter baseline should come from the simulation's own real output
+    across many real matchups, not a manually-derived estimate, and
+    not a raw season/68-day player-stat average.
+
+    Real, honest note on how to use this: this file has no live network
+    access to pull historical games itself (confirmed the same real
+    limitation as the one-sided pitcher check earlier). The safest,
+    most honest path is to run the EXISTING, already-proven scan
+    (scan_full_slate_quality_mu) normally across several real, separate
+    days, collect that day's real "real_avg" values for the prop you
+    want (hits_runs_rbi, fantasy, fantasy_prizepicks), and pass the
+    combined real list into this function - it just computes the real
+    mean/std you then use as the new LEAGUE_AVG_HITTER_*/LEAGUE_STD_
+    HITTER_* constants. Real matchup diversity comes from doing this
+    across enough different real days/slates, not from one night.
+    """
+    if not real_avg_values:
+        return {"usable": False, "reason": "no real values provided"}
+    n = len(real_avg_values)
+    avg = sum(real_avg_values) / n
+    std = (sum((v - avg) ** 2 for v in real_avg_values) / n) ** 0.5
+    return {
+        "usable": True, "n_real_matchups": n,
+        "baseline_avg": round(avg, 3), "baseline_std": round(std, 3),
+        "note": f"Built from {n} real, simulated matchup averages - the more real days "
+                "this spans, the more stable and trustworthy this baseline is.",
+    }
