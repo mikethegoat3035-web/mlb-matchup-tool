@@ -11340,3 +11340,132 @@ def compute_simulation_derived_baseline(real_avg_values: list) -> dict:
         "note": f"Built from {n} real, simulated matchup averages - the more real days "
                 "this spans, the more stable and trustworthy this baseline is.",
     }
+
+
+def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict:
+    """
+    Real, direct whole-slate Stage 1 scanner - per direct request,
+    automatically runs the full real matchup simulation across EVERY
+    real game on today's slate (both sides of each game), instead of
+    requiring the user to manually select and run one game at a time.
+    Reuses the exact same, already-proven pipeline used in the Full
+    Matchup Simulation section (pull_confirmed_lineup, get_probable_
+    pitcher, pull_pitcher_pitches, build_arsenal_profile,
+    pull_batter_pitches, build_hitter_profile, build_pitch_crosswalk,
+    simulate_matchup_n_times) - just looped across the whole real
+    slate rather than one game.
+
+    HONEST, REAL CAVEAT: built and reasoned through carefully, mirroring
+    the exact proven per-game logic already in streamlit_app.py, but
+    this specific whole-slate loop has not been run live end-to-end (no
+    network access in this build environment to test against a real,
+    current slate). Watch the first real run closely.
+
+    Uses a lower default n_simulations (500 vs the usual 1000) since
+    this runs across every game at once - real simulation cost adds up
+    fast across a full slate, and 500 real games per matchup is still
+    a large, meaningfully stable sample.
+
+    Returns {"usable": bool, "hitters_df": pd.DataFrame, "pitchers_df":
+    pd.DataFrame, "games_scanned": int, "games_skipped": list} - the two
+    dataframes have columns [player, team, prop, real_avg, cv], the
+    same real structure Stage 1 already uses, ready to feed directly
+    into the same real zscore/cv filtering already built.
+    """
+    today_str = get_mlb_today().strftime("%Y-%m-%d")
+    try:
+        games_df = pull_todays_games()
+    except Exception as e:
+        return {"usable": False, "reason": f"couldn't pull today's real schedule: {e}"}
+    if games_df is None or games_df.empty:
+        return {"usable": False, "reason": "no real games found for today"}
+
+    hitter_rows, pitcher_rows = [], []
+    games_skipped = []
+
+    for _, g in games_df.iterrows():
+        game_pk = g.get("game_id")
+        try:
+            lineup_data = pull_confirmed_lineup(game_pk)
+        except Exception as e:
+            games_skipped.append(f"{g.get('away_name','?')} @ {g.get('home_name','?')} - lineup pull failed: {e}")
+            continue
+        if lineup_data is None or lineup_data.get("lineup_status") not in (
+                "confirmed", "lineups_posted_pitcher_tbd"):
+            games_skipped.append(f"{g.get('away_name','?')} @ {g.get('home_name','?')} - not confirmed yet")
+            continue
+
+        for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
+            real_lineup = lineup_data.get(hitting_side, [])
+            if not real_lineup:
+                continue
+            try:
+                opposing_pitcher = get_probable_pitcher(game_pk, pitching_side)
+            except Exception:
+                opposing_pitcher = None
+            if opposing_pitcher is None:
+                continue
+
+            pid = opposing_pitcher["player_id"]
+            pitcher_recent_start = (get_mlb_today() - timedelta(days=68)).strftime("%Y-%m-%d")
+            try:
+                pitcher_pitches = pull_pitcher_pitches(pid, pitcher_recent_start, today_str)
+                pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
+                pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
+                                if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
+                pitcher_game_log = pull_pitcher_game_log(pid, pitcher_recent_start, today_str)
+                starter_avg_outs = (pitcher_game_log["outs"].mean()
+                                    if pitcher_game_log is not None and not pitcher_game_log.empty else 15.0)
+            except Exception:
+                continue
+            if not pitcher_arsenal:
+                continue
+
+            lineup_crosswalks = {}
+            for hitter in real_lineup:
+                try:
+                    h_pitches = pull_batter_pitches(hitter["player_id"], season_start, today_str)
+                    batter_hand = (h_pitches["stand"].mode().iloc[0]
+                                  if not h_pitches.empty and "stand" in h_pitches else "R")
+                    h_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
+                    crosswalk = build_pitch_crosswalk(pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
+                    lineup_crosswalks[hitter["name"]] = crosswalk
+                except Exception:
+                    continue
+
+            if not lineup_crosswalks:
+                continue
+            try:
+                sim_results = simulate_matchup_n_times(
+                    lineup_crosswalks, starter_avg_outs, n_simulations=n_simulations)
+            except Exception:
+                continue
+
+            team_label = g.get(f"{hitting_side}_name", "?")
+            for hitter_name, props_dict in sim_results.get("hitters", {}).items():
+                for prop, series in props_dict.items():
+                    if not series:
+                        continue
+                    avg = sum(series) / len(series)
+                    std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
+                    cv = round(std / avg, 3) if avg else None
+                    hitter_rows.append({"player": hitter_name, "team": team_label, "prop": prop,
+                                          "real_avg": round(avg, 2), "cv": cv})
+
+            pitcher_team_label = g.get(f"{pitching_side}_name", "?")
+            for prop, series in sim_results.get("starter", {}).items():
+                if not series:
+                    continue
+                avg = sum(series) / len(series)
+                std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
+                cv = round(std / avg, 3) if avg else None
+                pitcher_rows.append({"player": opposing_pitcher["name"], "team": pitcher_team_label,
+                                       "prop": prop, "real_avg": round(avg, 2), "cv": cv})
+
+    return {
+        "usable": True,
+        "hitters_df": pd.DataFrame(hitter_rows),
+        "pitchers_df": pd.DataFrame(pitcher_rows),
+        "games_scanned": len(games_df) - len(games_skipped),
+        "games_skipped": games_skipped,
+    }
