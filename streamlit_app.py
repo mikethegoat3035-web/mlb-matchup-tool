@@ -68,7 +68,7 @@ from prop_model_combined import (
     scan_full_slate_quality_mu, rescore_quality_mu_row,
     pull_prizepicks_mlb_lines, pull_underdog_mlb_lines, merge_book_lines_into_slate,
     match_book_line_to_player, get_unconfirmed_games_today, get_already_started_games,
-    get_one_sided_pitcher_props, get_one_sided_pitcher_props_by_team,
+    scan_whole_slate_stage1,
     pull_todays_games,
     backtest_full_season_mlb, PITCHER_BACKTEST_LINES, HITTER_BACKTEST_LINES,
     backtest_hitter_prop_quality_walk_forward, get_batter_id,
@@ -171,355 +171,79 @@ if "pending_games" in st.session_state:
                    "lineups post — usually 1-3 hours before game time.")
 
 st.divider()
-st.subheader("🎯 One-Sided Pitcher Check")
+st.header("🔍 Whole-Slate Stage 1 Scan - Pitchers & Hitters")
 st.caption(
-    "For a game still showing as not fully confirmed above: a pitcher's own props "
-    "(strikeouts, outs, hits allowed, earned runs) only ever depend on the OPPOSING "
-    "team's real, confirmed lineup - never his own team's hitters. This runs that "
-    "check directly, without waiting for both sides to post."
-)
-one_sided_team = st.text_input("Pitching team name (e.g. 'Marlins' or 'Miami')", key="one_sided_team")
-one_sided_lines_str = st.text_input(
-    "Lines to check (e.g. outs:15.5, strikeouts:5.5, hits_allowed:4.5)",
-    value="outs:15.5, strikeouts:5.5, hits_allowed:4.5", key="one_sided_lines",
-)
-if st.button("Run one-sided pitcher check", key="one_sided_btn"):
-    try:
-        lines = {}
-        for part in one_sided_lines_str.split(","):
-            k, v = part.split(":")
-            lines[k.strip()] = float(v.strip())
-    except Exception:
-        st.error("Couldn't parse the lines - use the format 'outs:15.5, strikeouts:5.5'.")
-        lines = None
-    if lines and one_sided_team.strip():
-        with st.spinner(f"Finding {one_sided_team}'s game and checking the opposing lineup..."):
-            try:
-                result = get_one_sided_pitcher_props_by_team(one_sided_team.strip(), lines)
-                if not result.get("usable"):
-                    st.warning(f"Not ready yet: {result.get('reason')}")
-                else:
-                    st.success(f"{result['pitcher_name']} — {result['note']}")
-                    st.caption(f"Opposing lineup: {result['opposing_lineup_size']} real hitters pulled.")
-                    st.dataframe(result["probabilities"], width='stretch')
-            except Exception as e:
-                st.error(f"One-sided check failed: {e}")
-    elif not one_sided_team.strip():
-        st.error("Type the pitching team's name first.")
-
-
-
-st.header("🔍 League-Wide Pitcher Quality Scan")
-st.caption(
-    "Real, direct scan of every real starting pitcher across today's real games - "
-    "shows his own real, weighted-average key metrics (whiff%, CSW%, putaway%, "
-    "avg velo, avg spin rate) with a real tier grade (Elite/Good/Average/Poor) "
-    "against the same real TIER_BENCHMARKS used elsewhere in this file. Built "
-    "specifically as a fast, real diagnostic - no simulation required, so you can "
-    "quickly see who's genuinely strong or weak today and export the raw numbers "
-    "for review, rather than running a full matchup simulation per game just to "
-    "check pitcher quality."
+    "Real, direct whole-slate scan - automatically runs the full real matchup "
+    "simulation across EVERY confirmed game today (both sides), instead of "
+    "running one game at a time. Replaces the old One-Sided Pitcher Check and "
+    "League-Wide Pitcher Quality Scan with a single, direct test of whether the "
+    "real pitcher z-score/CV thresholds (adjusted this session) actually let "
+    "genuine pitcher survivors through - and does the same for hitters, in case "
+    "there's something there worth finding too."
 )
 st.caption(
-    "Honest, real caveat carried over from the Original Method Matcher above: "
-    "almost every real, rostered MLB starter already clears a competent bar on "
-    "his primary pitches (survivorship bias), so these grades alone won't always "
-    "sharply separate a great matchup from an average one - but they're a real, "
-    "direct, fast way to spot genuine outliers in either direction."
+    "⚠️ Honest, real caveat: this specific whole-slate loop has not been run "
+    "live end-to-end (no network access in this build environment to test "
+    "against a real, current slate). Watch the first real run closely - if "
+    "something breaks or looks wrong, that's genuinely useful information, not "
+    "a sign to distrust everything else in this file."
 )
 
-if st.button("Scan all of today's real starting pitchers", key="league_scan_pitchers_btn"):
-    with st.spinner("Pulling today's real schedule..."):
+whole_slate_n_sims = st.number_input("Simulations per matchup", min_value=100, max_value=1000,
+                                       value=500, step=100, key="whole_slate_n_sims")
+ws_col1, ws_col2, ws_col3, ws_col4 = st.columns(4)
+with ws_col1:
+    ws_pitcher_min_z = st.slider("Pitcher min z-score", 0.0, 2.0, 0.5, step=0.1, key="ws_pitcher_min_z")
+with ws_col2:
+    ws_pitcher_max_cv = st.slider("Pitcher max CV", 0.1, 1.5, 1.05, step=0.05, key="ws_pitcher_max_cv")
+with ws_col3:
+    ws_hitter_min_z = st.slider("Hitter min z-score", 0.0, 2.0, 0.3, step=0.1, key="ws_hitter_min_z")
+with ws_col4:
+    ws_hitter_max_cv = st.slider("Hitter max CV", 0.1, 2.0, 1.2, step=0.05, key="ws_hitter_max_cv")
+
+if st.button("Scan the whole real slate now", key="whole_slate_scan_btn"):
+    with st.spinner("Running the real, full matchup simulation across every confirmed game today - "
+                     "this can take several minutes on a full slate..."):
         try:
-            scan_games_df = pull_todays_games()
+            whole_slate_result = scan_whole_slate_stage1(SEASON_START, n_simulations=int(whole_slate_n_sims))
         except Exception as e:
-            st.error(f"Couldn't pull today's real schedule: {e}")
-            scan_games_df = pd.DataFrame()
+            st.error(f"Whole-slate scan failed: {e}")
+            whole_slate_result = {"usable": False, "reason": str(e)}
 
-    if scan_games_df is None or scan_games_df.empty:
-        st.info("No real games found for today.")
+    if not whole_slate_result.get("usable"):
+        st.warning(f"Not ready yet: {whole_slate_result.get('reason')}")
     else:
-        scan_rows = []
-        scan_errors = []
-        progress = st.progress(0.0)
-        for i, (_, g) in enumerate(scan_games_df.iterrows()):
-            game_pk = g.get("game_id")
-            for side in ["home", "away"]:
-                try:
-                    p_info = get_probable_pitcher(game_pk, side)
-                    if not p_info or not p_info.get("player_id"):
-                        continue
-                    pid = p_info["player_id"]
-                    pname = p_info.get("name", "Unknown")
-                    recent_start = (get_mlb_today() - timedelta(days=68)).strftime("%Y-%m-%d")
-                    today_str = get_mlb_today().strftime("%Y-%m-%d")
-                    pitches = pull_pitcher_pitches(pid, recent_start, today_str)
-                    arsenal = build_arsenal_profile(pitches)
-                    if not arsenal:
-                        continue
-                    pitcher_hand = (pitches["p_throws"].mode().iloc[0]
-                                    if not pitches.empty and "p_throws" in pitches else "R")
+        st.session_state.whole_slate_hitters_df = whole_slate_result["hitters_df"]
+        st.session_state.whole_slate_pitchers_df = whole_slate_result["pitchers_df"]
+        st.success(f"Scanned {whole_slate_result['games_scanned']} real confirmed game(s).")
+        if whole_slate_result["games_skipped"]:
+            with st.expander(f"{len(whole_slate_result['games_skipped'])} game(s) skipped"):
+                for s in whole_slate_result["games_skipped"]:
+                    st.write(s)
 
-                    # REAL, NEW - per direct request, cross-references
-                    # this pitcher's real arsenal against the real,
-                    # confirmed top-3 opposing hitters (using the same,
-                    # already-proven calc_original_method_match logic -
-                    # hard xwOBA/xwOBACON thresholds, majority vote
-                    # across his meaningfully-used pitches). Honest, real
-                    # dependency: only runs if the lineup is actually
-                    # confirmed yet - often not true early in the day,
-                    # so this can legitimately show "not confirmed yet"
-                    # REAL FIX (per direct request - "weigh who they face
-                    # in lineup") - replaced the top-3-only check with a
-                    # real, full, PA-weighted read across the ENTIRE real
-                    # opposing lineup, reusing the same, already-tested
-                    # calc_lineup_weighted_pitcher_read function already
-                    # proven in Original Method Matcher - the real #1-2
-                    # hitters genuinely face this pitcher more times per
-                    # game than the #8-9 spots, and this weights
-                    # accordingly instead of treating a quick top-3 look
-                    # as the full picture.
-                    lineup_status = "not confirmed yet"
-                    lineup_weighted_read_text = "n/a"
-                    lineup_weighted_share = None
-                    opp_lineup = None
-                    try:
-                        opposing_side = "away" if side == "home" else "home"
-                        lineup_info = pull_confirmed_lineup(game_pk)
-                        opp_lineup = lineup_info.get(opposing_side)
-                        if opp_lineup:
-                            lineup_status = "confirmed"
-                            hitter_profiles_by_order_slot = {}
-                            for hitter in opp_lineup:
-                                h_pitches = pull_batter_pitches(hitter["player_id"], f"{today_str[:4]}-03-20", today_str)
-                                h_profile = build_hitter_profile(h_pitches)
-                                if h_profile:
-                                    hitter_profiles_by_order_slot[hitter.get("order_slot")] = h_profile
-                            lineup_read = calc_lineup_weighted_pitcher_read(
-                                arsenal, opp_lineup, hitter_profiles_by_order_slot, pitcher_hand,
-                            )
-                            lineup_weighted_read_text = lineup_read.get("read", "n/a")
-                            lineup_weighted_share = lineup_read.get("weighted_qualifying_share")
-                    except Exception:
-                        lineup_status = "error checking lineup"
+if st.session_state.get("whole_slate_pitchers_df") is not None and not st.session_state.whole_slate_pitchers_df.empty:
+    pdf = st.session_state.whole_slate_pitchers_df.copy()
+    field_mean = pdf.groupby("prop")["real_avg"].transform("mean")
+    field_std = pdf.groupby("prop")["real_avg"].transform("std").fillna(0.01)
+    pdf["zscore"] = ((pdf["real_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
+    pitcher_survivors = pdf[(pdf["zscore"] >= ws_pitcher_min_z) & (pdf["cv"] <= ws_pitcher_max_cv)]
+    st.subheader(f"Pitchers - {len(pitcher_survivors)} of {len(pdf)} real rows clear the current thresholds "
+                 f"(z>={ws_pitcher_min_z}, cv<={ws_pitcher_max_cv})")
+    st.dataframe(pitcher_survivors.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
+    with st.expander("See all real pitcher rows, including ones that didn't clear"):
+        st.dataframe(pdf.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
 
-                    # Real, usage%-weighted average across his real
-                    # arsenal (both hands combined) - one real, summary
-                    # row per pitcher rather than one row per pitch type,
-                    # so this stays scannable across a whole day's slate.
-                    # REAL FIX (found via direct user feedback) - the
-                    # first version of this scan only included 4 real
-                    # metrics; expanded here to the same, full set
-                    # already established and used elsewhere in this
-                    # file (build_pitcher_tendency_profile) - chase%,
-                    # zone%, putaway% (the real K-prop signal), chase-
-                    # whiff%, and zone-whiff%, not just whiff/CSW/velo/
-                    # spin alone.
-                    total_usage = sum(p.usage_pct for p in arsenal) or 1
-                    def _wavg(attr):
-                        vals = [(getattr(p, attr), p.usage_pct) for p in arsenal if pd.notna(getattr(p, attr, None))]
-                        return sum(v * w for v, w in vals) / total_usage if vals else float("nan")
-
-                    # REAL, NEW - same real weighting logic as _wavg above,
-                    # but filtered to the pitcher's real arsenal entries
-                    # against ONE specific batter hand, giving his true,
-                    # split-specific metric (e.g. real groundball% vs LHH
-                    # specifically) instead of a blended, both-hands average.
-                    def _wavg_by_hand(attr, hand):
-                        hand_arsenal = [p for p in arsenal if p.vs_hand == hand]
-                        hand_usage = sum(p.usage_pct for p in hand_arsenal) or 1
-                        vals = [(getattr(p, attr), p.usage_pct) for p in hand_arsenal if pd.notna(getattr(p, attr, None))]
-                        return sum(v * w for v, w in vals) / hand_usage if vals else float("nan")
-
-                    w_whiff = _wavg("whiff_pct")
-                    w_csw = _wavg("csw_pct")
-                    w_velo = _wavg("avg_velo")
-                    w_spin = _wavg("avg_spin_rate")
-                    w_chase = _wavg("chase_pct")
-                    w_putaway = _wavg("putaway_pct")
-                    w_zone = _wavg("zone_pct")
-                    w_chase_whiff = _wavg("chase_whiff_pct")
-                    w_zone_whiff = _wavg("z_whiff_pct")
-                    # REAL FIX (found via direct user report - hits_allowed
-                    # is driven by contact outcome, not strikeout ability;
-                    # groundball_pct/flyball_pct were confirmed missing
-                    # here too, despite being real, already-tracked data,
-                    # same gap pattern as avg_velo).
-                    w_groundball = _wavg("groundball_pct")
-                    w_flyball = _wavg("flyball_pct")
-
-                    # REAL, NEW (per direct request) - lineup-handedness-
-                    # weighted versions of the metrics that actually drive
-                    # hits_allowed/BB-allowed/Ks. A pitcher's BLENDED
-                    # groundball%/whiff%/CSW% (both hands combined, above)
-                    # doesn't reflect that tonight's REAL, specific lineup
-                    # might be mostly one hand - if the real top of the
-                    # order is mostly LHH, his real vs-LHH splits matter
-                    # far more than his vs-RHH numbers, and vice versa.
-                    # Reuses the SAME real, established, already-tested
-                    # PA-weighting (EXPECTED_PA_BY_ORDER_SLOT) already used
-                    # for the lineup_weighted_read above, and the same
-                    # real get_batter_hand lookup already used elsewhere
-                    # in this file - not reinvented, just applied here too.
-                    handedness_weighted_read = "n/a"
-                    hw_groundball = hw_whiff = hw_csw = None
-                    if opp_lineup:
-                        try:
-                            total_pa_weight = 0.0
-                            weighted_gb = weighted_whiff = weighted_csw = 0.0
-                            hand_breakdown = []
-                            for hitter in opp_lineup:
-                                order_slot = hitter.get("order_slot")
-                                pa_weight = EXPECTED_PA_BY_ORDER_SLOT.get(order_slot, 4.0)
-                                real_hand = get_batter_hand(hitter["player_id"])
-                                if real_hand == "S":
-                                    # Real switch hitter - assumes the real,
-                                    # standard platoon choice (bats opposite
-                                    # the pitcher's own throwing hand).
-                                    real_hand = "R" if pitcher_hand == "L" else "L"
-                                gb_this_hand = _wavg_by_hand("groundball_pct", real_hand)
-                                whiff_this_hand = _wavg_by_hand("whiff_pct", real_hand)
-                                csw_this_hand = _wavg_by_hand("csw_pct", real_hand)
-                                if pd.notna(gb_this_hand):
-                                    weighted_gb += pa_weight * gb_this_hand
-                                if pd.notna(whiff_this_hand):
-                                    weighted_whiff += pa_weight * whiff_this_hand
-                                if pd.notna(csw_this_hand):
-                                    weighted_csw += pa_weight * csw_this_hand
-                                total_pa_weight += pa_weight
-                                hand_breakdown.append(f"{hitter.get('name', '?')} ({real_hand})")
-                            if total_pa_weight > 0:
-                                hw_groundball = round(weighted_gb / total_pa_weight, 1)
-                                hw_whiff = round(weighted_whiff / total_pa_weight, 1)
-                                hw_csw = round(weighted_csw / total_pa_weight, 1)
-                                handedness_weighted_read = (
-                                    f"Real lineup: {', '.join(hand_breakdown)}. Handedness-weighted "
-                                    f"(PA-weighted by real batting order): GB% {hw_groundball}, "
-                                    f"whiff% {hw_whiff}, CSW% {hw_csw} - vs blended (both hands) "
-                                    f"GB% {round(w_groundball, 1)}, whiff% {round(w_whiff, 1)}, CSW% {round(w_csw, 1)}."
-                                )
-                        except Exception:
-                            handedness_weighted_read = "error computing handedness-weighted read"
-
-                    def _grade(val, metric):
-                        b = TIER_BENCHMARKS.get(metric)
-                        if b is None or pd.isna(val):
-                            return "n/a"
-                        if b["direction"] == "high":
-                            if val >= b["elite"]:
-                                return "Elite"
-                            if val <= b["poor"]:
-                                return "Poor"
-                        else:
-                            if val <= b["elite"]:
-                                return "Elite"
-                            if val >= b["poor"]:
-                                return "Poor"
-                        return "Average"
-
-                    # REAL FIX (caught before shipping) - these grades
-                    # need to exist as real, standalone variables to be
-                    # usable in the new verdict logic below, not just
-                    # computed inline inside the dict literal.
-                    whiff_grade = _grade(w_whiff, "whiff_pct")
-                    csw_grade = _grade(w_csw, "csw_pct")
-                    groundball_grade = _grade(w_groundball, "groundball_pct")
-
-                    # REAL, NEW - per direct request, pitcher_fantasy is
-                    # driven by real, specific components (outs, Ks,
-                    # earned runs, quality start, win) - wins are
-                    # genuinely hard (team run-support/bullpen dependent,
-                    # not just pitcher skill), but quality start has a
-                    # real, simple, direct definition (6+ real innings,
-                    # <=3 real earned runs) that his own actual game log
-                    # this season can directly answer, rather than
-                    # inferring it from pitch-level stuff metrics alone.
-                    real_qs_rate = None
-                    real_qs_starts = 0
-                    try:
-                        official_log = pull_official_pitcher_game_log(pid, int(today_str[:4]))
-                        if not official_log.empty and "quality_start" in official_log.columns:
-                            real_qs_starts = len(official_log)
-                            real_qs_rate = official_log["quality_start"].mean()
-                    except Exception:
-                        pass
-
-                    scan_rows.append({
-                        "team": g.get("home_name") if side == "home" else g.get("away_name"),
-                        "pitcher": pname,
-                        "real_whiff_pct": round(w_whiff, 1), "whiff_grade": whiff_grade,
-                        "real_csw_pct": round(w_csw, 1), "csw_grade": csw_grade,
-                        "real_chase_pct": round(w_chase, 1), "chase_grade": _grade(w_chase, "chase_pct"),
-                        "real_putaway_pct": round(w_putaway, 1), "putaway_grade": _grade(w_putaway, "putaway_pct"),
-                        "real_zone_pct": round(w_zone, 1), "zone_grade": _grade(w_zone, "zone_pct"),
-                        "real_chase_whiff_pct": round(w_chase_whiff, 1), "chase_whiff_grade": _grade(w_chase_whiff, "chase_whiff_pct"),
-                        "real_zone_whiff_pct": round(w_zone_whiff, 1), "zone_whiff_grade": _grade(w_zone_whiff, "z_whiff_pct"),
-                        "real_groundball_pct": round(w_groundball, 1), "groundball_grade": groundball_grade,
-                        "real_flyball_pct": round(w_flyball, 1) if pd.notna(w_flyball) else float("nan"),
-                        "real_avg_velo": round(w_velo, 1),
-                        "real_avg_spin_rate": round(w_spin, 0), "spin_grade": _grade(w_spin, "avg_spin_rate"),
-                        # REAL, NEW (per direct request) - handedness-
-                        # weighted versions of the metrics driving hits_
-                        # allowed/BB-allowed/Ks, using the real, confirmed
-                        # lineup's actual batting-side composition (PA-
-                        # weighted by real batting order) instead of a
-                        # blended, both-hands average.
-                        "handedness_weighted_groundball_pct": hw_groundball,
-                        "handedness_weighted_whiff_pct": hw_whiff,
-                        "handedness_weighted_csw_pct": hw_csw,
-                        "handedness_weighted_read": handedness_weighted_read,
-                        "vs_top3_lineup_status": lineup_status,
-                        "real_lineup_weighted_read": lineup_weighted_read_text,
-                        # REAL, NEW - per direct request, prop-specific
-                        # verdicts using the metrics that actually matter
-                        # for each real prop, not a single generic grade.
-                        # hits_allowed depends on contact suppression
-                        # (groundball rate + how much of the real lineup's
-                        # expected PA volume comes from hitters who beat
-                        # him) - confirmed, real, usable signal. pitcher_
-                        # fantasy under requires a real short/bad outing,
-                        # which elite whiff%/CSW% actually argue AGAINST
-                        # (better stuff predicts a BETTER outing, not a
-                        # worse one) - explicitly flagged as unconfirmable
-                        # here rather than guessed at, since the real
-                        # driver (workload/pitch-count limits) isn't data
-                        # this tool has access to.
-                        "hits_allowed_verdict": (
-                            "Real concern - fly-ball prone (Poor groundball grade)" if groundball_grade == "Poor"
-                            else (f"Real support - {round(lineup_weighted_share*100,1)}% real lineup PA match, {groundball_grade} groundball rate"
-                                  if lineup_weighted_share is not None and lineup_weighted_share < 0.15 and groundball_grade in ("Elite", "Average")
-                                  else "Ordinary - no standout real support either way")
-                        ),
-                        "real_quality_start_rate": round(real_qs_rate * 100, 1) if real_qs_rate is not None else None,
-                        "real_qs_sample_starts": real_qs_starts,
-                        "pitcher_fantasy_verdict": (
-                            f"Real, direct QS rate: {round(real_qs_rate*100,1)}% over {real_qs_starts} real starts this season - "
-                            + ("supports OVER (goes deep, limits runs)" if real_qs_rate >= 0.5
-                               else "supports UNDER (real, actual short/bad outings, not just inferred)")
-                            if real_qs_rate is not None and real_qs_starts >= 5
-                            else (
-                                "Stuff argues AGAINST a fantasy under (Elite whiff/CSW predict a GOOD outing) - "
-                                "real QS sample too thin to confirm either way; wins remain unpredictable regardless"
-                                if whiff_grade == "Elite" or csw_grade == "Elite"
-                                else "No real signal either way - real QS sample too thin, and no standout stuff grade"
-                            )
-                        ),
-                    })
-                except Exception as e:
-                    scan_errors.append(f"{side} pitcher, game {game_pk}: {type(e).__name__}: {e}")
-            progress.progress((i + 1) / len(scan_games_df))
-
-        if scan_rows:
-            scan_df = pd.DataFrame(scan_rows)
-            st.dataframe(scan_df, width='stretch')
-            st.caption(f"Real pitchers scanned: {len(scan_df)} across {len(scan_games_df)} real games.")
-        else:
-            st.info("No real pitcher data could be pulled for today's games.")
-        if scan_errors:
-            with st.expander(f"{len(scan_errors)} real errors during the scan"):
-                for e in scan_errors:
-                    st.write(e)
-
+if st.session_state.get("whole_slate_hitters_df") is not None and not st.session_state.whole_slate_hitters_df.empty:
+    hdf = st.session_state.whole_slate_hitters_df.copy()
+    field_mean = hdf.groupby("prop")["real_avg"].transform("mean")
+    field_std = hdf.groupby("prop")["real_avg"].transform("std").fillna(0.01)
+    hdf["zscore"] = ((hdf["real_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
+    hitter_survivors = hdf[(hdf["zscore"] >= ws_hitter_min_z) & (hdf["cv"] <= ws_hitter_max_cv)]
+    st.subheader(f"Hitters - {len(hitter_survivors)} of {len(hdf)} real rows clear the current thresholds "
+                 f"(z>={ws_hitter_min_z}, cv<={ws_hitter_max_cv})")
+    st.dataframe(hitter_survivors.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
+    with st.expander("See all real hitter rows, including ones that didn't clear"):
+        st.dataframe(hdf.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
 
 
 st.header("🎯 Original Method Matcher")
@@ -1097,14 +821,22 @@ else:
                 # REAL FIX - raised from 0.5, based on real, direct
                 # evidence from an actual run (2026-09-06/07): comparing
                 # two real pitchers in the same game, one at z=0.96
-                # looked genuinely strong, while another at z=0.51 barely
-                # cleared the old 0.5 bar and turned out to be a much
-                # weaker, less trustworthy signal. Raising the floor
-                # pushes out the "barely passing" cases and keeps the
-                # genuinely differentiated ones - still just one real
-                # data point behind this, so keep watching results.
+                # REAL FIX (per direct request, confirmed via live
+                # testing tonight) - 0.8 was originally raised from 0.5
+                # after one specific case where a weak pitcher barely
+                # cleared 0.5. But tested live against a real 14-pitcher
+                # slate: ZERO cleared 0.8 (real max was 0.71), while
+                # zero cleared 0.5 the OLD way either at the time - the
+                # real, structural issue is that pitcher stats spread
+                # out less night to night than hitters do, not that 0.8
+                # was correctly calibrated. Lowered back to 0.5, now
+                # matching the already-established strikeouts/outs/
+                # earned_runs-specific threshold below, so the general
+                # and specific pitcher bars are internally consistent
+                # instead of the general one being stricter than the
+                # specific one.
                 pitcher_min_zscore = st.slider("Pitcher minimum edge (real std devs above league baseline)",
-                                        0.0, 2.0, 0.8, step=0.1, key="sim_pitcher_min_zscore")
+                                        0.0, 2.0, 0.5, step=0.1, key="sim_pitcher_min_zscore")
                 # REAL FIX (confirmed mathematically, per direct request -
                 # traced why strikeouts/outs/earned_runs never survived
                 # Stage 1 regardless of the actual pitcher). The shared
@@ -1142,8 +874,16 @@ else:
                 # data, with a real, strong edge (z=0.86) failing only
                 # because it barely missed the old 0.6 cap - raised
                 # slightly to give real, strong edges room.
+                # REAL FIX (per direct request) - the comment above
+                # already documents real pitcher CVs from an actual live
+                # run ranging 0.26-1.02, but the cap was still set at
+                # 0.75 - cutting off the entire upper quarter of that
+                # CONFIRMED real range even after the z-score fix.
+                # Raised to 1.05 to genuinely cover what real pitcher
+                # starts actually look like, rather than an arbitrary
+                # point partway through the documented real data.
                 pitcher_max_cv = st.slider("Pitcher maximum coefficient of variation",
-                                    0.1, 1.5, 0.75, step=0.05, key="sim_pitcher_max_cv")
+                                    0.1, 1.5, 1.05, step=0.05, key="sim_pitcher_max_cv")
                 hitter_max_cv = st.slider("Hitter maximum coefficient of variation",
                                     0.1, 2.0, 1.2, step=0.05, key="sim_hitter_max_cv")
             min_coverage = st.slider(
