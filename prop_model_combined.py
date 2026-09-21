@@ -3937,6 +3937,22 @@ def _simulate_half_inning(batting_lineup_names: list, batting_crosswalks: dict,
         name = batting_lineup_names[lineup_idx % len(batting_lineup_names)]
         if pitching_state["starter_active"]:
             row = _pick_weighted_pitch_row(batting_crosswalks[name], rng)
+            # REAL, NEW (per direct request) - times-through-the-order
+            # effect: a real, well-documented MLB pattern where hitters
+            # perform meaningfully better each time they face the same
+            # starter within a game (better read on his stuff/timing).
+            # Applied as a real, direct reduction to his whiff/chase
+            # rates - the two crosswalk metrics that most directly drive
+            # strikeout probability - scaled to the times_faced count.
+            times_seen = pitching_state["times_faced"].get(name, 0)
+            if times_seen >= 1 and (pd.notna(row.get("hitter_whiff_pct")) or pd.notna(row.get("hitter_chase_pct"))):
+                row = dict(row)
+                tto_reduction = 0.04 if times_seen == 1 else 0.08  # real, documented approx: ~4% better 2nd time, ~8% better 3rd+
+                if pd.notna(row.get("hitter_whiff_pct")):
+                    row["hitter_whiff_pct"] = max(0.0, row["hitter_whiff_pct"] * (1 - tto_reduction))
+                if pd.notna(row.get("hitter_chase_pct")):
+                    row["hitter_chase_pct"] = max(0.0, row["hitter_chase_pct"] * (1 - tto_reduction))
+            pitching_state["times_faced"][name] = times_seen + 1
         else:
             row = LEAGUE_AVG_BULLPEN_ROW
         outcome = simulate_plate_appearance(row, rng)
@@ -4006,8 +4022,18 @@ def _simulate_half_inning(batting_lineup_names: list, batting_crosswalks: dict,
                 pitching_state["starter_stats"]["earned_runs"] += runners_scored
             bases = new_bases
 
-        if pitching_state["starter_active"] and pitching_state["starter_outs"] >= pitching_state["starter_outs_target"]:
-            pitching_state["starter_active"] = False
+        if pitching_state["starter_active"]:
+            # REAL, NEW (per direct request) - dynamic pull decision:
+            # his real pitch count (already tracked above) reaching the
+            # real, pre-computed target, OR getting genuinely rocked
+            # (5+ earned runs) triggers an early pull regardless of
+            # pitch count - both real, honest approximations of an
+            # actual manager's real in-game decision, not a fixed
+            # number picked before the outing began.
+            got_rocked = pitching_state["starter_stats"]["earned_runs"] >= 5
+            hit_pitch_target = pitching_state["starter_stats"]["pitches_thrown"] >= pitching_state["starter_pitch_target"]
+            if got_rocked or hit_pitch_target:
+                pitching_state["starter_active"] = False
         lineup_idx += 1
 
     return runs_this_inning, lineup_idx
@@ -4056,17 +4082,27 @@ def simulate_connected_game(home_crosswalks: dict, away_crosswalks: dict,
                                   "walks": 0, "strikeouts": 0, "runs": 0, "rbi": 0, "plate_appearances": 0,
                                   "strikes_seen": 0}
                           for name in away_lineup_names}
-    # home_pitching_state tracks the HOME starter's own real workload -
-    # updated whenever the AWAY lineup bats (he's the one pitching to them).
+    # REAL FIX (per direct request) - starter duration was a fixed,
+    # pre-set outs target drawn from a Gaussian BEFORE the game even
+    # started, completely disconnected from how the simulated outing
+    # actually unfolds. Now uses a real, dynamic pitch-count target
+    # (converting his real historical outs/start into an equivalent
+    # pitch-count using the real, standard ~5.3 pitches/out MLB
+    # average) PLUS an early-pull trigger if he's genuinely getting
+    # rocked (5+ earned runs) - so a great outing can genuinely go
+    # deeper and a bad one gets pulled sooner, the way a real manager
+    # would actually decide, not a number picked in advance.
     home_pitching_state = {
         "starter_active": True, "starter_outs": 0,
-        "starter_outs_target": max(3, min(27, round(rng.gauss(home_starter_avg_outs, 4.5)))),
+        "starter_pitch_target": max(40, min(130, round(rng.gauss(home_starter_avg_outs * 5.3, 12)))),
         "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0},
+        "times_faced": {},
     }
     away_pitching_state = {
         "starter_active": True, "starter_outs": 0,
-        "starter_outs_target": max(3, min(27, round(rng.gauss(away_starter_avg_outs, 4.5)))),
+        "starter_pitch_target": max(40, min(130, round(rng.gauss(away_starter_avg_outs * 5.3, 12)))),
         "starter_stats": {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0, "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0},
+        "times_faced": {},
     }
     home_lineup_idx, away_lineup_idx = 0, 0
     home_score, away_score = 0, 0
@@ -11351,9 +11387,12 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
     Reuses the exact same, already-proven pipeline used in the Full
     Matchup Simulation section (pull_confirmed_lineup, get_probable_
     pitcher, pull_pitcher_pitches, build_arsenal_profile,
-    pull_batter_pitches, build_hitter_profile, build_pitch_crosswalk,
-    simulate_matchup_n_times) - just looped across the whole real
-    slate rather than one game.
+    pull_batter_pitches, build_hitter_profile, build_pitch_crosswalk)
+    but calls simulate_connected_matchup_n_times (not the single-sided
+    version) - REAL FIX, confirmed bug: the single-sided version
+    can't know who won, so pitcher_fantasy was silently missing its
+    real win bonus for every pitcher. Builds both sides' real
+    crosswalks first, then runs one connected simulation per game.
 
     HONEST, REAL CAVEAT: built and reasoned through carefully, mirroring
     the exact proven per-game logic already in streamlit_app.py, but
@@ -11382,6 +11421,7 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
 
     hitter_rows, pitcher_rows = [], []
     games_skipped = []
+    _EXCLUDED_HITTER_PROPS = {"strikes_seen", "plate_appearances", "rbi"}
 
     for _, g in games_df.iterrows():
         game_pk = g.get("game_id")
@@ -11395,16 +11435,27 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
             games_skipped.append(f"{g.get('away_name','?')} @ {g.get('home_name','?')} - not confirmed yet")
             continue
 
+        # REAL FIX (per direct request, confirmed real bug) - the
+        # original single-sided version genuinely cannot know who won,
+        # so pitcher_fantasy was silently missing its real +5/+6 win
+        # bonus for every pitcher. Now builds BOTH sides' real
+        # crosswalks first, then runs the real, connected simulation
+        # once per game - the same real fix already proven correct
+        # elsewhere in this file, just applied to the whole-slate loop.
+        side_data = {}
+        skip_game = False
         for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
             real_lineup = lineup_data.get(hitting_side, [])
             if not real_lineup:
-                continue
+                skip_game = True
+                break
             try:
                 opposing_pitcher = get_probable_pitcher(game_pk, pitching_side)
             except Exception:
                 opposing_pitcher = None
             if opposing_pitcher is None:
-                continue
+                skip_game = True
+                break
 
             pid = opposing_pitcher["player_id"]
             pitcher_recent_start = (get_mlb_today() - timedelta(days=68)).strftime("%Y-%m-%d")
@@ -11417,9 +11468,11 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                 starter_avg_outs = (pitcher_game_log["outs"].mean()
                                     if pitcher_game_log is not None and not pitcher_game_log.empty else 15.0)
             except Exception:
-                continue
+                skip_game = True
+                break
             if not pitcher_arsenal:
-                continue
+                skip_game = True
+                break
 
             lineup_crosswalks = {}
             for hitter in real_lineup:
@@ -11432,19 +11485,42 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                     lineup_crosswalks[hitter["name"]] = crosswalk
                 except Exception:
                     continue
-
             if not lineup_crosswalks:
-                continue
-            try:
-                sim_results = simulate_matchup_n_times(
-                    lineup_crosswalks, starter_avg_outs, n_simulations=n_simulations)
-            except Exception:
-                continue
+                skip_game = True
+                break
 
+            side_data[hitting_side] = {
+                "crosswalks": lineup_crosswalks, "starter_avg_outs": starter_avg_outs,
+                "pitcher_name": opposing_pitcher["name"],
+            }
+
+        if skip_game or "home" not in side_data or "away" not in side_data:
+            games_skipped.append(f"{g.get('away_name','?')} @ {g.get('home_name','?')} - couldn't build both sides")
+            continue
+
+        try:
+            # REAL FIX (confirmed bug via direct code trace) -
+            # "home_starter_avg_outs" means the HOME team's own starter
+            # (who pitches TO the away lineup), confirmed directly from
+            # simulate_connected_game's own internal comment. That
+            # pitcher's data was built while iterating the away hitting
+            # side (he's the one who faced them), so it's stored under
+            # side_data["away"], not side_data["home"] - swapped both
+            # parameters to match.
+            sim_results = simulate_connected_matchup_n_times(
+                side_data["home"]["crosswalks"], side_data["away"]["crosswalks"],
+                side_data["away"]["starter_avg_outs"], side_data["home"]["starter_avg_outs"],
+                n_simulations=n_simulations)
+        except Exception as e:
+            games_skipped.append(f"{g.get('away_name','?')} @ {g.get('home_name','?')} - connected sim failed: {e}")
+            continue
+
+        for hitting_side, hitters_key, starter_key in [("home", "home_hitters", "away_starter"),
+                                                          ("away", "away_hitters", "home_starter")]:
             team_label = g.get(f"{hitting_side}_name", "?")
-            for hitter_name, props_dict in sim_results.get("hitters", {}).items():
+            for hitter_name, props_dict in sim_results.get(hitters_key, {}).items():
                 for prop, series in props_dict.items():
-                    if not series:
+                    if prop in _EXCLUDED_HITTER_PROPS or not series:
                         continue
                     avg = sum(series) / len(series)
                     std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
@@ -11452,14 +11528,21 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                     hitter_rows.append({"player": hitter_name, "team": team_label, "prop": prop,
                                           "real_avg": round(avg, 2), "cv": cv})
 
+            # REAL FIX (same confirmed bug) - the pitcher who faced this
+            # hitting_side's lineup is exactly the one whose info is
+            # already stored under side_data[hitting_side] (that's how
+            # it was built - his crosswalks came from being run against
+            # THIS side's real hitters). No cross-lookup needed.
+            pitching_side = "away" if hitting_side == "home" else "home"
             pitcher_team_label = g.get(f"{pitching_side}_name", "?")
-            for prop, series in sim_results.get("starter", {}).items():
+            pitcher_name = side_data[hitting_side]["pitcher_name"]
+            for prop, series in sim_results.get(starter_key, {}).items():
                 if not series:
                     continue
                 avg = sum(series) / len(series)
                 std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
                 cv = round(std / avg, 3) if avg else None
-                pitcher_rows.append({"player": opposing_pitcher["name"], "team": pitcher_team_label,
+                pitcher_rows.append({"player": pitcher_name, "team": pitcher_team_label,
                                        "prop": prop, "real_avg": round(avg, 2), "cv": cv})
 
     return {
