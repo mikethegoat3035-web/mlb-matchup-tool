@@ -11646,3 +11646,4 @@ def find_player_by_name(name: str) -> Optional[dict]:
     except Exception:
         pass
     return None
+    
