@@ -299,11 +299,50 @@ else:
         omm_label_col = "matchup"
     elif "away_name" in omm_games_df.columns and "home_name" in omm_games_df.columns:
         omm_games_df = omm_games_df.copy()
-        omm_games_df["matchup"] = omm_games_df["away_name"] + " @ " + omm_games_df["home_name"]
+        # REAL FIX (confirmed real bug via direct user report - a real
+        # doubleheader showed the wrong pitcher pairing, Game 1's
+        # matchup crossed with Game 2's) - both games of a doubleheader
+        # share the exact same team names, so without a real game-
+        # number disambiguation, the dropdown couldn't tell them apart
+        # and the lookup's .iloc[0] always grabbed the first matching
+        # row - same real fix already proven correct in the Full
+        # Matchup Simulation section, applied here too.
+        base_labels = omm_games_df["away_name"] + " @ " + omm_games_df["home_name"]
+        label_counts = base_labels.value_counts()
+        game_nums = omm_games_df.get("game_num")
+        seen_so_far = {}
+        final_labels = []
+        for i, base_label in enumerate(base_labels):
+            if label_counts[base_label] > 1:
+                gn = game_nums.iloc[i] if game_nums is not None else None
+                if pd.notna(gn):
+                    final_labels.append(f"{base_label} (Game {int(gn)})")
+                else:
+                    seen_so_far[base_label] = seen_so_far.get(base_label, 0) + 1
+                    final_labels.append(f"{base_label} (Game {seen_so_far[base_label]})")
+            else:
+                final_labels.append(base_label)
+        omm_games_df["matchup"] = final_labels
         omm_label_col = "matchup"
     elif "away_team" in omm_games_df.columns and "home_team" in omm_games_df.columns:
         omm_games_df = omm_games_df.copy()
-        omm_games_df["matchup"] = omm_games_df["away_team"] + " @ " + omm_games_df["home_team"]
+        # REAL FIX (same confirmed doubleheader bug, applied here too)
+        base_labels2 = omm_games_df["away_team"] + " @ " + omm_games_df["home_team"]
+        label_counts2 = base_labels2.value_counts()
+        game_nums2 = omm_games_df.get("game_num")
+        seen_so_far2 = {}
+        final_labels2 = []
+        for i, base_label in enumerate(base_labels2):
+            if label_counts2[base_label] > 1:
+                gn = game_nums2.iloc[i] if game_nums2 is not None else None
+                if pd.notna(gn):
+                    final_labels2.append(f"{base_label} (Game {int(gn)})")
+                else:
+                    seen_so_far2[base_label] = seen_so_far2.get(base_label, 0) + 1
+                    final_labels2.append(f"{base_label} (Game {seen_so_far2[base_label]})")
+            else:
+                final_labels2.append(base_label)
+        omm_games_df["matchup"] = final_labels2
         omm_label_col = "matchup"
     else:
         omm_label_col = omm_games_df.columns[0]
