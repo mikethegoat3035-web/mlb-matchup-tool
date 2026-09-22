@@ -9439,17 +9439,36 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
     # Attempt 3: pull the actual starter from real pitching stats — catches
     # the case where the lineup/game is confirmed but probablePitcher
     # itself wasn't populated the way attempts 1-2 expected.
+    #
+    # REAL FIX (confirmed real bug via direct user report - a real
+    # doubleheader's afternoon Game 2, checked before it started, showed
+    # the wrong pitcher). Confirmed by direct logic: if a game genuinely
+    # hasn't started, no real pitch has been thrown in it, so
+    # gamesStarted/battersFaced showing non-zero here can't genuinely
+    # reflect THIS game - it must be reflecting something else (likely
+    # season-cumulative data, exactly the risk this docstring already
+    # flagged). Now checks the game's real status first and only allows
+    # this attempt when the game has actually started - the only
+    # situation where these stats could genuinely belong to this game.
     try:
-        if box is None:
-            box = statsapi.boxscore_data(game_pk)
-        team_players = box.get(side, {}).get("players", {}) if isinstance(box.get(side), dict) else {}
-        for pid, pdata in team_players.items():
-            stats = pdata.get("stats", {}).get("pitching", {})
-            if stats.get("gamesStarted", 0) or stats.get("battersFaced", 0):
-                person = pdata.get("person", {})
-                if person.get("id"):
-                    return {"player_id": person["id"], "name": person.get("fullName"),
-                            "source": "attempt_3_actual_stats"}
+        game_has_started = False
+        try:
+            status_check = statsapi.get("schedule", {"sportId": 1, "gamePk": game_pk})
+            game_status = status_check["dates"][0]["games"][0].get("status", {}).get("abstractGameState", "")
+            game_has_started = game_status in ("Live", "Final")
+        except (KeyError, IndexError, TypeError):
+            pass
+        if game_has_started:
+            if box is None:
+                box = statsapi.boxscore_data(game_pk)
+            team_players = box.get(side, {}).get("players", {}) if isinstance(box.get(side), dict) else {}
+            for pid, pdata in team_players.items():
+                stats = pdata.get("stats", {}).get("pitching", {})
+                if stats.get("gamesStarted", 0) or stats.get("battersFaced", 0):
+                    person = pdata.get("person", {})
+                    if person.get("id"):
+                        return {"player_id": person["id"], "name": person.get("fullName"),
+                                "source": "attempt_3_actual_stats"}
     except Exception:
         pass
 
