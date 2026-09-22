@@ -11623,3 +11623,4 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
         "games_scanned": len(games_df) - len(games_skipped),
         "games_skipped": games_skipped,
     }
+    
