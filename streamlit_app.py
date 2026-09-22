@@ -373,6 +373,8 @@ else:
                     continue
 
                 with st.spinner(f"Building {opposing_pitcher['name']}'s real tendency profile..."):
+                    st.caption(f"Real {pitching_side} starter resolved: **{opposing_pitcher['name']}** "
+                               f"(via {opposing_pitcher.get('source', 'unknown')}) | Real game_pk used: {omm_game_pk}")
                     try:
                         pid = opposing_pitcher["player_id"]
                         pitcher_pitches = pull_pitcher_pitches(pid, pitcher_recent_start, today_str)
@@ -650,11 +652,11 @@ else:
                     st.warning(
                         f"⚠️ {opposing_pitcher['name']} ({pitching_side} starter) was resolved via the "
                         f"least-verified fallback method (attempt 3) - double check this is genuinely "
-                        f"today's real starter before trusting this simulation."
+                        f"today's real starter before trusting this simulation. Real game_pk used: {sim_game_pk}"
                     )
                 else:
                     st.caption(f"Real {pitching_side} starter resolved: **{opposing_pitcher['name']}** "
-                               f"(via {pitcher_source})")
+                               f"(via {pitcher_source}) | Real game_pk used: {sim_game_pk}")
 
                 pid = opposing_pitcher["player_id"]
                 # Real fix - matches the same, already-established convention
