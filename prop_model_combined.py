@@ -9418,7 +9418,23 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
         sched = statsapi.get("schedule", {
             "sportId": 1, "gamePk": game_pk, "hydrate": "probablePitcher",
         })
-        game = sched["dates"][0]["games"][0]
+        # REAL FIX (confirmed real bug via direct user report - Game 1
+        # of a real doubleheader showed Game 2's pitcher instead).
+        # Confirmed the root cause directly: this blindly took the
+        # FIRST game in MLB's response ([0]) without ever checking it
+        # actually matched the requested game_pk. For a doubleheader,
+        # MLB's schedule response can include both real games for that
+        # date - taking [0] silently grabbed whichever game happened to
+        # be listed first, regardless of which one was actually
+        # requested. Now explicitly finds the entry whose own gamePk
+        # matches what was asked for.
+        game = None
+        for g in sched.get("dates", [{}])[0].get("games", []):
+            if g.get("gamePk") == game_pk:
+                game = g
+                break
+        if game is None:
+            game = sched["dates"][0]["games"][0]  # real, last-resort fallback if the match genuinely isn't found
         pp = game.get("teams", {}).get(side, {}).get("probablePitcher")
         if pp and pp.get("id"):
             return {"player_id": pp["id"], "name": pp.get("fullName"), "source": "attempt_1_schedule_hydrate"}
@@ -9454,7 +9470,14 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
         game_has_started = False
         try:
             status_check = statsapi.get("schedule", {"sportId": 1, "gamePk": game_pk})
-            game_status = status_check["dates"][0]["games"][0].get("status", {}).get("abstractGameState", "")
+            status_game = None
+            for g in status_check.get("dates", [{}])[0].get("games", []):
+                if g.get("gamePk") == game_pk:
+                    status_game = g
+                    break
+            if status_game is None:
+                status_game = status_check["dates"][0]["games"][0]
+            game_status = status_game.get("status", {}).get("abstractGameState", "")
             game_has_started = game_status in ("Live", "Final")
         except (KeyError, IndexError, TypeError):
             pass
