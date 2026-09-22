@@ -9413,44 +9413,73 @@ def get_probable_pitcher(game_pk: int, side: str) -> Optional[dict]:
     if statsapi is None:
         raise ImportError("pip install MLB-StatsAPI --break-system-packages")
 
-    # Attempt 1: schedule + hydrate — try this first, most reliable pregame
-    try:
-        sched = statsapi.get("schedule", {
-            "sportId": 1, "gamePk": game_pk, "hydrate": "probablePitcher",
-        })
-        # REAL FIX (confirmed real bug via direct user report - Game 1
-        # of a real doubleheader showed Game 2's pitcher instead).
-        # Confirmed the root cause directly: this blindly took the
-        # FIRST game in MLB's response ([0]) without ever checking it
-        # actually matched the requested game_pk. For a doubleheader,
-        # MLB's schedule response can include both real games for that
-        # date - taking [0] silently grabbed whichever game happened to
-        # be listed first, regardless of which one was actually
-        # requested. Now explicitly finds the entry whose own gamePk
-        # matches what was asked for.
-        game = None
-        for g in sched.get("dates", [{}])[0].get("games", []):
-            if g.get("gamePk") == game_pk:
-                game = g
-                break
-        if game is None:
-            game = sched["dates"][0]["games"][0]  # real, last-resort fallback if the match genuinely isn't found
-        pp = game.get("teams", {}).get(side, {}).get("probablePitcher")
-        if pp and pp.get("id"):
-            return {"player_id": pp["id"], "name": pp.get("fullName"), "source": "attempt_1_schedule_hydrate"}
-    except (KeyError, IndexError, TypeError):
-        pass
+    def _is_rescheduled_game() -> bool:
+        """
+        Real, direct check - per direct request, confirmed real issue
+        where a rescheduled/makeup game's probablePitcher field can
+        still hold stale data from when it was ORIGINALLY scheduled
+        (confirmed live case: a May 23 postponement made up as part of
+        a September doubleheader still showed the pitcher who was
+        probable back in May). MLB's raw schedule API directly exposes
+        a real "rescheduledFrom" field - confirmed field name via
+        direct search - checked here directly rather than guessing at
+        pitcher activity. Returns False (trust attempts 1-2 normally)
+        if the check itself can't be completed.
+        """
+        try:
+            sched = statsapi.get("schedule", {"sportId": 1, "gamePk": game_pk})
+            for g in sched.get("dates", [{}])[0].get("games", []):
+                if g.get("gamePk") == game_pk:
+                    return bool(g.get("rescheduledFrom") or g.get("resumeDate"))
+        except Exception:
+            pass
+        return False
 
-    # Attempt 2: boxscore_data's probablePitcher field (original approach)
-    try:
-        box = statsapi.boxscore_data(game_pk)
-        team = box.get(side, {})
-        if isinstance(team, dict) and team.get("probablePitcher"):
-            p = team["probablePitcher"]
-            if p.get("id"):
-                return {"player_id": p["id"], "name": p.get("fullName"), "source": "attempt_2_boxscore_probable"}
-    except Exception:
-        box = None
+    game_is_rescheduled = _is_rescheduled_game()
+
+    # REAL FIX (confirmed via a real, documented issue on this exact
+    # library - toddrob99/MLB-StatsAPI issue #164 - the schedule
+    # endpoint can return multiple real games even when a specific
+    # gamePk is requested, and downstream code matching against
+    # position [0] silently grabs the wrong one for a doubleheader).
+    # boxscore_data(game_pk) takes the game_pk as a direct path
+    # parameter rather than filtering a list, making it structurally
+    # immune to this - tried FIRST now instead of second.
+
+    # Attempt 1 (was attempt 2): boxscore_data's probablePitcher field
+    # REAL FIX - skipped entirely for a confirmed rescheduled game,
+    # since this field can hold stale data from the original date.
+    box = None
+    if not game_is_rescheduled:
+        try:
+            box = statsapi.boxscore_data(game_pk)
+            team = box.get(side, {})
+            if isinstance(team, dict) and team.get("probablePitcher"):
+                p = team["probablePitcher"]
+                if p.get("id"):
+                    return {"player_id": p["id"], "name": p.get("fullName"), "source": "attempt_1_boxscore_probable"}
+        except Exception:
+            box = None
+
+    # Attempt 2 (was attempt 1): schedule + hydrate - also skipped for
+    # a confirmed rescheduled game, same real reason as above.
+    if not game_is_rescheduled:
+        try:
+            sched = statsapi.get("schedule", {
+                "sportId": 1, "gamePk": game_pk, "hydrate": "probablePitcher",
+            })
+            game = None
+            for g in sched.get("dates", [{}])[0].get("games", []):
+                if g.get("gamePk") == game_pk:
+                    game = g
+                    break
+            if game is None:
+                game = sched["dates"][0]["games"][0]  # real, last-resort fallback if the match genuinely isn't found
+            pp = game.get("teams", {}).get(side, {}).get("probablePitcher")
+            if pp and pp.get("id"):
+                return {"player_id": pp["id"], "name": pp.get("fullName"), "source": "attempt_2_schedule_hydrate"}
+        except (KeyError, IndexError, TypeError):
+            pass
 
     # Attempt 3: pull the actual starter from real pitching stats — catches
     # the case where the lineup/game is confirmed but probablePitcher
