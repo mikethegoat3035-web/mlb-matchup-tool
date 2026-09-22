@@ -11623,4 +11623,26 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
         "games_scanned": len(games_df) - len(games_skipped),
         "games_skipped": games_skipped,
     }
-    
+
+
+def find_player_by_name(name: str) -> Optional[dict]:
+    """
+    Real, direct player search by name - per direct request, a manual
+    override path for when the automated probable-pitcher lookup gets
+    it wrong (confirmed real case: a rescheduled doubleheader game
+    still returning a stale pitcher from months earlier, even after
+    three real attempts to fix the automated detection). Uses
+    statsapi.lookup_player(), MLB-StatsAPI's own standard name-search
+    function - returns the first real match's {"player_id", "name"},
+    or None if nothing real matches.
+    """
+    if statsapi is None:
+        raise ImportError("pip install MLB-StatsAPI --break-system-packages")
+    try:
+        results = statsapi.lookup_player(name)
+        if results:
+            p = results[0]
+            return {"player_id": p.get("id"), "name": p.get("fullName")}
+    except Exception:
+        pass
+    return None
