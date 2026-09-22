@@ -350,51 +350,104 @@ else:
     omm_row = omm_games_df[omm_games_df[omm_label_col] == omm_game_label].iloc[0]
     omm_game_pk = omm_row.get("game_pk")
 
-    if st.button("Run Original Method check for both real pitchers", key="omm_run_btn"):
+    # REAL, NEW (per direct request, fixing a real bug) - same
+    # restructure as the Full Matchup Simulation section: lineup and
+    # pitchers now pull immediately after game selection, cached in
+    # session_state, with verification/override UI shown BEFORE the
+    # run button - not after clicking it.
+    omm_cache_key = f"omm_data_{omm_game_pk}"
+    if omm_cache_key not in st.session_state:
         with st.spinner("Pulling real, confirmed lineups and both real starters..."):
             try:
-                omm_lineup_data = pull_confirmed_lineup(omm_game_pk)
+                pulled_lineup = pull_confirmed_lineup(omm_game_pk)
             except Exception as e:
                 st.error(f"Couldn't pull the real, confirmed lineup: {e}")
-                omm_lineup_data = None
+                pulled_lineup = None
+            pulled_pitchers = {}
+            for pside in ("home", "away"):
+                try:
+                    pulled_pitchers[pside] = get_probable_pitcher(omm_game_pk, pside)
+                except Exception:
+                    pulled_pitchers[pside] = None
+        st.session_state[omm_cache_key] = {"lineup": pulled_lineup, "pitchers": pulled_pitchers}
 
-        if omm_lineup_data is None or omm_lineup_data.get("lineup_status") != "confirmed":
-            st.warning("This real game doesn't have a fully confirmed lineup yet (both batting "
-                       "orders + both starting pitchers) - try again closer to first pitch.")
-        else:
-            with st.expander("✅ Verify the real, confirmed lineups being used", expanded=True):
-                for side_label, side_key in [("Away", "away"), ("Home", "home")]:
-                    real_lineup_side = omm_lineup_data.get(side_key, [])
-                    if real_lineup_side:
-                        names_in_order = [h.get("name", "?") for h in real_lineup_side]
-                        st.markdown(f"**{side_label} lineup ({len(names_in_order)}):** " + ", ".join(names_in_order))
+    omm_data = st.session_state[omm_cache_key]
+    omm_lineup_data = omm_data["lineup"]
+    omm_pitchers = omm_data["pitchers"]
+
+    omm_ready = omm_lineup_data is not None and omm_lineup_data.get("lineup_status") == "confirmed"
+    if not omm_ready:
+        st.warning("This real game doesn't have a fully confirmed lineup yet (both batting "
+                   "orders + both starting pitchers) - try again closer to first pitch.")
+    else:
+        with st.expander("✅ Verify (and adjust, if needed) the real pitchers and lineups being used", expanded=True):
+            for pside in ("away", "home"):
+                p = omm_pitchers.get(pside)
+                if p is None:
+                    st.warning(f"No real, confirmed {pside} starter found yet.")
+                    continue
+                st.caption(f"Real {pside} starter resolved: **{p['name']}** (via {p.get('source', 'unknown')}) | "
+                           f"Real game_pk used: {omm_game_pk}")
+                override_name = st.text_input(
+                    f"Wrong {pside} starter? Type the real name to override:",
+                    key=f"omm_pitcher_override_{pside}_{omm_game_pk}",
+                )
+                if override_name.strip():
+                    override_result = find_player_by_name(override_name.strip())
+                    if override_result and override_result.get("player_id"):
+                        st.success(f"Using **{override_result['name']}** instead (manual override).")
+                        omm_pitchers[pside] = {"player_id": override_result["player_id"],
+                                                 "name": override_result["name"], "source": "manual_override"}
                     else:
-                        st.markdown(f"**{side_label} lineup:** not yet posted")
+                        st.error(f"Couldn't find a real player matching '{override_name}' - keeping the auto-detected pitcher.")
 
+            for side_label, side_key in [("Away", "away"), ("Home", "home")]:
+                real_lineup_side = omm_lineup_data.get(side_key, [])
+                if real_lineup_side:
+                    names_in_order = [h.get("name", "?") for h in real_lineup_side]
+                    st.markdown(f"**{side_label} lineup ({len(names_in_order)}):** " + ", ".join(names_in_order))
+                else:
+                    st.markdown(f"**{side_label} lineup:** not yet posted")
+
+            st.markdown("**Wrong hitter? Replace one below:**")
+            for side_label, side_key in [("Away", "away"), ("Home", "home")]:
+                real_lineup_side = omm_lineup_data.get(side_key, [])
+                if not real_lineup_side:
+                    continue
+                col1, col2 = st.columns(2)
+                with col1:
+                    slot_options = [f"{i+1}. {h.get('name', '?')}" for i, h in enumerate(real_lineup_side)]
+                    chosen_slot = st.selectbox(f"{side_label} - pick a spot to replace", ["(none)"] + slot_options,
+                                                 key=f"omm_hitter_slot_{side_key}_{omm_game_pk}")
+                with col2:
+                    replacement_name = st.text_input(f"{side_label} - real name to use instead",
+                                                        key=f"omm_hitter_name_{side_key}_{omm_game_pk}")
+                if chosen_slot != "(none)" and replacement_name.strip():
+                    slot_idx = int(chosen_slot.split(".")[0]) - 1
+                    replacement_result = find_player_by_name(replacement_name.strip())
+                    if replacement_result and replacement_result.get("player_id"):
+                        omm_lineup_data[side_key][slot_idx] = {
+                            "player_id": replacement_result["player_id"], "name": replacement_result["name"],
+                        }
+                        st.success(f"{side_label} spot {slot_idx+1} now using **{replacement_result['name']}**.")
+                    else:
+                        st.error(f"Couldn't find a real player matching '{replacement_name}'.")
+
+    if omm_ready and st.button("Run Original Method check for both real pitchers", key="omm_run_btn"):
+        if True:
             today_str = get_mlb_today().strftime("%Y-%m-%d")
             pitcher_recent_start = (datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=68)).strftime("%Y-%m-%d")
             omm_results = {}
 
             for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
                 real_lineup = omm_lineup_data.get(hitting_side, [])
-                opposing_pitcher = get_probable_pitcher(omm_game_pk, pitching_side)
+                # REAL FIX (same restructure) - uses the already-
+                # resolved (and potentially overridden) pitcher instead
+                # of re-fetching fresh here, which would have silently
+                # discarded any manual override made before Run.
+                opposing_pitcher = omm_pitchers.get(pitching_side)
                 if not real_lineup or opposing_pitcher is None:
                     continue
-
-                st.caption(f"Real {pitching_side} starter resolved: **{opposing_pitcher['name']}** "
-                           f"(via {opposing_pitcher.get('source', 'unknown')}) | Real game_pk used: {omm_game_pk}")
-                override_name = st.text_input(
-                    f"Wrong {pitching_side} starter? Type the real name to override:",
-                    key=f"omm_override_{pitching_side}_{omm_game_pk}",
-                )
-                if override_name.strip():
-                    override_result = find_player_by_name(override_name.strip())
-                    if override_result and override_result.get("player_id"):
-                        st.success(f"Using **{override_result['name']}** instead (manual override).")
-                        opposing_pitcher = {"player_id": override_result["player_id"],
-                                              "name": override_result["name"], "source": "manual_override"}
-                    else:
-                        st.error(f"Couldn't find a real player matching '{override_name}' - keeping the auto-detected pitcher.")
 
                 with st.spinner(f"Building {opposing_pitcher['name']}'s real tendency profile..."):
                     try:
@@ -604,6 +657,90 @@ else:
                         f"(status: {game1_row.iloc[0].get('status', 'unknown')}). "
                         f"Pitcher/lineup data for Game 2 may not be fully ready.")
 
+    # REAL, NEW (per direct request, fixing a real bug) - lineup and
+    # both pitchers now pull immediately after game selection, cached
+    # in session_state, with verification/override UI shown BEFORE the
+    # run button - not after clicking it. Cache key includes the game
+    # so switching games re-pulls fresh data automatically.
+    sim_cache_key = f"sim_data_{sim_game_pk}"
+    if sim_cache_key not in st.session_state:
+        with st.spinner("Pulling the real lineup and confirming both real starters..."):
+            try:
+                pulled_lineup = pull_confirmed_lineup(sim_game_pk)
+            except Exception as e:
+                st.error(f"Couldn't pull the real lineup: {e}")
+                pulled_lineup = None
+            pulled_pitchers = {}
+            for pside in ("home", "away"):
+                try:
+                    pulled_pitchers[pside] = get_probable_pitcher(sim_game_pk, pside)
+                except Exception:
+                    pulled_pitchers[pside] = None
+        st.session_state[sim_cache_key] = {"lineup": pulled_lineup, "pitchers": pulled_pitchers}
+
+    sim_data = st.session_state[sim_cache_key]
+    lineup_data = sim_data["lineup"]
+    sim_pitchers = sim_data["pitchers"]
+
+    sim_ready = lineup_data is not None and lineup_data.get("lineup_status") in (
+        "confirmed", "lineups_posted_pitcher_tbd")
+    if not sim_ready:
+        st.warning("The real lineup for this game hasn't posted yet - try again closer to first pitch.")
+    else:
+        with st.expander("✅ Verify (and adjust, if needed) the real pitchers and lineups being used", expanded=True):
+            for pside in ("away", "home"):
+                p = sim_pitchers.get(pside)
+                if p is None:
+                    st.warning(f"No real, confirmed {pside} starter found yet.")
+                    continue
+                p_source = p.get("source", "unknown")
+                st.caption(f"Real {pside} starter resolved: **{p['name']}** (via {p_source}) | "
+                           f"Real game_pk used: {sim_game_pk}")
+                override_name = st.text_input(
+                    f"Wrong {pside} starter? Type the real name to override:",
+                    key=f"sim_pitcher_override_{pside}_{sim_game_pk}",
+                )
+                if override_name.strip():
+                    override_result = find_player_by_name(override_name.strip())
+                    if override_result and override_result.get("player_id"):
+                        st.success(f"Using **{override_result['name']}** instead (manual override).")
+                        sim_pitchers[pside] = {"player_id": override_result["player_id"],
+                                                 "name": override_result["name"], "source": "manual_override"}
+                    else:
+                        st.error(f"Couldn't find a real player matching '{override_name}' - keeping the auto-detected pitcher.")
+
+            for side_label, side_key in [("Away", "away"), ("Home", "home")]:
+                real_lineup_side = lineup_data.get(side_key, [])
+                if real_lineup_side:
+                    names_in_order = [h.get("name", "?") for h in real_lineup_side]
+                    st.markdown(f"**{side_label} lineup ({len(names_in_order)}):** " + ", ".join(names_in_order))
+                else:
+                    st.markdown(f"**{side_label} lineup:** not yet posted")
+
+            st.markdown("**Wrong hitter? Replace one below:**")
+            for side_label, side_key in [("Away", "away"), ("Home", "home")]:
+                real_lineup_side = lineup_data.get(side_key, [])
+                if not real_lineup_side:
+                    continue
+                col1, col2 = st.columns(2)
+                with col1:
+                    slot_options = [f"{i+1}. {h.get('name', '?')}" for i, h in enumerate(real_lineup_side)]
+                    chosen_slot = st.selectbox(f"{side_label} - pick a spot to replace", ["(none)"] + slot_options,
+                                                 key=f"sim_hitter_slot_{side_key}_{sim_game_pk}")
+                with col2:
+                    replacement_name = st.text_input(f"{side_label} - real name to use instead",
+                                                        key=f"sim_hitter_name_{side_key}_{sim_game_pk}")
+                if chosen_slot != "(none)" and replacement_name.strip():
+                    slot_idx = int(chosen_slot.split(".")[0]) - 1
+                    replacement_result = find_player_by_name(replacement_name.strip())
+                    if replacement_result and replacement_result.get("player_id"):
+                        lineup_data[side_key][slot_idx] = {
+                            "player_id": replacement_result["player_id"], "name": replacement_result["name"],
+                        }
+                        st.success(f"{side_label} spot {slot_idx+1} now using **{replacement_result['name']}**.")
+                    else:
+                        st.error(f"Couldn't find a real player matching '{replacement_name}'.")
+
     # REAL FIX - park factor and live wind now actually applied to the
     # simulation, per direct finding that they were completely absent.
     # Park is determined by the HOME team regardless of which lineup is
@@ -629,44 +766,16 @@ else:
                                   "statistically tighter over_rate/avg estimates than 100 would - "
                                   "there's little real reason to use fewer.")
 
-    if st.button("Run full matchup simulation", key="sim_run_button"):
-        with st.spinner("Pulling the real lineup and confirming both real starters..."):
-            try:
-                lineup_data = pull_confirmed_lineup(sim_game_pk)
-            except Exception as e:
-                st.error(f"Couldn't pull the real lineup: {e}")
-                lineup_data = None
-
-        if lineup_data is None or lineup_data.get("lineup_status") not in (
-                "confirmed", "lineups_posted_pitcher_tbd"):
-            st.warning("The real lineup for this game hasn't posted yet - try again closer to first pitch.")
-        else:
-            # REAL, NEW (per direct request) - same verification
-            # principle already applied to pitchers, now applied to
-            # hitters: shows the real, confirmed lineup for both real
-            # teams before the simulation runs, so a wrong or stale
-            # lineup can be caught and confirmed correct up front.
-            with st.expander("✅ Verify the real, confirmed lineups being used", expanded=True):
-                for side_label, side_key in [("Away", "away"), ("Home", "home")]:
-                    real_lineup_side = lineup_data.get(side_key, [])
-                    if real_lineup_side:
-                        names_in_order = [h.get("name", "?") for h in real_lineup_side]
-                        st.markdown(f"**{side_label} lineup ({len(names_in_order)}):** " + ", ".join(names_in_order))
-                    else:
-                        st.markdown(f"**{side_label} lineup:** not yet posted")
-
+    if sim_ready and st.button("Run full matchup simulation", key="sim_run_button"):
+        if True:
             today_str = get_mlb_today().strftime("%Y-%m-%d")
             combined_hitters_series = {}
             combined_pitchers_series = {}
             sim_lineup_teams = {}
             sim_pitcher_teams = {}
             combined_lineup_coverage = {}
-            # Real fix - these were already being built (crosswalk has real
-            # xwOBA/xwobacon/whiff/chase per pitch type, pitcher_arsenal has
-            # real usage%/zone%/whiff% per pitch type vs each hand) but
-            # discarded right after feeding the simulation - never saved
-            # anywhere the UI could show them. Captured here so they can be
-            # displayed for real verification below.
+            combined_crosswalks = {}
+            combined_arsenals = {}
             combined_crosswalks = {}
             combined_arsenals = {}
 
@@ -680,11 +789,13 @@ else:
                 if not real_lineup:
                     st.warning(f"No real, confirmed lineup found for the {hitting_side} team yet - skipped.")
                     continue
-                try:
-                    opposing_pitcher = get_probable_pitcher(sim_game_pk, pitching_side)
-                except Exception as e:
-                    opposing_pitcher = None
-                    st.error(f"Couldn't identify the real {pitching_side} starter: {e}")
+                # REAL FIX (fixing the real bug this whole restructure
+                # was for) - uses the already-resolved pitcher from
+                # sim_pitchers (which reflects any manual override made
+                # before clicking Run), instead of re-fetching fresh
+                # from get_probable_pitcher here, which would have
+                # silently discarded the override entirely.
+                opposing_pitcher = sim_pitchers.get(pitching_side)
 
                 if opposing_pitcher is None:
                     st.warning(f"No real, confirmed starter found for the {pitching_side} team yet - skipped.")
@@ -697,37 +808,6 @@ else:
                 # source tells you which of the 3 real fallback methods
                 # actually resolved this - attempt_3 hasn't been verified
                 # live and deserves real, extra scrutiny if it shows up.
-                pitcher_source = opposing_pitcher.get("source", "unknown")
-                if pitcher_source == "attempt_3_actual_stats":
-                    st.warning(
-                        f"⚠️ {opposing_pitcher['name']} ({pitching_side} starter) was resolved via the "
-                        f"least-verified fallback method (attempt 3) - double check this is genuinely "
-                        f"today's real starter before trusting this simulation. Real game_pk used: {sim_game_pk}"
-                    )
-                else:
-                    st.caption(f"Real {pitching_side} starter resolved: **{opposing_pitcher['name']}** "
-                               f"(via {pitcher_source}) | Real game_pk used: {sim_game_pk}")
-
-                # REAL, NEW (per direct request, after 3 rounds of
-                # automated fixes still failed on a confirmed real
-                # doubleheader edge case) - a direct manual override.
-                # If the auto-detected pitcher is wrong, type the real
-                # name here and it takes over the actual simulation -
-                # doesn't depend on correctly guessing MLB's API
-                # structure for edge cases like a rescheduled game.
-                override_name = st.text_input(
-                    f"Wrong {pitching_side} starter? Type the real name to override:",
-                    key=f"sim_override_{pitching_side}_{sim_game_pk}",
-                )
-                if override_name.strip():
-                    override_result = find_player_by_name(override_name.strip())
-                    if override_result and override_result.get("player_id"):
-                        st.success(f"Using **{override_result['name']}** instead (manual override).")
-                        opposing_pitcher = {"player_id": override_result["player_id"],
-                                              "name": override_result["name"], "source": "manual_override"}
-                    else:
-                        st.error(f"Couldn't find a real player matching '{override_name}' - keeping the auto-detected pitcher.")
-
                 pid = opposing_pitcher["player_id"]
                 # Real fix - matches the same, already-established convention
                 # used everywhere else in this file (scan_full_slate_quality_
