@@ -80,7 +80,7 @@ from prop_model_combined import (
     simulate_combo_hit_rate_from_backtest,
     bootstrap_mu_stability, pull_hitter_game_log, get_mlb_today,
     pull_official_hitter_game_log, HITTER_FANTASY_WEIGHTS,
-    pull_confirmed_lineup, get_probable_pitcher,
+    pull_confirmed_lineup, get_probable_pitcher, find_player_by_name,
     pull_pitcher_pitches, build_arsenal_profile, pull_batter_pitches,
     build_hitter_profile, build_pitch_crosswalk, pull_pitcher_game_log,
     simulate_matchup_n_times, real_over_rate_from_simulation,
