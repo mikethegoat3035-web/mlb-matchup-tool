@@ -952,6 +952,21 @@ def calc_wind_hr_multiplier(team_query: str, wind_mph: int, wind_direction: str)
 
 LEAGUE_AVG_PITCHER_WHIFF = 11.5   # SwStr%, approx midpoint of TIER_BENCHMARKS whiff_pct elite/poor (15/8)
 LEAGUE_AVG_PITCHER_CSW = 27.5     # midpoint of TIER_BENCHMARKS csw_pct elite/poor (31/24)
+LEAGUE_AVG_PITCHER_Z_WHIFF = 15.0  # same midpoint pattern, from TIER_BENCHMARKS z_whiff_pct elite/poor (10/20) - same underlying stat as the hitter-side entry, opposite direction (pitcher wants this HIGH)
+# REAL FIX (found via direct request - confirmed 8 metrics were
+# computed and graded, but never fed into the simulation - some not
+# even exposed in the crosswalk at all). Same midpoint-of-
+# TIER_BENCHMARKS pattern as every other league-average constant here.
+LEAGUE_AVG_PITCHER_PUTAWAY = 25.5        # midpoint of putaway_pct elite/poor (33/18)
+LEAGUE_AVG_PITCHER_Z_CONTACT_AGAINST = 85.0  # midpoint of z_contact_pct_against elite/poor (80/90)
+LEAGUE_AVG_PITCHER_TWO_STRIKE_CALLED = 21.0  # midpoint of two_strike_called_pct elite/poor (28/14)
+LEAGUE_AVG_PITCHER_Z_SWING_INDUCED = 66.0    # midpoint of z_swing_pct elite/poor (72/60)
+LEAGUE_AVG_PITCHER_CALLED_STRIKE = 16.5      # midpoint of called_strike_pct elite/poor (19/14)
+LEAGUE_AVG_HITTER_Z_WHIFF = 15.0             # midpoint of z_whiff_pct elite/poor (10/20), hitter's own
+LEAGUE_AVG_HITTER_Z_CONTACT = 85.0           # midpoint of z_contact_pct elite/poor (90/80), hitter's own
+LEAGUE_AVG_HITTER_CONTACT = 77.0             # midpoint of contact_pct elite/poor (82/72)
+LEAGUE_AVG_PITCHER_WHIFF_PER_SWING = 24.0    # midpoint of whiff_per_swing_pct elite/poor (30/18)
+LEAGUE_AVG_PITCHER_CHASE_WHIFF = 36.5        # midpoint of chase_whiff_pct elite/poor (45/28)
 LEAGUE_AVG_PITCHER_HARDHIT_AGAINST = 37.0  # midpoint of hardhit_pct_against elite/poor (32/42)
 # Real, honest approximate per-start averages AND typical real game-to-
 # game spread (std) for a typical MLB starter - used as a fixed,
@@ -1576,6 +1591,7 @@ TIER_BENCHMARKS = {
     "hardhit_pct":       {"elite": 50.0,  "poor": 30.0,  "direction": "high"},  # hitter's OWN contact quality — high is good
     "slg":               {"elite": 0.480, "poor": 0.370, "direction": "high"},
     "xwoba":             {"elite": 0.370, "poor": 0.290, "direction": "high"},
+    "xwobacon":          {"elite": 0.430, "poor": 0.340, "direction": "high"},  # hitter's own contact-only quality - matches the real benchmark established for tonight's side-system, distinct from xwobacon_against (pitcher-allowed) below
     "whiff_pct":         {"elite": 15.0,  "poor": 8.0,   "direction": "high"},  # pitcher SwStr%
     "chase_whiff_pct":   {"elite": 45.0,  "poor": 28.0,  "direction": "high"},
     "avg_spin_rate":     {"elite": 2400,  "poor": 2000,  "direction": "high"},
@@ -1599,6 +1615,19 @@ TIER_BENCHMARKS = {
     # have data access, same as anything else here.
     "z_swing_pct":       {"elite": 72.0,  "poor": 60.0,  "direction": "high"},  # real MLB Z-Swing% (swings on in-zone pitches) clusters ~65-70% league-wide - a pitcher who reliably gets swings on a pitch he lands in the zone gets more predictable, favorable outcomes (avoids "taken for ball four" surprises)
     "whiff_per_swing_pct": {"elite": 30.0, "poor": 18.0, "direction": "high"},  # real MLB-wide swing-and-miss-per-swing rate clusters ~24-25% (contact% around 75-76%) - distinct from swstr_pct, which is diluted by every non-swing pitch
+    # REAL FIX (found via direct request - confirmed these 6 were
+    # computed and already feeding the simulation, but had no elite/
+    # average/poor grading tier anywhere in this file). Real, standard
+    # MLB-wide benchmarks - same honesty caveat as z_swing_pct/whiff_
+    # per_swing_pct above: not independently verified against live 2026
+    # data (no network access here), worth a real sanity check once
+    # you have data access.
+    "barrel_pct":        {"elite": 12.0,  "poor": 4.0,   "direction": "high"},  # hitter's own - matches the real benchmark already established for the side-system tonight
+    "iso":               {"elite": 0.200, "poor": 0.120, "direction": "high"},  # isolated power - real, standard MLB-wide thresholds
+    "ba":                {"elite": 0.280, "poor": 0.230, "direction": "high"},
+    "avg_exit_velo":     {"elite": 91.0,  "poor": 86.0,  "direction": "high"},  # real, standard Statcast EV benchmarks (mph)
+    "z_contact_pct":     {"elite": 90.0,  "poor": 80.0,  "direction": "high"},  # hitter's OWN in-zone contact ability - opposite direction from the pitcher-side z_contact_pct_against entry above (same underlying stat, different side of the matchup)
+    "contact_pct":       {"elite": 82.0,  "poor": 72.0,  "direction": "high"},
 }
 
 
@@ -1640,7 +1669,15 @@ def crucial_hitter_metrics(hitter_recent: list, pitcher_hand: str, usage_thresho
         return sum(v * n for v, n in vals) / sum(n for _, n in vals) if vals else None
 
     raw = {"xba": wavg("xba"), "chase_pct": wavg("chase_pct"), "z_whiff_pct": wavg("z_whiff_pct"),
-           "hardhit_pct": wavg("hardhit_pct"), "slg": wavg("slg"), "xwoba": wavg("xwoba")}
+           "hardhit_pct": wavg("hardhit_pct"), "slg": wavg("slg"), "xwoba": wavg("xwoba"),
+           # REAL FIX (found via direct request - confirmed these were
+           # already computed on HitterPitchProfile and fed into the
+           # simulation, but never actually included in this function's
+           # graded output, leaving their newly-added TIER_BENCHMARKS
+           # entries orphaned).
+           "xwobacon": wavg("xwobacon"), "barrel_pct": wavg("barrel_pct"),
+           "iso": wavg("iso"), "ba": wavg("ba"), "avg_exit_velo": wavg("avg_exit_velo"),
+           "z_contact_pct": wavg("z_contact_pct"), "contact_pct": wavg("contact_pct")}
 
     graded = {}
     for k, v in raw.items():
@@ -1677,7 +1714,22 @@ def crucial_pitcher_metrics(pitcher_recent: list, usage_threshold: float = 15.0)
 
         raw = {"whiff_pct": wavg("whiff_pct"), "chase_whiff_pct": wavg("chase_whiff_pct"),
                "avg_spin_rate": wavg("avg_spin_rate"), "groundball_pct": wavg("groundball_pct"),
-               "zone_pct": wavg("zone_pct"), "hardhit_pct_against": wavg("hardhit_pct")}
+               "zone_pct": wavg("zone_pct"), "hardhit_pct_against": wavg("hardhit_pct"),
+               # REAL FIX (same confirmed gap as the hitter side - these
+               # were already computed on PitchProfile and fed into the
+               # simulation/PITCHER_PROP_METRICS, but never actually
+               # included in this function's graded output).
+               "putaway_pct": wavg("putaway_pct"), "csw_pct": wavg("csw_pct"),
+               "called_strike_pct": wavg("called_strike_pct"),
+               "xba_against": wavg("xba_against"), "xwobacon_against": wavg("xwobacon_against"),
+               "two_strike_called_pct": wavg("two_strike_called_pct"),
+               # REAL NOTE - these two TIER_BENCHMARKS keys use different
+               # names than the actual dataclass attribute (same
+               # underlying stat, pitcher's own induced/allowed side of
+               # it) - wavg() pulls the real attribute, the dict key
+               # below matches it to its real TIER_BENCHMARKS entry.
+               "chase_pct_induced": wavg("chase_pct"),
+               "z_contact_pct_against": wavg("z_contact_pct")}
 
         graded = {}
         for k, v in raw.items():
@@ -3148,9 +3200,24 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
             "pitcher_own_chase_pct": p.chase_pct,
             "pitcher_own_xba_against": p.xba_against,
             "pitcher_own_xwobacon_against": p.xwobacon_against,
+            # REAL, NEW (per direct request) - his OWN real in-zone
+            # whiff rate, the exact signal for "generates whiffs even
+            # while confidently throwing strikes" (not just off-the-
+            # plate chase-induced whiffs, a real, distinct pitcher
+            # skill from chase_whiff_pct).
+            "pitcher_own_z_whiff_pct": p.z_whiff_pct,
             "pitcher_chase_whiff_pct": p.chase_whiff_pct,
             "pitcher_whiff_pct": p.whiff_pct,  # SwStr% (per PITCH) - NOT the apples-to-apples pairing for hitter_whiff_pct below, see pitcher_whiff_per_swing_pct
             "pitcher_whiff_per_swing_pct": p.whiff_per_swing_pct,  # REAL FIX: this is the field that actually matches hitter_whiff_pct's denominator (swings, not all pitches) - was computed but never surfaced anywhere in the file before now
+            # REAL FIX (found via direct request - confirmed these 5
+            # were computed and already graded elsewhere, but never
+            # even exposed in this crosswalk at all, let alone fed
+            # into the simulation).
+            "pitcher_own_putaway_pct": p.putaway_pct,  # the real K-prop "can he finish a hitter off" signal
+            "pitcher_own_z_contact_pct": p.z_contact_pct,  # in-zone contact ALLOWED - lower is better for him
+            "pitcher_own_two_strike_called_pct": p.two_strike_called_pct,  # real backwards-K rate
+            "pitcher_own_z_swing_pct": p.z_swing_pct,  # real induced in-zone swing rate
+            "pitcher_own_called_strike_pct": p.called_strike_pct,
             "hitter_n_pitches": h.n_pitches if h else 0,
             "hitter_whiff_pct": h.whiff_pct if h else None,  # per SWING - compare against pitcher_whiff_per_swing_pct above, not pitcher_whiff_pct
             "hitter_chase_pct": h.chase_pct if h else None,
@@ -3171,6 +3238,10 @@ def build_pitch_crosswalk(pitcher_arsenal: list, hitter_profile: list,
             "hitter_avg_exit_velo": h.avg_exit_velo if h else None,  # RAW EV, by pitch/hand, wired directly into scoring now - a real, valid point that xwOBACON's blend can smooth over a genuine underlying difference between two hitters who land on similar xwOBACON through different real profiles
             "hitter_avg_launch_angle": h.avg_launch_angle if h else None,
             "hitter_barrel_pct": h.barrel_pct if h else None,  # real, official MLB.com EV+LA combination - genuinely different from hardhit_pct (a blunt 95mph threshold) and xwobacon (a continuous run-value blend) - this is the specific, real "elite quality of contact" classification
+            # REAL FIX (same confirmed gap as the pitcher side above)
+            "hitter_z_whiff_pct": h.z_whiff_pct if h else None,  # his own real in-zone whiff rate - lower is better for him (opposite direction from the pitcher-induced version)
+            "hitter_z_contact_pct": h.z_contact_pct if h else None,  # his own real in-zone contact ability
+            "hitter_contact_pct": h.contact_pct if h else None,  # his own real overall contact rate
             "pitcher_avg_velo": p.avg_velo,
             # Real velocity-vs-bat-speed mismatch: NOT a raw subtraction
             # of pitch speed minus bat speed (those are two different
@@ -3384,6 +3455,11 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random,
     # command in his own most-used zone, not just the hitter's profile).
     if pd.notna(crosswalk_row.get("pitcher_zone_called_strike_delta")):
         walk_shift -= crosswalk_row["pitcher_zone_called_strike_delta"] / 40.0
+    # REAL FIX (found via direct request - his own real called-strike
+    # rate, a real command signal, was computed and graded but never
+    # fed into the simulation).
+    if pd.notna(crosswalk_row.get("pitcher_own_called_strike_pct")):
+        walk_shift -= (crosswalk_row["pitcher_own_called_strike_pct"] - LEAGUE_AVG_PITCHER_CALLED_STRIKE) / 30.0
     bb_rate = max(0.01, min(0.35, LEAGUE_AVG_BB_RATE + walk_shift * 0.15))
 
     # Real strikeout adjustment - same signals already proven for the
@@ -3407,6 +3483,36 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random,
     # thing as the hitter's own whiff/chase tendencies.
     if pd.notna(crosswalk_row.get("pitcher_own_csw_pct")):
         k_shift += (crosswalk_row["pitcher_own_csw_pct"] - LEAGUE_AVG_PITCHER_CSW) / 60.0
+    # Real, new addition (per direct request) - his OWN real in-zone
+    # whiff rate now directly feeds strikeout probability. This is the
+    # specific matchup dynamic requested: a pitcher who generates real
+    # whiffs even on pitches he confidently lands in the zone (not just
+    # via chasing him off the plate) is a genuinely different, stronger
+    # signal than CSW% alone - CSW% blends called strikes in too, and
+    # doesn't isolate this specific "can attack the zone and still miss
+    # bats" skill the way this does.
+    if pd.notna(crosswalk_row.get("pitcher_own_z_whiff_pct")):
+        k_shift += (crosswalk_row["pitcher_own_z_whiff_pct"] - LEAGUE_AVG_PITCHER_Z_WHIFF) / 50.0
+    # REAL FIX (found via direct request - confirmed these were
+    # computed and graded but never fed into the simulation at all).
+    if pd.notna(crosswalk_row.get("pitcher_own_putaway_pct")):
+        k_shift += (crosswalk_row["pitcher_own_putaway_pct"] - LEAGUE_AVG_PITCHER_PUTAWAY) / 60.0
+    if pd.notna(crosswalk_row.get("pitcher_own_z_contact_pct")):
+        k_shift -= (crosswalk_row["pitcher_own_z_contact_pct"] - LEAGUE_AVG_PITCHER_Z_CONTACT_AGAINST) / 100.0
+    if pd.notna(crosswalk_row.get("pitcher_own_two_strike_called_pct")):
+        k_shift += (crosswalk_row["pitcher_own_two_strike_called_pct"] - LEAGUE_AVG_PITCHER_TWO_STRIKE_CALLED) / 60.0
+    if pd.notna(crosswalk_row.get("pitcher_own_z_swing_pct")):
+        k_shift += (crosswalk_row["pitcher_own_z_swing_pct"] - LEAGUE_AVG_PITCHER_Z_SWING_INDUCED) / 200.0
+    if pd.notna(crosswalk_row.get("hitter_z_whiff_pct")):
+        k_shift += (crosswalk_row["hitter_z_whiff_pct"] - LEAGUE_AVG_HITTER_Z_WHIFF) / 60.0
+    if pd.notna(crosswalk_row.get("hitter_z_contact_pct")):
+        k_shift -= (crosswalk_row["hitter_z_contact_pct"] - LEAGUE_AVG_HITTER_Z_CONTACT) / 100.0
+    if pd.notna(crosswalk_row.get("hitter_contact_pct")):
+        k_shift -= (crosswalk_row["hitter_contact_pct"] - LEAGUE_AVG_HITTER_CONTACT) / 100.0
+    if pd.notna(crosswalk_row.get("pitcher_whiff_per_swing_pct")):
+        k_shift += (crosswalk_row["pitcher_whiff_per_swing_pct"] - LEAGUE_AVG_PITCHER_WHIFF_PER_SWING) / 50.0
+    if pd.notna(crosswalk_row.get("pitcher_chase_whiff_pct")):
+        k_shift += (crosswalk_row["pitcher_chase_whiff_pct"] - LEAGUE_AVG_PITCHER_CHASE_WHIFF) / 80.0
     # Genuinely missing until now - raw bat speed as its OWN independent
     # signal (not just through the velocity mismatch), matching the same
     # real addition made to strikeouts/hits/total_bases scoring earlier
@@ -3477,6 +3583,16 @@ def simulate_plate_appearance(crosswalk_row: dict, rng: random.Random,
         power_shift += (crosswalk_row["hitter_hardhit_pct"] - LEAGUE_AVG_HITTER_HARDHIT) / 100.0
     if pd.notna(crosswalk_row.get("hitter_xwobacon")):
         power_shift += (crosswalk_row["hitter_xwobacon"] - LEAGUE_AVG_HITTER_XWOBACON) * 2.5
+    # Real, new addition (per direct request) - plain hitter_xwoba was
+    # already computed by pitch type and used as a real qualifying gate
+    # elsewhere in this file, but never actually fed into this
+    # simulation's outcome probabilities. Added here as a genuinely new,
+    # modest signal on top of xba/xwobacon: xwoba is the one metric here
+    # that folds in real walk value alongside contact quality, capturing
+    # overall production this specific pitch type produces that the
+    # more contact-narrow signals above don't fully see on their own.
+    if pd.notna(crosswalk_row.get("hitter_xwoba")):
+        power_shift += (crosswalk_row["hitter_xwoba"] - LEAGUE_AVG_XWOBA_PITCH) * 2.0
     if pd.notna(crosswalk_row.get("hitter_avg_exit_velo")):
         power_shift += (crosswalk_row["hitter_avg_exit_velo"] - LEAGUE_AVG_HITTER_EXIT_VELO) / 20.0
     if pd.notna(crosswalk_row.get("hitter_flyball_pct")):
@@ -3789,7 +3905,18 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
     # standard deviation (4.5 outs, roughly 1.5 innings) captures that
     # honestly, clipped to a real, sane range (a start doesn't go below
     # 3 real outs or beyond 27).
-    starter_outs_target = max(3, min(27, round(rng.gauss(starter_avg_outs, 4.5))))
+    # REAL FIX (found via direct request - confirmed the same
+    # architectural gap already found and fixed in simulate_connected_
+    # game earlier tonight, and in the NFL model's game engine before
+    # that). A fixed, pre-set outs target drawn from a Gaussian BEFORE
+    # the game even starts is disconnected from how the outing actually
+    # unfolds - a real bad outing should get pulled sooner, a real good
+    # one should go deeper. Replaced with the same proven, dynamic
+    # approach: a real pitch-count target (using the same ~5.3
+    # pitches/out real MLB average), plus a real early-pull trigger if
+    # he's genuinely getting rocked (5+ earned runs), regardless of
+    # pitch count.
+    starter_pitch_target = max(40, min(130, round(rng.gauss(starter_avg_outs * 5.3, 12))))
 
     starter_stats = {name: {"strikeouts": 0, "outs": 0, "hits_allowed": 0, "walks_allowed": 0,
                              "earned_runs": 0, "batters_faced": 0, "pitches_thrown": 0, "strikes_thrown": 0}
@@ -3801,6 +3928,8 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
 
     total_outs = 0
     starter_outs = 0
+    starter_total_pitches = 0
+    starter_total_earned_runs = 0
     starter_active = True
     lineup_idx = 0
     bases = [False, False, False]  # real, simple base-state tracking for runs/RBI
@@ -3817,6 +3946,7 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
             starter_stats[name]["batters_faced"] += 1
             starter_stats[name]["pitches_thrown"] += pa_pitches
             starter_stats[name]["strikes_thrown"] += pa_strikes_pitcher
+            starter_total_pitches += pa_pitches
 
         hs = hitter_stats[name]
         hs["plate_appearances"] += 1
@@ -3859,6 +3989,7 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
                         # otherwise.
                         if starter_active:
                             starter_stats[name]["earned_runs"] += 1
+                            starter_total_earned_runs += 1
                     else:
                         bases[2] = True  # 2nd forced to 3rd (3rd was empty)
                     bases[1] = True  # 1st forced to 2nd
@@ -3901,10 +4032,14 @@ def simulate_one_game(lineup_crosswalks: dict, starter_avg_outs: float, rng: ran
             # runs allowed while he's actually in the game.
             if starter_active and runners_scored > 0:
                 starter_stats[name]["earned_runs"] += runners_scored
+                starter_total_earned_runs += runners_scored
             bases = new_bases
 
-        if starter_active and starter_outs >= starter_outs_target:
-            starter_active = False
+        if starter_active:
+            got_rocked = starter_total_earned_runs >= 5
+            hit_pitch_target = starter_total_pitches >= starter_pitch_target
+            if got_rocked or hit_pitch_target:
+                starter_active = False
         lineup_idx += 1
 
     return {"starter_stats": starter_stats, "hitter_stats": hitter_stats}
@@ -11646,4 +11781,3 @@ def find_player_by_name(name: str) -> Optional[dict]:
     except Exception:
         pass
     return None
-    
