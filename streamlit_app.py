@@ -684,9 +684,68 @@ else:
 
     sim_ready = lineup_data is not None and lineup_data.get("lineup_status") in (
         "confirmed", "lineups_posted_pitcher_tbd")
+
+    # REAL FIX (found via direct user report - the override UI below
+    # was completely unreachable when lineup_status said not_yet_posted
+    # at all, even when the user had the real, actually-confirmed
+    # lineup in hand from another source like RotoWire). This gives a
+    # real, full manual-entry path that works regardless of what the
+    # automated detection found.
     if not sim_ready:
-        st.warning("The real lineup for this game hasn't posted yet - try again closer to first pitch.")
-    else:
+        st.warning("The real lineup for this game hasn't posted yet according to this tool's automated check.")
+        with st.expander("Have the real lineup from elsewhere (RotoWire, etc)? Enter it manually", expanded=False):
+            st.caption("Enter each real name in real batting order, one per line, 9 total, for each real team.")
+            manual_away_text = st.text_area("Away team real lineup (1 name per line, real batting order)",
+                                              key=f"manual_away_lineup_{sim_game_pk}")
+            manual_home_text = st.text_area("Home team real lineup (1 name per line, real batting order)",
+                                              key=f"manual_home_lineup_{sim_game_pk}")
+            manual_away_pitcher = st.text_input("Away starting pitcher (real name)",
+                                                   key=f"manual_away_pitcher_{sim_game_pk}")
+            manual_home_pitcher = st.text_input("Home starting pitcher (real name)",
+                                                   key=f"manual_home_pitcher_{sim_game_pk}")
+            if st.button("Use this manual lineup instead", key=f"manual_lineup_submit_{sim_game_pk}"):
+                manual_lineup = {"away": [], "home": []}
+                manual_ok = True
+                for side_label, text in [("away", manual_away_text), ("home", manual_home_text)]:
+                    names = [n.strip() for n in text.splitlines() if n.strip()]
+                    if len(names) != 9:
+                        st.error(f"{side_label.title()} needs exactly 9 real names, one per line - found {len(names)}.")
+                        manual_ok = False
+                        continue
+                    for i, name in enumerate(names):
+                        found = m_find = find_player_by_name(name)
+                        if not found or not found.get("player_id"):
+                            st.error(f"Couldn't find a real player matching '{name}' for {side_label} slot {i+1}.")
+                            manual_ok = False
+                            continue
+                        manual_lineup[side_label].append({
+                            "player_id": found["player_id"], "name": found["name"],
+                            "order_slot": i + 1, "expected_pa": EXPECTED_PA_BY_ORDER_SLOT.get(i + 1, 4.0),
+                        })
+                manual_pitchers = {}
+                for pside, pname in [("away", manual_away_pitcher), ("home", manual_home_pitcher)]:
+                    if pname.strip():
+                        p_found = find_player_by_name(pname.strip())
+                        if p_found and p_found.get("player_id"):
+                            manual_pitchers[pside] = {"player_id": p_found["player_id"],
+                                                        "name": p_found["name"], "source": "manual_entry"}
+                        else:
+                            st.error(f"Couldn't find a real player matching '{pname}' for {pside} starter.")
+                            manual_ok = False
+                    else:
+                        manual_ok = False
+                        st.error(f"Need a real {pside} starting pitcher name.")
+                if manual_ok:
+                    lineup_data = {"lineup_status": "manual_entry", "away": manual_lineup["away"],
+                                     "home": manual_lineup["home"]}
+                    sim_pitchers = manual_pitchers
+                    st.session_state[sim_cache_key] = {"lineup": lineup_data, "pitchers": sim_pitchers}
+                    st.success("Real, manually-entered lineup and pitchers now in use - click 'Run full matchup simulation' below.")
+                    sim_ready = True
+
+    if not sim_ready and lineup_data is None:
+        pass  # already warned above, manual entry path shown
+    elif sim_ready:
         with st.expander("✅ Verify (and adjust, if needed) the real pitchers and lineups being used", expanded=True):
             for pside in ("away", "home"):
                 p = sim_pitchers.get(pside)
