@@ -9282,7 +9282,21 @@ def pull_confirmed_lineup(game_pk: int) -> dict:
         raw = statsapi.get("schedule", {
             "sportId": 1, "gamePk": game_pk, "hydrate": "lineups,probablePitcher",
         })
-        game = raw.get("dates", [{}])[0].get("games", [{}])[0]
+        # REAL FIX (confirmed real bug via direct user report - a game
+        # with real, already-posted lineups on RotoWire still showed
+        # "not ready" here). Same confirmed library issue already found
+        # and fixed in get_probable_pitcher earlier - MLB's schedule
+        # endpoint can return multiple real games even when a specific
+        # gamePk is requested, and blindly taking position [0] can
+        # silently grab a DIFFERENT game's (not-yet-posted) lineup data
+        # instead of the real one that was actually requested.
+        game = None
+        for g in raw.get("dates", [{}])[0].get("games", []):
+            if g.get("gamePk") == game_pk:
+                game = g
+                break
+        if game is None:
+            game = raw.get("dates", [{}])[0].get("games", [{}])[0]  # real, last-resort fallback if the match genuinely isn't found
         home_ready, away_ready = False, False
         for side in ("home", "away"):
             lineup_raw = game.get("lineups", {}).get(f"{side}Players", [])
