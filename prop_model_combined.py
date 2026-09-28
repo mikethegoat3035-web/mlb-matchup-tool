@@ -11869,6 +11869,445 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
     }
 
 
+# =====================================================================
+# EXPECTED-LINEUP PREVIEW (RotoWire) - scan a slate before official
+# lineups post (e.g. tomorrow's games, today).
+#
+# Pipeline: fetch RotoWire's daily-lineups page -> walk the HTML into a
+# flat list of "lines" (plain text, plus one tagged token per player
+# link) -> parse the lines into games -> match each RotoWire name to a
+# real MLB player id using that TEAM's roster (so "K. Schwarber" or an
+# accent-less "Cristopher Sanchez" still resolves correctly, and two
+# different "Luis Garcia"s can't get mixed up) -> hand back the exact
+# lineup / pitcher structures the simulation already consumes.
+#
+# The parser is deliberately built on the page's reading ORDER (time,
+# teams, pitcher, status, nine hitters, repeat) rather than on CSS
+# class names, so cosmetic site changes are less likely to break it.
+# HONEST LIMIT: the parser is tested against RotoWire's real page
+# content, but the live HTTP fetch and the HTML walker could not be
+# exercised from the build environment (no access to rotowire.com) -
+# fetch_rotowire_lineups() therefore reports exactly what it saw
+# (status code, line count, player-link count) so a failure is
+# diagnosable instead of silent.
+# =====================================================================
+import re as _re
+import unicodedata as _unicodedata
+
+ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
+
+MLB_TEAM_ID_TO_ABBR = {
+    108: "LAA", 109: "ARI", 110: "BAL", 111: "BOS", 112: "CHC", 113: "CIN", 114: "CLE",
+    115: "COL", 116: "DET", 117: "HOU", 118: "KC", 119: "LAD", 120: "WSH", 121: "NYM",
+    133: "ATH", 134: "PIT", 135: "SD", 136: "SEA", 137: "SF", 138: "STL", 139: "TB",
+    140: "TEX", 141: "TOR", 142: "MIN", 143: "PHI", 144: "ATL", 145: "CWS", 146: "MIA",
+    147: "NYY", 158: "MIL",
+}
+_RW_VALID_ABBRS = set(MLB_TEAM_ID_TO_ABBR.values())
+_RW_ABBR_ALIASES = {"CHW": "CWS", "WSN": "WSH", "WAS": "WSH", "OAK": "ATH", "KCR": "KC",
+                    "SFG": "SF", "SDP": "SD", "TBR": "TB", "AZ": "ARI", "ARZ": "ARI"}
+_RW_NICKNAME_TO_ABBR = {
+    "diamondbacks": "ARI", "braves": "ATL", "orioles": "BAL", "red-sox": "BOS", "cubs": "CHC",
+    "reds": "CIN", "guardians": "CLE", "rockies": "COL", "white-sox": "CWS", "tigers": "DET",
+    "astros": "HOU", "royals": "KC", "angels": "LAA", "dodgers": "LAD", "marlins": "MIA",
+    "brewers": "MIL", "twins": "MIN", "mets": "NYM", "yankees": "NYY", "athletics": "ATH",
+    "phillies": "PHI", "pirates": "PIT", "padres": "SD", "mariners": "SEA", "giants": "SF",
+    "cardinals": "STL", "rays": "TB", "rangers": "TEX", "blue-jays": "TOR", "nationals": "WSH",
+}
+
+_RW_TIME_RE = _re.compile(r"^\d{1,2}:\d{2}\s*[AP]M\s*ET$", _re.I)
+_RW_STATUS_RE = _re.compile(r"^(confirmed|expected|projected|unknown)\s+lineup$", _re.I)
+_RW_NOT_POSTED_RE = _re.compile(r"lineup has not been posted", _re.I)
+_RW_UNDECIDED_RE = _re.compile(r"^\W*(undecided|tbd|tba|unannounced)\W*$", _re.I)
+_RW_POSITIONS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH", "P", "OF", "IF", "UT"}
+_RW_PAGE_DATE_RE = _re.compile(r"lineups for ([A-Za-z]+ \d{1,2}, \d{4})", _re.I)
+_RW_BOX_SLUG_RE = _re.compile(r"^(?P<home>.+?)-vs-(?P<away>.+?)-\d{4}-\d{2}-\d{2}(?:-\d+)?$")
+
+
+def _rw_norm(s) -> str:
+    """Accent-stripped, punctuation-free, lowercase, suffix-free name key."""
+    s = _unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not _unicodedata.combining(c))
+    s = _re.sub(r"[^A-Za-z]+", " ", s).lower()
+    return " ".join(t for t in s.split() if t not in ("jr", "sr", "ii", "iii", "iv"))
+
+
+def _rw_squash(s) -> str:
+    return _rw_norm(s).replace(" ", "")
+
+
+def _rw_slug_to_name(slug: str) -> str:
+    parts = str(slug or "").split("-")
+    while parts and parts[-1].isdigit():
+        parts.pop()
+    return " ".join(p.capitalize() for p in parts)
+
+
+def _rw_norm_abbr(text):
+    t = str(text or "").strip().upper()
+    t = _RW_ABBR_ALIASES.get(t, t)
+    return t if t in _RW_VALID_ABBRS else None
+
+
+def _rotowire_html_to_lines(html: str) -> list:
+    """
+    Flattens the page into reading-order lines: every non-empty text
+    node becomes one line; every player link becomes ONE tagged line
+    '@@P|<full name>|<display text>|<slug>' (full name comes from the
+    link's title attribute when present, else the URL slug); every
+    box-score link becomes '@@B|<slug>'.
+    """
+    from bs4 import Comment
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "template"]):
+        tag.decompose()
+    lines = []
+
+    def walk(node):
+        for child in node.children:
+            if isinstance(child, Comment):
+                continue
+            if getattr(child, "name", None) is None:  # text node
+                txt = " ".join(str(child).split())
+                if txt:
+                    lines.append(txt)
+                continue
+            href = (child.get("href") or "") if child.name == "a" else ""
+            if child.name == "a" and "/baseball/player/" in href:
+                slug = href.rstrip("/").split("/")[-1]
+                full = (child.get("title") or "").strip() or _rw_slug_to_name(slug)
+                disp = " ".join(child.get_text(" ", strip=True).split())
+                lines.append(f"@@P|{full}|{disp}|{slug}")
+            elif child.name == "a" and "/baseball/box-score/" in href:
+                lines.append("@@B|" + href.rstrip("/").split("/")[-1])
+            else:
+                walk(child)
+
+    walk(soup)
+    return lines
+
+
+def _rw_parse_block(block: list):
+    time_str = block[0]
+    n = len(block)
+    i = 1
+    teams, box_slug = [], None
+    while i < n:
+        l = block[i]
+        if l.startswith("@@B|") and box_slug is None:
+            box_slug = l.split("|", 1)[1]
+        if l.startswith("@@P|") or _RW_UNDECIDED_RE.match(l):
+            break
+        ab = _rw_norm_abbr(l)
+        if ab and len(teams) < 2:
+            teams.append(ab)
+        i += 1
+
+    if len(teams) == 2:
+        away_abbr, home_abbr = teams
+    else:
+        m = _RW_BOX_SLUG_RE.match(box_slug or "")
+        away_abbr = _RW_NICKNAME_TO_ABBR.get(m.group("away")) if m else None
+        home_abbr = _RW_NICKNAME_TO_ABBR.get(m.group("home")) if m else None
+        if not (away_abbr and home_abbr):
+            return None
+
+    sides = []
+    for _ in range(2):
+        side = {"pitcher_name": None, "pitcher_slug": None, "pitcher_undecided": False,
+                "primary_only": False, "status": None, "lineup": [], "lineup_not_posted": False}
+        # 1) the side's starting pitcher (a player link, or 'Undecided')
+        while i < n:
+            l = block[i]
+            if l.startswith("@@P|"):
+                _, full, _disp, slug = l.split("|", 3)
+                side["pitcher_name"], side["pitcher_slug"] = full, slug
+                i += 1
+                break
+            if _RW_UNDECIDED_RE.match(l):
+                side["pitcher_undecided"] = True
+                i += 1
+                break
+            i += 1
+        # 2) pitcher footnotes (throws hand, record, PRIM tag) up to the status line
+        while i < n:
+            l = block[i]
+            if _RW_STATUS_RE.match(l):
+                side["status"] = l.strip().title()
+                i += 1
+                break
+            if l.strip().upper() == "PRIM":
+                side["primary_only"] = True
+            if l in _RW_POSITIONS and i + 1 < n and block[i + 1].startswith("@@P|"):
+                break  # status line missing - hitters start here
+            i += 1
+        # 3) the nine hitters (each preceded by a position label)
+        pending_pos = None
+        while i < n and len(side["lineup"]) < 9:
+            l = block[i]
+            if _RW_NOT_POSTED_RE.search(l):
+                side["lineup_not_posted"] = True
+                i += 1
+                break
+            if l.lower().startswith("starting pitcher intel"):
+                i += 1
+                break
+            if _RW_UNDECIDED_RE.match(l):
+                break  # the other side's pitcher - leave it for the next pass
+            if l.startswith("@@P|"):
+                if pending_pos is None:
+                    break  # a player link with no position label = the other side's pitcher
+                _, full, disp, slug = l.split("|", 3)
+                side["lineup"].append({"name": full, "display": disp, "slug": slug, "pos": pending_pos})
+                pending_pos = None
+            elif l in _RW_POSITIONS:
+                pending_pos = l
+            i += 1
+        # swallow the trailing 'Starting Pitcher Intel' label if we stopped at 9
+        if i < n and block[i].lower().startswith("starting pitcher intel"):
+            i += 1
+        sides.append(side)
+
+    return {"time": time_str, "away_abbr": away_abbr, "home_abbr": home_abbr,
+            "away": sides[0], "home": sides[1]}
+
+
+def parse_rotowire_lines(lines: list) -> list:
+    """Splits the flat line list into games (each starts at a 'H:MM PM ET' line) and parses each."""
+    starts = [i for i, l in enumerate(lines) if _RW_TIME_RE.match(l)]
+    games = []
+    for gi, s in enumerate(starts):
+        e = starts[gi + 1] if gi + 1 < len(starts) else len(lines)
+        parsed = _rw_parse_block(lines[s:e])
+        if parsed:
+            games.append(parsed)
+    # drop exact duplicates (e.g. a hidden compact-view copy of the same block),
+    # keeping whichever copy has more hitters - but keep true doubleheaders (different times)
+    best = {}
+    order = []
+    for g in games:
+        key = (g["away_abbr"], g["home_abbr"], g["time"])
+        n_h = len(g["away"]["lineup"]) + len(g["home"]["lineup"])
+        if key not in best:
+            best[key] = g
+            order.append(key)
+        elif n_h > len(best[key]["away"]["lineup"]) + len(best[key]["home"]["lineup"]):
+            best[key] = g
+    return [best[k] for k in order]
+
+
+def _rw_page_date(lines: list):
+    from datetime import datetime as _dt
+    for l in lines:
+        m = _RW_PAGE_DATE_RE.search(l)
+        if m:
+            try:
+                return _dt.strptime(m.group(1), "%B %d, %Y").date()
+            except ValueError:
+                return None
+    return None
+
+
+def fetch_rotowire_lineups(when: str = "tomorrow", expected_date=None, timeout: int = 20) -> dict:
+    """
+    when: 'today' or 'tomorrow' (RotoWire's own date toggle).
+    expected_date: a datetime.date - if the page's own printed date doesn't
+    match it, the result is refused rather than silently scanning the wrong day.
+    Never raises; returns {'ok', 'games', 'page_date', 'error', 'status_code',
+    'n_lines', 'n_player_links'}.
+    """
+    out = {"ok": False, "games": [], "page_date": None, "error": None,
+           "status_code": None, "n_lines": 0, "n_player_links": 0}
+    if requests is None or BeautifulSoup is None:
+        out["error"] = "The requests / beautifulsoup4 packages aren't installed in this environment."
+        return out
+    params = {} if (not when or when == "today") else {"date": when}
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = requests.get(ROTOWIRE_LINEUPS_URL, params=params, headers=headers, timeout=timeout)
+        out["status_code"] = resp.status_code
+        if resp.status_code != 200:
+            out["error"] = (f"RotoWire answered HTTP {resp.status_code} - it may be blocking automated "
+                            f"requests from this server.")
+            return out
+        lines = _rotowire_html_to_lines(resp.text)
+    except Exception as e:
+        out["error"] = f"Couldn't fetch/read RotoWire: {e}"
+        return out
+
+    out["n_lines"] = len(lines)
+    out["n_player_links"] = sum(1 for l in lines if l.startswith("@@P|"))
+    out["page_date"] = _rw_page_date(lines)
+    if expected_date is not None and out["page_date"] is not None and out["page_date"] != expected_date:
+        out["error"] = (f"RotoWire's page is for {out['page_date']}, not the {expected_date} slate you "
+                        f"picked - refusing to use it.")
+        return out
+    try:
+        out["games"] = parse_rotowire_lines(lines)
+    except Exception as e:
+        out["error"] = f"Fetched the page but couldn't parse it: {e}"
+        return out
+    if not out["games"]:
+        out["error"] = ("Fetched RotoWire but found no games in it (either none are listed yet, "
+                        "or the page layout changed).")
+        return out
+    out["ok"] = True
+    return out
+
+
+_RW_ROSTER_CACHE = {}
+
+
+def _get_team_roster(team_id) -> list:
+    """40-man + active roster for a team, merged; failures are never cached."""
+    if team_id in _RW_ROSTER_CACHE:
+        return _RW_ROSTER_CACHE[team_id]
+    people = {}
+    for rtype in ("40Man", "active"):
+        try:
+            resp = statsapi.get("team_roster", {"teamId": int(team_id), "rosterType": rtype})
+        except Exception:
+            continue
+        for r in (resp or {}).get("roster", []):
+            p = r.get("person", {}) or {}
+            pid, nm = p.get("id"), p.get("fullName")
+            if pid and nm:
+                d = people.setdefault(pid, {"player_id": pid, "name": nm, "active": False})
+                if rtype == "active":
+                    d["active"] = True
+    result = list(people.values())
+    if result:
+        _RW_ROSTER_CACHE[team_id] = result
+    return result
+
+
+def _rw_pick_unique(cands):
+    if len(cands) == 1:
+        return cands[0]
+    active = [c for c in cands if c.get("active")]
+    return active[0] if len(active) == 1 else None
+
+
+def resolve_rotowire_player(name, team_id=None, display=None, slug=None):
+    """
+    RotoWire name -> real MLB player. Matches against the player's own
+    team roster first (exact name, then squashed name, then first-initial +
+    last name); only if that fails does it fall back to a league-wide name
+    lookup, which is flagged 'lookup_unverified' since a common name can
+    belong to more than one player. Returns {'player_id','name','match'} or None.
+    """
+    names = [n for n in (name, _rw_slug_to_name(slug) if slug else None) if n]
+    roster = _get_team_roster(team_id) if team_id else []
+    if roster:
+        for n in names:
+            hit = _rw_pick_unique([p for p in roster if _rw_norm(p["name"]) == _rw_norm(n)])
+            if hit:
+                return {"player_id": hit["player_id"], "name": hit["name"], "match": "roster_exact"}
+        for n in names:
+            hit = _rw_pick_unique([p for p in roster if _rw_squash(p["name"]) == _rw_squash(n)])
+            if hit:
+                return {"player_id": hit["player_id"], "name": hit["name"], "match": "roster_exact"}
+        for n in [display] + names:
+            toks = _rw_norm(n).split()
+            if len(toks) >= 2 and len(toks[0]) <= 2:
+                ini, last = toks[0][0], " ".join(toks[1:])
+                hit = _rw_pick_unique([p for p in roster
+                                       if _rw_norm(p["name"]).startswith(ini)
+                                       and _rw_norm(p["name"]).endswith(" " + last)])
+                if hit:
+                    return {"player_id": hit["player_id"], "name": hit["name"], "match": "roster_initial"}
+    for n in names:
+        try:
+            found = find_player_by_name(n)
+        except Exception:
+            found = None
+        if found and found.get("player_id"):
+            return {"player_id": found["player_id"], "name": found["name"], "match": "lookup_unverified"}
+    return None
+
+
+def find_rotowire_game(games: list, away_abbr: str, home_abbr: str, game_num=None):
+    matches = [g for g in games if g["away_abbr"] == away_abbr and g["home_abbr"] == home_abbr]
+    if not matches:
+        return None
+    try:
+        idx = int(game_num) - 1
+    except (TypeError, ValueError):
+        idx = 0
+    return matches[idx] if 0 <= idx < len(matches) else matches[0]
+
+
+def build_preview_from_rotowire(rw_game: dict, away_team_id, home_team_id, game_pk=None):
+    """
+    Turns one parsed RotoWire game into (lineup_data, pitchers) in exactly
+    the shape pull_confirmed_lineup / get_probable_pitcher produce, so the
+    existing simulation runs on it unchanged. lineup_status is
+    'preview_expected' so the app can label results as a preview.
+    Unmatched hitters are kept as visible placeholders (player_id None) so
+    batting-order slots stay aligned and the user can replace them.
+    """
+    meta = {"source": "RotoWire expected lineup", "away_abbr": rw_game["away_abbr"],
+            "home_abbr": rw_game["home_abbr"], "time": rw_game.get("time"), "unresolved": [],
+            "lookup_unverified": []}
+    lineup = {"lineup_status": "preview_expected", "away": [], "home": [], "preview_meta": meta}
+    pitchers = {}
+
+    for side, tid in (("away", away_team_id), ("home", home_team_id)):
+        sd = rw_game[side]
+        meta[f"{side}_status"] = sd.get("status") or ("no lineup posted" if sd.get("lineup_not_posted") else "unknown")
+        for slot, h in enumerate(sd["lineup"], start=1):
+            res = resolve_rotowire_player(h["name"], tid, h.get("display"), h.get("slug"))
+            pa = EXPECTED_PA_BY_ORDER_SLOT.get(slot, 4.0)
+            if res:
+                lineup[side].append({"player_id": res["player_id"], "name": res["name"], "order_slot": slot,
+                                     "expected_pa": pa, "match": res["match"], "pos": h.get("pos")})
+                if res["match"] == "lookup_unverified":
+                    meta["lookup_unverified"].append(f"{side} #{slot} {res['name']}")
+            else:
+                lineup[side].append({"player_id": None, "name": f"{h['name']} (unmatched)", "order_slot": slot,
+                                     "expected_pa": pa, "match": "unresolved", "pos": h.get("pos")})
+                meta["unresolved"].append(f"{side} #{slot} {h['name']}")
+
+        mlb_p = None
+        if game_pk:
+            try:
+                mlb_p = get_probable_pitcher(game_pk, side)
+            except Exception:
+                mlb_p = None
+        chosen, flag = None, ""
+        if sd["pitcher_undecided"] or not sd["pitcher_name"]:
+            chosen = mlb_p
+            flag = ("RotoWire shows no starter" +
+                    (f"; MLB lists {mlb_p['name']} (using him)" if mlb_p else "; MLB lists none either - can't scan this side's opponent yet"))
+        else:
+            res = resolve_rotowire_player(sd["pitcher_name"], tid, None, sd.get("pitcher_slug"))
+            if res:
+                chosen = {"player_id": res["player_id"], "name": res["name"], "source": "rotowire_expected"}
+                if mlb_p and mlb_p.get("player_id") == res["player_id"]:
+                    flag = "MLB's probable pitcher agrees"
+                elif mlb_p:
+                    flag = f"CONFLICT - MLB lists {mlb_p['name']} instead; verify before trusting"
+                else:
+                    flag = "RotoWire only - MLB hasn't listed a probable pitcher"
+            elif mlb_p:
+                chosen = mlb_p
+                flag = f"Couldn't match RotoWire's '{sd['pitcher_name']}' to a player; using MLB's {mlb_p['name']}"
+            else:
+                flag = f"Couldn't match RotoWire's '{sd['pitcher_name']}' to a real player"
+            if sd.get("primary_only"):
+                flag += " | RotoWire tags him as pitching AFTER an opener - likely a bullpen game"
+        pitchers[side] = chosen
+        meta[f"{side}_pitcher_flag"] = flag
+        meta[f"{side}_pitcher_rotowire"] = sd.get("pitcher_name") or "Undecided"
+
+    return lineup, pitchers
+
+
 def find_player_by_name(name: str) -> Optional[dict]:
     """
     Real, direct player search by name - per direct request, a manual
