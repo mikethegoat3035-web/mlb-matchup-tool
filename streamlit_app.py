@@ -302,29 +302,68 @@ if st.button("Scan the whole real slate now", key="whole_slate_scan_btn"):
                 for s in whole_slate_result["games_skipped"]:
                     st.write(s)
 
+ws_min_reliable_field = st.slider(
+    "Minimum field size for the z-score cutoff to apply", 10, 100, 40, step=5,
+    key="ws_min_reliable_field",
+    help="On a small slate (playoffs, a few games), comparing a player only to the handful of "
+         "others scanned that same run makes the z-score noisy - it can miss a real standout "
+         "just because too few players are in the comparison group. Below this many real rows "
+         "for a given prop, the z-score filter is skipped for that prop and every real row is "
+         "shown instead, ranked, so you can judge it yourself rather than have an unreliable "
+         "number silently hide it.")
+
+
+def _render_whole_slate_table(df: pd.DataFrame, min_z: float, max_cv: float, label: str, min_field: int):
+    """
+    Shared real logic for both the pitcher and hitter whole-slate tables.
+    REAL FIX (found via direct request after a playoff slate returned zero
+    survivors) - the z-score here is only ever relative to the OTHER real
+    rows scanned in this same run (grouped by prop), never against a fixed
+    outside baseline. That comparison group shrinks hard on a small slate
+    (a handful of games instead of a full ~15-game day), so the mean/std
+    behind the z-score gets genuinely unstable - it can fail to flag a real
+    standout purely because too few players are in the field, not because
+    the matchup itself is weak. Below min_field real rows for a given prop,
+    this now skips the z/cv filter for that prop entirely and shows every
+    real row instead, ranked by z-score, with a visible flag - so a small
+    slate is judged by eye against real numbers instead of being silently
+    emptied by a filter that was never reliable at that size to begin with.
+    """
+    df = df.copy()
+    field_mean = df.groupby("prop")["real_avg"].transform("mean")
+    field_std = df.groupby("prop")["real_avg"].transform("std").fillna(0.01)
+    df["zscore"] = ((df["real_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
+    df["field_n"] = df.groupby("prop")["real_avg"].transform("count")
+
+    small_field_props = sorted(df.loc[df["field_n"] < min_field, "prop"].unique().tolist())
+    reliable = df[df["field_n"] >= min_field]
+    unreliable = df[df["field_n"] < min_field]
+
+    survivors = reliable[(reliable["zscore"] >= min_z) & (reliable["cv"] <= max_cv)]
+    survivors = pd.concat([survivors, unreliable], ignore_index=True) if not unreliable.empty else survivors
+
+    st.subheader(f"{label} - {len(survivors)} of {len(df)} real rows shown "
+                 f"(z>={min_z}, cv<={max_cv} where the field is large enough; "
+                 f"every row shown, unfiltered, where it isn't)")
+    if small_field_props:
+        st.warning(
+            f"Real field too small for a reliable z-score cutoff on: {', '.join(small_field_props)} "
+            f"(fewer than {min_field} real rows scanned tonight for that prop). Every real row for "
+            f"those props is included above regardless of z-score - judge them by the real_avg "
+            f"column yourself rather than trust the cutoff here."
+        )
+    st.dataframe(survivors.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
+    with st.expander(f"See every real {label.lower()} row, including ones the filter would drop"):
+        st.dataframe(df.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
+
+
 if st.session_state.get("whole_slate_pitchers_df") is not None and not st.session_state.whole_slate_pitchers_df.empty:
-    pdf = st.session_state.whole_slate_pitchers_df.copy()
-    field_mean = pdf.groupby("prop")["real_avg"].transform("mean")
-    field_std = pdf.groupby("prop")["real_avg"].transform("std").fillna(0.01)
-    pdf["zscore"] = ((pdf["real_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
-    pitcher_survivors = pdf[(pdf["zscore"] >= ws_pitcher_min_z) & (pdf["cv"] <= ws_pitcher_max_cv)]
-    st.subheader(f"Pitchers - {len(pitcher_survivors)} of {len(pdf)} real rows clear the current thresholds "
-                 f"(z>={ws_pitcher_min_z}, cv<={ws_pitcher_max_cv})")
-    st.dataframe(pitcher_survivors.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
-    with st.expander("See all real pitcher rows, including ones that didn't clear"):
-        st.dataframe(pdf.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
+    _render_whole_slate_table(st.session_state.whole_slate_pitchers_df, ws_pitcher_min_z, ws_pitcher_max_cv,
+                              "Pitchers", ws_min_reliable_field)
 
 if st.session_state.get("whole_slate_hitters_df") is not None and not st.session_state.whole_slate_hitters_df.empty:
-    hdf = st.session_state.whole_slate_hitters_df.copy()
-    field_mean = hdf.groupby("prop")["real_avg"].transform("mean")
-    field_std = hdf.groupby("prop")["real_avg"].transform("std").fillna(0.01)
-    hdf["zscore"] = ((hdf["real_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
-    hitter_survivors = hdf[(hdf["zscore"] >= ws_hitter_min_z) & (hdf["cv"] <= ws_hitter_max_cv)]
-    st.subheader(f"Hitters - {len(hitter_survivors)} of {len(hdf)} real rows clear the current thresholds "
-                 f"(z>={ws_hitter_min_z}, cv<={ws_hitter_max_cv})")
-    st.dataframe(hitter_survivors.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
-    with st.expander("See all real hitter rows, including ones that didn't clear"):
-        st.dataframe(hdf.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
+    _render_whole_slate_table(st.session_state.whole_slate_hitters_df, ws_hitter_min_z, ws_hitter_max_cv,
+                              "Hitters", ws_min_reliable_field)
 
 
 st.header("🎯 Original Method Matcher")
