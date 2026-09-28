@@ -99,6 +99,7 @@ from prop_model_combined import (
     calc_lineup_weighted_pitcher_read, calc_prop_lineup_vulnerability,
     get_batter_hand, EXPECTED_PA_BY_ORDER_SLOT,
     calc_pitcher_fantasy_lineup_read, calc_doubly_confirmed_hitter_signal,
+    fetch_rotowire_lineups, find_rotowire_game, build_preview_from_rotowire, MLB_TEAM_ID_TO_ABBR,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -133,6 +134,86 @@ st.caption("Pitch-type-level matchup analysis with real probability estimates �
            "not a guess dressed up as one.")
 
 SEASON_START = "2026-03-27"
+
+
+# ---------------------------------------------------------------------------
+# Preview mode - scan a slate BEFORE official lineups post
+# ---------------------------------------------------------------------------
+def _slate_day_picker(key_prefix):
+    """Today / Tomorrow selector. Returns (label, datetime)."""
+    choice = st.radio("Which day's games?", ["Today", "Tomorrow"], horizontal=True,
+                      key=f"{key_prefix}_slate_day",
+                      help="Tomorrow lets you preview a slate early using RotoWire's expected lineups.")
+    base = get_mlb_today()
+    return choice, (base if choice == "Today" else base + timedelta(days=1))
+
+
+def _render_preview_loader(game_row, game_pk, cache_key, slate_choice, slate_date, key_prefix):
+    """
+    Shown when the official lineup isn't posted yet. Pulls RotoWire's expected
+    lineups + probable starters, matches every name to a real player on that
+    team's roster, and swaps the result into the same cache the simulation
+    already reads - so nothing downstream changes.
+    """
+    with st.expander("🔮 Preview with RotoWire's expected lineups + probable starters", expanded=True):
+        st.caption(
+            "Use this to scan a game BEFORE MLB posts the official lineup. Pulls RotoWire's expected "
+            "batting orders and probable starters and matches each name to a real player on that team's "
+            "roster. Results are a PREVIEW - re-run once the official lineup posts."
+        )
+        if st.button("Load expected lineups from RotoWire", key=f"{key_prefix}_rw_load_{game_pk}"):
+            try:
+                away_id, home_id = int(game_row.get("away_id")), int(game_row.get("home_id"))
+            except (TypeError, ValueError):
+                st.error("This game's team IDs weren't in the schedule data, so it can't be matched to RotoWire's page.")
+                return
+            away_abbr, home_abbr = MLB_TEAM_ID_TO_ABBR.get(away_id), MLB_TEAM_ID_TO_ABBR.get(home_id)
+            if not (away_abbr and home_abbr):
+                st.error(f"Unrecognized team IDs ({away_id}, {home_id}) - can't match to RotoWire.")
+                return
+            with st.spinner("Fetching RotoWire and matching players to real MLB rosters..."):
+                rw = fetch_rotowire_lineups(when="tomorrow" if slate_choice == "Tomorrow" else "today",
+                                            expected_date=slate_date.date())
+                if not rw["ok"]:
+                    st.error(rw["error"])
+                    st.caption(f"Diagnostics: HTTP status {rw['status_code']}, {rw['n_lines']} text lines read, "
+                               f"{rw['n_player_links']} player links found. If this keeps failing, use the manual "
+                               f"entry box below instead.")
+                    return
+                gnum = game_row.get("game_num")
+                rw_game = find_rotowire_game(rw["games"], away_abbr, home_abbr,
+                                             gnum if (gnum is not None and pd.notna(gnum)) else None)
+                if rw_game is None:
+                    listed = ", ".join(f"{g['away_abbr']} @ {g['home_abbr']}" for g in rw["games"])
+                    st.error(f"RotoWire's page doesn't list {away_abbr} @ {home_abbr}. It lists: {listed}")
+                    return
+                lineup, pitchers = build_preview_from_rotowire(rw_game, away_id, home_id, game_pk)
+            st.session_state[cache_key] = {"lineup": lineup, "pitchers": pitchers}
+            st.rerun()
+
+
+def _render_preview_banner(lineup_data, cache_key, key_prefix):
+    """Loud, persistent label + per-starter reliability flags whenever preview data is in use."""
+    if not lineup_data or lineup_data.get("lineup_status") != "preview_expected":
+        return
+    meta = lineup_data.get("preview_meta", {})
+    st.warning("🔮 **PREVIEW MODE** - these are RotoWire's *expected* lineups and probable starters, not "
+               "official ones. Treat results as a preview and re-run once MLB posts the confirmed lineup.")
+    for side in ("away", "home"):
+        st.caption(f"**{meta.get(side + '_abbr', side).upper()} starter** (RotoWire: "
+                   f"{meta.get(side + '_pitcher_rotowire', '?')}): {meta.get(side + '_pitcher_flag', '')}  "
+                   f"|  lineup: {meta.get(side + '_status', '?')}")
+    st.caption("Each team's hitters are simulated against the OTHER team's starter - only trust a side whose "
+               "opposing starter is confirmed.")
+    if meta.get("unresolved"):
+        st.error("Couldn't match these to real players (skipped unless you replace them below): "
+                 + ", ".join(meta["unresolved"]))
+    if meta.get("lookup_unverified"):
+        st.caption("Matched by a league-wide name search rather than the team roster - double-check: "
+                   + ", ".join(meta["lookup_unverified"]))
+    if st.button("Discard preview and re-check the official lineup", key=f"{key_prefix}_discard_{cache_key}"):
+        st.session_state.pop(cache_key, None)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -276,17 +357,22 @@ with omm_col3:
     omm_min_usage = st.number_input("Min real pitch usage% to count as \"meaningfully used\"",
                                       min_value=0.0, max_value=40.0, value=10.0, step=1.0, key="omm_min_usage")
 
-if st.button("Load today's real games", key="omm_load_games_btn"):
-    with st.spinner("Pulling today's real schedule..."):
+omm_pick_choice, omm_pick_date = _slate_day_picker("omm")
+if st.button("Load real games", key="omm_load_games_btn"):
+    with st.spinner("Pulling the real schedule..."):
         try:
-            st.session_state.omm_games_df = pull_todays_games()
+            st.session_state.omm_games_df = pull_todays_games(date=omm_pick_date.strftime("%m/%d/%Y"))
+            st.session_state.omm_loaded_choice = omm_pick_choice
+            st.session_state.omm_loaded_date = omm_pick_date
         except Exception as e:
-            st.error(f"Couldn't pull today's real schedule: {e}")
+            st.error(f"Couldn't pull the real schedule: {e}")
             st.session_state.omm_games_df = pd.DataFrame()
 
+omm_loaded_choice = st.session_state.get("omm_loaded_choice", "Today")
+omm_loaded_date = st.session_state.get("omm_loaded_date", get_mlb_today())
 omm_games_df = st.session_state.get("omm_games_df")
 if omm_games_df is None or omm_games_df.empty:
-    st.info("Click \"Load today's real games\" above to pick a real matchup.")
+    st.info("Pick a day and click \"Load real games\" above to pick a real matchup.")
 else:
     # REAL FIX (confirmed bug, found via direct user report - "shows a
     # number game, not team names") - pull_todays_games() returns raw
@@ -348,7 +434,9 @@ else:
         omm_label_col = omm_games_df.columns[0]
     omm_game_label = st.selectbox("Pick a real game", omm_games_df[omm_label_col].tolist(), key="omm_game_select")
     omm_row = omm_games_df[omm_games_df[omm_label_col] == omm_game_label].iloc[0]
-    omm_game_pk = omm_row.get("game_pk")
+    # REAL BUG FIX - MLB-StatsAPI schedule rows carry "game_id", not "game_pk", so this used to
+    # come back None and pull the lineup for the wrong game (or none at all).
+    omm_game_pk = omm_row.get("game_id") if "game_id" in omm_row.index else omm_row.get("game_pk")
 
     # REAL, NEW (per direct request, fixing a real bug) - same
     # restructure as the Full Matchup Simulation section: lineup and
@@ -375,12 +463,15 @@ else:
     omm_lineup_data = omm_data["lineup"]
     omm_pitchers = omm_data["pitchers"]
 
-    omm_ready = omm_lineup_data is not None and omm_lineup_data.get("lineup_status") == "confirmed"
+    omm_ready = omm_lineup_data is not None and omm_lineup_data.get("lineup_status") in (
+        "confirmed", "preview_expected")
     if not omm_ready:
         st.warning("This real game doesn't have a fully confirmed lineup yet (both batting "
-                   "orders + both starting pitchers) - try again closer to first pitch.")
+                   "orders + both starting pitchers) - try again closer to first pitch, or preview it below.")
+        _render_preview_loader(omm_row, omm_game_pk, omm_cache_key, omm_loaded_choice, omm_loaded_date, "omm")
     else:
         with st.expander("✅ Verify (and adjust, if needed) the real pitchers and lineups being used", expanded=True):
+            _render_preview_banner(omm_lineup_data, omm_cache_key, "omm")
             for pside in ("away", "home"):
                 p = omm_pitchers.get(pside)
                 if p is None:
@@ -440,7 +531,7 @@ else:
             omm_results = {}
 
             for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
-                real_lineup = omm_lineup_data.get(hitting_side, [])
+                real_lineup = [h for h in omm_lineup_data.get(hitting_side, []) if h.get("player_id") is not None]
                 # REAL FIX (same restructure) - uses the already-
                 # resolved (and potentially overridden) pitcher instead
                 # of re-fetching fresh here, which would have silently
@@ -602,14 +693,15 @@ st.caption(
     "genuinely re-simulating outcomes rather than computing one probability."
 )
 
+sim_slate_choice, sim_slate_date = _slate_day_picker("sim")
 sim_games_df = None
 try:
-    sim_games_df = pull_todays_games()
+    sim_games_df = pull_todays_games(date=sim_slate_date.strftime("%m/%d/%Y"))
 except Exception as e:
-    st.error(f"Couldn't pull today's real games: {e}")
+    st.error(f"Couldn't pull the real games: {e}")
 
 if sim_games_df is None or sim_games_df.empty:
-    st.info("No games found for today.")
+    st.info(f"No games found for {sim_slate_choice.lower()}.")
 else:
     # REAL BUG FIX - a doubleheader produces two rows with the IDENTICAL
     # "away @ home" label, so building a dict keyed by that string alone
@@ -683,7 +775,7 @@ else:
     sim_pitchers = sim_data["pitchers"]
 
     sim_ready = lineup_data is not None and lineup_data.get("lineup_status") in (
-        "confirmed", "lineups_posted_pitcher_tbd")
+        "confirmed", "lineups_posted_pitcher_tbd", "preview_expected")
 
     # REAL FIX (found via direct user report - the override UI below
     # was completely unreachable when lineup_status said not_yet_posted
@@ -693,6 +785,9 @@ else:
     # automated detection found.
     if not sim_ready:
         st.warning("The real lineup for this game hasn't posted yet according to this tool's automated check.")
+        if not selected_row.empty:
+            _render_preview_loader(selected_row.iloc[0], sim_game_pk, sim_cache_key,
+                                   sim_slate_choice, sim_slate_date, "sim")
         with st.expander("Have the real lineup from elsewhere (RotoWire, etc)? Enter it manually", expanded=False):
             st.caption("Enter each real name in real batting order, one per line, 9 total, for each real team.")
             manual_away_text = st.text_area("Away team real lineup (1 name per line, real batting order)",
@@ -747,6 +842,7 @@ else:
         pass  # already warned above, manual entry path shown
     elif sim_ready:
         with st.expander("✅ Verify (and adjust, if needed) the real pitchers and lineups being used", expanded=True):
+            _render_preview_banner(lineup_data, sim_cache_key, "sim")
             for pside in ("away", "home"):
                 p = sim_pitchers.get(pside)
                 if p is None:
@@ -808,7 +904,11 @@ else:
     st.info(f"⚾ Tonight's park: {sim_park_factor.get('note', 'no specific park data - using neutral')}")
 
     sim_wind_multiplier = 1.0
-    sim_weather = pull_game_weather(sim_home_team)
+    if sim_slate_choice == "Tomorrow":
+        sim_weather = {"note": "Wind adjustment skipped for a next-day preview - the weather feed only gives the "
+                              "nearest upcoming hour, not tomorrow's game time."}
+    else:
+        sim_weather = pull_game_weather(sim_home_team)
     if "note" in sim_weather and sim_weather.get("wind_mph") is None:
         st.caption(f"Weather: {sim_weather['note']}")
     elif sim_weather.get("wind_mph") is not None:
@@ -827,6 +927,8 @@ else:
 
     if sim_ready and st.button("Run full matchup simulation", key="sim_run_button"):
         if True:
+            if lineup_data.get("lineup_status") == "preview_expected":
+                st.info("🔮 Running in PREVIEW mode on RotoWire's expected lineups - re-run once official lineups post.")
             today_str = get_mlb_today().strftime("%Y-%m-%d")
             combined_hitters_series = {}
             combined_pitchers_series = {}
@@ -898,6 +1000,10 @@ else:
                 lineup_crosswalks = {}
                 progress = st.progress(0.0, text=f"Building real crosswalks for the {hitting_side} lineup...")
                 for i, hitter in enumerate(real_lineup):
+                    if hitter.get("player_id") is None:
+                        st.caption(f"Skipped {hitter.get('name', '?')} - no real player matched; "
+                                   f"replace him above to include him.")
+                        continue
                     try:
                         # Hitters correctly stay on the full season here -
                         # matches the same default convention (hitter_
