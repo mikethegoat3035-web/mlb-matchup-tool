@@ -96,10 +96,11 @@ from prop_model_combined import (
     LEAGUE_AVG_HITTER_FANTASY_UD_PER_GAME, LEAGUE_STD_HITTER_FANTASY_UD_PER_GAME,
     LEAGUE_AVG_HITTER_FANTASY_PP_PER_GAME, LEAGUE_STD_HITTER_FANTASY_PP_PER_GAME,
     build_pitcher_tendency_profile, calc_original_method_match, attack_zone_breakdown,
-    calc_lineup_weighted_pitcher_read, calc_prop_lineup_vulnerability,
+    calc_lineup_weighted_pitcher_read, calc_prop_lineup_vulnerability, hitter_prop_vulnerability_score,
     get_batter_hand, EXPECTED_PA_BY_ORDER_SLOT,
     calc_pitcher_fantasy_lineup_read, calc_doubly_confirmed_hitter_signal,
     fetch_rotowire_lineups, find_rotowire_game, build_preview_from_rotowire, MLB_TEAM_ID_TO_ABBR,
+    HITTER_PROP_TO_VULN_TYPE, PITCHER_PROP_TO_SIGNATURE_TYPE,
 )
 
 st.set_page_config(page_title="MLB Matchup Tool", layout="wide", page_icon="⚾")
@@ -216,6 +217,33 @@ def _render_preview_banner(lineup_data, cache_key, key_prefix):
         st.rerun()
 
 
+# REAL FIX (found via direct testing - accidentally removed when the
+# Whole-Slate Stage 1 section was deleted per direct request, since
+# these were defined as shared setup inside that section's own block,
+# but Full Matchup Simulation also genuinely needs them). Restored here,
+# outside either section, so both real graded tables (if more are ever
+# added) can reach them.
+PITCHER_METRIC_TIERS = [(0.50, "Elite"), (0.30, "Strong"), (0.15, "Average")]  # else Poor
+HITTER_METRIC_TIERS = [(1.5, "Elite"), (0.5, "Strong"), (-0.5, "Average")]     # else Poor
+TIER_ORDER = {"Poor": 0, "Average": 1, "Strong": 2, "Elite": 3}
+
+
+def _metric_tier(score, is_pitcher):
+    # REAL BUG FIX (found via direct testing) - a row with no real metric
+    # mechanism has metric_score as NaN (pandas' missing-value marker) once
+    # it's sitting in a DataFrame alongside graded rows, not Python's None -
+    # `pd.isna(nan)` is True but `nan is None` is False, so the original
+    # `is None` check silently fell through every real cutoff below (since
+    # `nan >= x` is always False) and mis-labeled every genuinely ungraded
+    # row "Poor" - a real, misleading judgment where none should exist.
+    if pd.isna(score):
+        return None
+    for cutoff, label in (PITCHER_METRIC_TIERS if is_pitcher else HITTER_METRIC_TIERS):
+        if score >= cutoff:
+            return label
+    return "Poor"
+
+
 # ---------------------------------------------------------------------------
 # Unconfirmed lineups check — see which games are still missing before scanning
 # ---------------------------------------------------------------------------
@@ -250,516 +278,6 @@ if "pending_games" in st.session_state:
         st.dataframe(pending[display_cols], width='stretch', hide_index=True)
         st.caption("Rescan closer to first pitch for these specific games once their "
                    "lineups post — usually 1-3 hours before game time.")
-
-st.divider()
-st.header("🔍 Whole-Slate Stage 1 Scan - Pitchers & Hitters")
-st.caption(
-    "Real, direct whole-slate scan - automatically runs the full real matchup "
-    "simulation across EVERY confirmed game today (both sides), instead of "
-    "running one game at a time. Replaces the old One-Sided Pitcher Check and "
-    "League-Wide Pitcher Quality Scan with a single, direct test of whether the "
-    "real pitcher z-score/CV thresholds (adjusted this session) actually let "
-    "genuine pitcher survivors through - and does the same for hitters, in case "
-    "there's something there worth finding too."
-)
-st.caption(
-    "⚠️ Honest, real caveat: this specific whole-slate loop has not been run "
-    "live end-to-end (no network access in this build environment to test "
-    "against a real, current slate). Watch the first real run closely - if "
-    "something breaks or looks wrong, that's genuinely useful information, not "
-    "a sign to distrust everything else in this file."
-)
-
-whole_slate_n_sims = st.number_input("Simulations per matchup", min_value=100, max_value=1000,
-                                       value=500, step=100, key="whole_slate_n_sims")
-
-# REAL FIX (per direct request, a genuine change to how a matchup is judged,
-# not just a UI tweak) - grading now comes from the REAL, underlying pitch-
-# by-pitch metrics that already drive the simulation (his real signature
-# pitch for this exact prop, checked against whether tonight's specific
-# real opposing hitters are individually vulnerable to it - see
-# calc_prop_lineup_vulnerability / hitter_prop_vulnerability_score, both
-# already proven, existing functions used elsewhere in this file, now
-# wired into this whole-slate loop too), NOT by checking the simulation's
-# final output number against any line - a fixed one I'd invented, or a
-# live sportsbook one. A real playoff line can run high or low depending
-# on who's pitching; the real metrics behind the matchup don't move just
-# because a line does, so that's what decides Elite/Poor here, never a line.
-#
-# real_avg (from scan_whole_slate_stage1) is still shown alongside this as
-# real, informational context - it is NOT what decides the grade anymore.
-#
-# metric_score's scale differs by side, since the two real, underlying
-# functions measure genuinely different things:
-#   - Pitcher props (strikeouts/outs/hits_allowed/earned_runs/walks_allowed):
-#     calc_prop_lineup_vulnerability's real, PA-weighted share (0-1) of
-#     tonight's actual lineup that is individually vulnerable to his real
-#     signature pitch for that exact prop.
-#   - Hitter props (hits/singles/total_bases/home_runs/strikeouts/walks/
-#     hits_runs_rbi/fantasy): hitter_prop_vulnerability_score's real,
-#     roughly -3..+3 read of how heavily the pitcher's actual usage leans
-#     into this hitter's real weak spot for that exact prop.
-# Some props (doubles, triples, runs, fantasy_prizepicks on the hitter
-# side; quality_start, win, batters_faced, pitches_thrown, strikes_thrown,
-# pitcher_fantasy/pitcher_fantasy_prizepicks on the pitcher side) have no
-# real, existing signature-metric mechanism built for them yet - those
-# rows show real_avg/cv only, honestly ungraded, rather than force a
-# guess.
-PITCHER_METRIC_TIERS = [(0.50, "Elite"), (0.30, "Strong"), (0.15, "Average")]  # else Poor
-HITTER_METRIC_TIERS = [(1.5, "Elite"), (0.5, "Strong"), (-0.5, "Average")]     # else Poor
-TIER_ORDER = {"Poor": 0, "Average": 1, "Strong": 2, "Elite": 3}
-
-
-def _metric_tier(score, is_pitcher):
-    # REAL BUG FIX (found via direct testing) - a row with no real metric
-    # mechanism has metric_score as NaN (pandas' missing-value marker) once
-    # it's sitting in a DataFrame alongside graded rows, not Python's None -
-    # `pd.isna(nan)` is True but `nan is None` is False, so the original
-    # `is None` check silently fell through every real cutoff below (since
-    # `nan >= x` is always False) and mis-labeled every genuinely ungraded
-    # row "Poor" - a real, misleading judgment where none should exist.
-    if pd.isna(score):
-        return None
-    for cutoff, label in (PITCHER_METRIC_TIERS if is_pitcher else HITTER_METRIC_TIERS):
-        if score >= cutoff:
-            return label
-    return "Poor"
-
-
-WHOLE_SLATE_HITTER_PROPS_WANTED = {"singles", "home_runs", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"}
-WHOLE_SLATE_PITCHER_PROPS_WANTED = {"strikeouts", "outs", "hits_allowed", "walks_allowed",
-                                     "earned_runs", "pitcher_fantasy", "pitcher_fantasy_prizepicks"}
-
-
-def _render_whole_slate_table(df: pd.DataFrame, max_cv: float, min_tier: str, label: str, is_pitcher: bool):
-    """Grades every real row by its real, underlying-metric matchup score, then filters by that tier + CV."""
-    df = df.copy()
-    # REAL FIX (per direct request) - narrowed to exactly the real props
-    # asked for, dropping everything else from this specific display:
-    # hitter singles/home_runs/hits_runs_rbi/fantasy(Underdog)/
-    # fantasy_prizepicks(PrizePicks), and all 7 real pitcher props
-    # (strikeouts/outs/hits_allowed/walks_allowed/earned_runs/
-    # pitcher_fantasy/pitcher_fantasy_prizepicks). This is a display
-    # filter only - scan_whole_slate_stage1 itself still computes every
-    # real prop and every real metric_score exactly as before.
-    wanted_props = (WHOLE_SLATE_PITCHER_PROPS_WANTED if is_pitcher else WHOLE_SLATE_HITTER_PROPS_WANTED)
-    df = df[df["prop"].isin(wanted_props)]
-    if df.empty:
-        st.subheader(f"{label} - 0 real rows")
-        return
-    if "metric_score" not in df.columns:
-        df["metric_score"] = None
-    df["tier"] = df["metric_score"].apply(lambda s: _metric_tier(s, is_pitcher))
-    min_rank = TIER_ORDER[min_tier]
-    graded_rows = df[df["tier"].notna()]
-    survivors = graded_rows[(graded_rows["tier"].map(TIER_ORDER) >= min_rank) & (graded_rows["cv"] <= max_cv)]
-    show_cols = [c for c in df.columns if c != "series"]
-    st.subheader(f"{label} - {len(survivors)} of {len(df)} real rows are {min_tier}+ on their real, "
-                 f"underlying-metric matchup score (not a line)")
-    ungraded = sorted(df.loc[df["tier"].isna(), "prop"].unique().tolist())
-    if ungraded:
-        st.caption(f"No real, underlying-metric mechanism built yet for: {', '.join(ungraded)} - those "
-                   f"rows show real_avg only, honestly ungraded, rather than a forced guess.")
-    st.dataframe(survivors[show_cols].sort_values("metric_score", ascending=False), width='stretch', hide_index=True)
-    with st.expander(f"See every real {label.lower()} row and its real tier, including ones below {min_tier}"):
-        st.dataframe(df[show_cols].sort_values("metric_score", ascending=False), width='stretch', hide_index=True)
-
-
-ws_col1, ws_col2, ws_col3 = st.columns(3)
-with ws_col1:
-    ws_min_tier = st.select_slider("Minimum real matchup tier to show", options=["Poor", "Average", "Strong", "Elite"],
-                                   value="Strong", key="ws_min_tier",
-                                   help="Graded from the real, underlying pitch-by-pitch metrics behind the "
-                                        "matchup (his real signature pitch for this prop vs tonight's real, "
-                                        "specific opposing hitters) - never from a betting line, fixed or live.")
-with ws_col2:
-    ws_pitcher_max_cv = st.slider("Pitcher max CV", 0.1, 1.5, 1.05, step=0.05, key="ws_pitcher_max_cv",
-                                  help="How much the simulation's OWN outcomes varied for this real matchup.")
-with ws_col3:
-    ws_hitter_max_cv = st.slider("Hitter max CV", 0.1, 2.0, 1.2, step=0.05, key="ws_hitter_max_cv")
-
-if st.button("Scan the whole real slate now", key="whole_slate_scan_btn"):
-    with st.spinner("Running the real, full matchup simulation across every confirmed game today - "
-                     "this can take several minutes on a full slate..."):
-        try:
-            whole_slate_result = scan_whole_slate_stage1(SEASON_START, n_simulations=int(whole_slate_n_sims))
-        except Exception as e:
-            st.error(f"Whole-slate scan failed: {e}")
-            whole_slate_result = {"usable": False, "reason": str(e)}
-
-    if not whole_slate_result.get("usable"):
-        st.warning(f"Not ready yet: {whole_slate_result.get('reason')}")
-    else:
-        st.session_state.whole_slate_hitters_df = whole_slate_result["hitters_df"]
-        st.session_state.whole_slate_pitchers_df = whole_slate_result["pitchers_df"]
-        st.success(f"Scanned {whole_slate_result['games_scanned']} real confirmed game(s).")
-        if whole_slate_result["games_skipped"]:
-            with st.expander(f"{len(whole_slate_result['games_skipped'])} game(s) skipped"):
-                for s in whole_slate_result["games_skipped"]:
-                    st.write(s)
-
-if st.session_state.get("whole_slate_pitchers_df") is not None and not st.session_state.whole_slate_pitchers_df.empty:
-    _render_whole_slate_table(st.session_state.whole_slate_pitchers_df, ws_pitcher_max_cv, ws_min_tier, "Pitchers", is_pitcher=True)
-
-if st.session_state.get("whole_slate_hitters_df") is not None and not st.session_state.whole_slate_hitters_df.empty:
-    _render_whole_slate_table(st.session_state.whole_slate_hitters_df, ws_hitter_max_cv, ws_min_tier, "Hitters", is_pitcher=False)
-
-
-
-st.header("🎯 Original Method Matcher")
-st.caption(
-    "Real, direct implementation of the user's own, historically-proven manual method - "
-    "not the older, looser continuous-blend scoring elsewhere in this app. For a real, "
-    "specific pitcher, builds his real tendency profile (usage%, zone%, CSW%, SwStr%, "
-    "zone-whiff%, chase%, chase-whiff%) with NO league-benchmark judgment attached, then "
-    "checks EVERY real hitter in the opposing lineup individually - hard .360+ xwOBA / "
-    ".450+ xwOBACON thresholds (both adjustable below), checked per pitch type, against "
-    "the pitcher's specific real throwing hand, requiring a real MAJORITY of his "
-    "meaningfully-used pitches to individually clear both bars. This is deliberately "
-    "stricter than the older scoring - fewer real matches showing up here is the "
-    "intended, correct result, not a bug."
-)
-st.caption(
-    "Honest status: mechanically verified against real, hand-built test cases (confirmed "
-    "correct majority-logic and handedness-specificity) but not yet run against a real, "
-    "live slate in this exact app flow - watch the first few real results closely."
-)
-
-omm_col1, omm_col2, omm_col3 = st.columns(3)
-with omm_col1:
-    omm_min_xwoba = st.number_input("Min real xwOBA per pitch", min_value=0.200, max_value=0.500,
-                                      value=0.360, step=0.005, format="%.3f", key="omm_min_xwoba")
-with omm_col2:
-    omm_min_xwobacon = st.number_input("Min real xwOBACON per pitch", min_value=0.250, max_value=0.600,
-                                         value=0.450, step=0.005, format="%.3f", key="omm_min_xwobacon")
-with omm_col3:
-    omm_min_usage = st.number_input("Min real pitch usage% to count as \"meaningfully used\"",
-                                      min_value=0.0, max_value=40.0, value=10.0, step=1.0, key="omm_min_usage")
-
-omm_pick_choice, omm_pick_date = _slate_day_picker("omm")
-if st.button("Load real games", key="omm_load_games_btn"):
-    with st.spinner("Pulling the real schedule..."):
-        try:
-            st.session_state.omm_games_df = pull_todays_games(date=omm_pick_date.strftime("%m/%d/%Y"))
-            st.session_state.omm_loaded_choice = omm_pick_choice
-            st.session_state.omm_loaded_date = omm_pick_date
-        except Exception as e:
-            st.error(f"Couldn't pull the real schedule: {e}")
-            st.session_state.omm_games_df = pd.DataFrame()
-
-omm_loaded_choice = st.session_state.get("omm_loaded_choice", "Today")
-omm_loaded_date = st.session_state.get("omm_loaded_date", get_mlb_today())
-omm_games_df = st.session_state.get("omm_games_df")
-if omm_games_df is None or omm_games_df.empty:
-    st.info("Pick a day and click \"Load real games\" above to pick a real matchup.")
-else:
-    # REAL FIX (confirmed bug, found via direct user report - "shows a
-    # number game, not team names") - pull_todays_games() returns raw
-    # MLB-StatsAPI fields directly, which don't include a "matchup"
-    # column, so this was silently falling back to the DataFrame's
-    # first column (likely game_id or similar) instead of anything
-    # readable. Builds a real matchup label from the actual team-name
-    # columns MLB-StatsAPI provides.
-    if "matchup" in omm_games_df.columns:
-        omm_label_col = "matchup"
-    elif "away_name" in omm_games_df.columns and "home_name" in omm_games_df.columns:
-        omm_games_df = omm_games_df.copy()
-        # REAL FIX (confirmed real bug via direct user report - a real
-        # doubleheader showed the wrong pitcher pairing, Game 1's
-        # matchup crossed with Game 2's) - both games of a doubleheader
-        # share the exact same team names, so without a real game-
-        # number disambiguation, the dropdown couldn't tell them apart
-        # and the lookup's .iloc[0] always grabbed the first matching
-        # row - same real fix already proven correct in the Full
-        # Matchup Simulation section, applied here too.
-        base_labels = omm_games_df["away_name"] + " @ " + omm_games_df["home_name"]
-        label_counts = base_labels.value_counts()
-        game_nums = omm_games_df.get("game_num")
-        seen_so_far = {}
-        final_labels = []
-        for i, base_label in enumerate(base_labels):
-            if label_counts[base_label] > 1:
-                gn = game_nums.iloc[i] if game_nums is not None else None
-                if pd.notna(gn):
-                    final_labels.append(f"{base_label} (Game {int(gn)})")
-                else:
-                    seen_so_far[base_label] = seen_so_far.get(base_label, 0) + 1
-                    final_labels.append(f"{base_label} (Game {seen_so_far[base_label]})")
-            else:
-                final_labels.append(base_label)
-        omm_games_df["matchup"] = final_labels
-        omm_label_col = "matchup"
-    elif "away_team" in omm_games_df.columns and "home_team" in omm_games_df.columns:
-        omm_games_df = omm_games_df.copy()
-        # REAL FIX (same confirmed doubleheader bug, applied here too)
-        base_labels2 = omm_games_df["away_team"] + " @ " + omm_games_df["home_team"]
-        label_counts2 = base_labels2.value_counts()
-        game_nums2 = omm_games_df.get("game_num")
-        seen_so_far2 = {}
-        final_labels2 = []
-        for i, base_label in enumerate(base_labels2):
-            if label_counts2[base_label] > 1:
-                gn = game_nums2.iloc[i] if game_nums2 is not None else None
-                if pd.notna(gn):
-                    final_labels2.append(f"{base_label} (Game {int(gn)})")
-                else:
-                    seen_so_far2[base_label] = seen_so_far2.get(base_label, 0) + 1
-                    final_labels2.append(f"{base_label} (Game {seen_so_far2[base_label]})")
-            else:
-                final_labels2.append(base_label)
-        omm_games_df["matchup"] = final_labels2
-        omm_label_col = "matchup"
-    else:
-        omm_label_col = omm_games_df.columns[0]
-    omm_game_label = st.selectbox("Pick a real game", omm_games_df[omm_label_col].tolist(), key="omm_game_select")
-    omm_row = omm_games_df[omm_games_df[omm_label_col] == omm_game_label].iloc[0]
-    # REAL BUG FIX - MLB-StatsAPI schedule rows carry "game_id", not "game_pk", so this used to
-    # come back None and pull the lineup for the wrong game (or none at all).
-    omm_game_pk = omm_row.get("game_id") if "game_id" in omm_row.index else omm_row.get("game_pk")
-
-    # REAL, NEW (per direct request, fixing a real bug) - same
-    # restructure as the Full Matchup Simulation section: lineup and
-    # pitchers now pull immediately after game selection, cached in
-    # session_state, with verification/override UI shown BEFORE the
-    # run button - not after clicking it.
-    omm_cache_key = f"omm_data_{omm_game_pk}"
-    if omm_cache_key not in st.session_state:
-        with st.spinner("Pulling real, confirmed lineups and both real starters..."):
-            try:
-                pulled_lineup = pull_confirmed_lineup(omm_game_pk)
-            except Exception as e:
-                st.error(f"Couldn't pull the real, confirmed lineup: {e}")
-                pulled_lineup = None
-            pulled_pitchers = {}
-            for pside in ("home", "away"):
-                try:
-                    pulled_pitchers[pside] = get_probable_pitcher(omm_game_pk, pside)
-                except Exception:
-                    pulled_pitchers[pside] = None
-        st.session_state[omm_cache_key] = {"lineup": pulled_lineup, "pitchers": pulled_pitchers}
-
-    omm_data = st.session_state[omm_cache_key]
-    omm_lineup_data = omm_data["lineup"]
-    omm_pitchers = omm_data["pitchers"]
-
-    omm_ready = omm_lineup_data is not None and omm_lineup_data.get("lineup_status") in (
-        "confirmed", "preview_expected")
-    if not omm_ready:
-        st.warning("This real game doesn't have a fully confirmed lineup yet (both batting "
-                   "orders + both starting pitchers) - try again closer to first pitch, or preview it below.")
-        _render_preview_loader(omm_row, omm_game_pk, omm_cache_key, omm_loaded_choice, omm_loaded_date, "omm")
-    else:
-        with st.expander("✅ Verify (and adjust, if needed) the real pitchers and lineups being used", expanded=True):
-            _render_preview_banner(omm_lineup_data, omm_cache_key, "omm")
-            for pside in ("away", "home"):
-                p = omm_pitchers.get(pside)
-                if p is None:
-                    st.warning(f"No real, confirmed {pside} starter found yet.")
-                    continue
-                st.caption(f"Real {pside} starter resolved: **{p['name']}** (via {p.get('source', 'unknown')}) | "
-                           f"Real game_pk used: {omm_game_pk}")
-                override_name = st.text_input(
-                    f"Wrong {pside} starter? Type the real name to override:",
-                    key=f"omm_pitcher_override_{pside}_{omm_game_pk}",
-                )
-                if override_name.strip():
-                    override_result = find_player_by_name(override_name.strip())
-                    if override_result and override_result.get("player_id"):
-                        st.success(f"Using **{override_result['name']}** instead (manual override).")
-                        omm_pitchers[pside] = {"player_id": override_result["player_id"],
-                                                 "name": override_result["name"], "source": "manual_override"}
-                    else:
-                        st.error(f"Couldn't find a real player matching '{override_name}' - keeping the auto-detected pitcher.")
-
-            for side_label, side_key in [("Away", "away"), ("Home", "home")]:
-                real_lineup_side = omm_lineup_data.get(side_key, [])
-                if real_lineup_side:
-                    names_in_order = [h.get("name", "?") for h in real_lineup_side]
-                    st.markdown(f"**{side_label} lineup ({len(names_in_order)}):** " + ", ".join(names_in_order))
-                else:
-                    st.markdown(f"**{side_label} lineup:** not yet posted")
-
-            st.markdown("**Wrong hitter? Replace one below:**")
-            for side_label, side_key in [("Away", "away"), ("Home", "home")]:
-                real_lineup_side = omm_lineup_data.get(side_key, [])
-                if not real_lineup_side:
-                    continue
-                col1, col2 = st.columns(2)
-                with col1:
-                    slot_options = [f"{i+1}. {h.get('name', '?')}" for i, h in enumerate(real_lineup_side)]
-                    chosen_slot = st.selectbox(f"{side_label} - pick a spot to replace", ["(none)"] + slot_options,
-                                                 key=f"omm_hitter_slot_{side_key}_{omm_game_pk}")
-                with col2:
-                    replacement_name = st.text_input(f"{side_label} - real name to use instead",
-                                                        key=f"omm_hitter_name_{side_key}_{omm_game_pk}")
-                if chosen_slot != "(none)" and replacement_name.strip():
-                    slot_idx = int(chosen_slot.split(".")[0]) - 1
-                    replacement_result = find_player_by_name(replacement_name.strip())
-                    if replacement_result and replacement_result.get("player_id"):
-                        omm_lineup_data[side_key][slot_idx] = {
-                            "player_id": replacement_result["player_id"], "name": replacement_result["name"],
-                        }
-                        st.success(f"{side_label} spot {slot_idx+1} now using **{replacement_result['name']}**.")
-                    else:
-                        st.error(f"Couldn't find a real player matching '{replacement_name}'.")
-
-    if omm_ready and st.button("Run Original Method check for both real pitchers", key="omm_run_btn"):
-        if True:
-            today_str = get_mlb_today().strftime("%Y-%m-%d")
-            pitcher_recent_start = (datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=68)).strftime("%Y-%m-%d")
-            omm_results = {}
-
-            for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
-                real_lineup = [h for h in omm_lineup_data.get(hitting_side, []) if h.get("player_id") is not None]
-                # REAL FIX (same restructure) - uses the already-
-                # resolved (and potentially overridden) pitcher instead
-                # of re-fetching fresh here, which would have silently
-                # discarded any manual override made before Run.
-                opposing_pitcher = omm_pitchers.get(pitching_side)
-                if not real_lineup or opposing_pitcher is None:
-                    continue
-
-                with st.spinner(f"Building {opposing_pitcher['name']}'s real tendency profile..."):
-                    try:
-                        pid = opposing_pitcher["player_id"]
-                        pitcher_pitches = pull_pitcher_pitches(pid, pitcher_recent_start, today_str)
-                        pitcher_arsenal = build_arsenal_profile(pitcher_pitches)
-                        pitcher_hand = (pitcher_pitches["p_throws"].mode().iloc[0]
-                                        if not pitcher_pitches.empty and "p_throws" in pitcher_pitches else "R")
-                        pitcher_zone_breakdown = attack_zone_breakdown(pitcher_pitches)
-                        tendency_profile = build_pitcher_tendency_profile(pitcher_arsenal, pitcher_zone_breakdown)
-                    except Exception as e:
-                        st.error(f"Couldn't build {opposing_pitcher['name']}'s real profile: {e}")
-                        continue
-
-                real_matches = []
-                hitter_profiles_by_order_slot = {}
-                hitter_hand_by_order_slot = {}
-                for hitter in real_lineup:
-                    try:
-                        h_pitches = pull_batter_pitches(hitter["player_id"], f"{today_str[:4]}-03-20", today_str)
-                        batter_hand = (h_pitches["stand"].mode().iloc[0]
-                                      if not h_pitches.empty and "stand" in h_pitches else "R")
-                        hitter_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
-                        hitter_profiles_by_order_slot[hitter.get("order_slot")] = hitter_profile
-                        hitter_hand_by_order_slot[hitter.get("order_slot")] = batter_hand
-                        match = calc_original_method_match(
-                            pitcher_arsenal, hitter_profile, pitcher_hand,
-                            min_pitch_usage_pct=omm_min_usage, min_xwoba=omm_min_xwoba,
-                            min_xwobacon=omm_min_xwobacon,
-                        )
-                        if match.get("usable") and match.get("real_majority_match"):
-                            real_matches.append({
-                                "hitter": hitter["name"],
-                                "pitches_qualifying": f"{match['pitches_qualifying']}/{match['pitches_scored']}",
-                                "read": match["read"],
-                            })
-                    except Exception:
-                        continue
-
-                # Real, aggregate, PA-weighted read for pitcher props
-                # specifically - reuses the same per-hitter profiles just
-                # built above, no re-pulling.
-                lineup_weighted_read = calc_lineup_weighted_pitcher_read(
-                    pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot, pitcher_hand,
-                    min_pitch_usage_pct=omm_min_usage, min_xwoba=omm_min_xwoba,
-                    min_xwobacon=omm_min_xwobacon,
-                )
-
-                # Real, prop-specific checks - different question from the
-                # contact-quality read above: for EACH real pitcher prop,
-                # does his identified signature pitch for that specific
-                # prop actually get exploited by MOST of the real, PA-
-                # weighted lineup he'll face tonight, using the metrics
-                # that matter for that specific prop.
-                prop_reads = {}
-                for prop_type in ["strikeouts", "outs", "hits_allowed", "walks_allowed", "pitcher_earned_runs"]:
-                    prop_reads[prop_type] = calc_prop_lineup_vulnerability(
-                        pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
-                        hitter_hand_by_order_slot, prop_type, min_pitch_usage_pct=omm_min_usage,
-                    )
-
-                # Real pitcher fantasy read - combines the outs/K/ER
-                # component reads above using the real point values,
-                # rather than a separate signature-pitch mechanism.
-                pf_read = calc_pitcher_fantasy_lineup_read(
-                    pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
-                    hitter_hand_by_order_slot, min_pitch_usage_pct=omm_min_usage,
-                )
-
-                omm_results[opposing_pitcher["name"]] = {
-                    "tendency_profile": tendency_profile,
-                    "real_matches": real_matches,
-                    "lineup_weighted_read": lineup_weighted_read,
-                    "prop_reads": prop_reads,
-                    "pf_read": pf_read,
-                }
-
-            st.session_state.omm_results = omm_results
-
-    if st.session_state.get("omm_results"):
-        for pitcher_name, data in st.session_state.omm_results.items():
-            st.subheader(f"vs {pitcher_name}")
-            with st.expander("Real pitcher tendency profile (no benchmark judgment attached)"):
-                st.dataframe(pd.DataFrame(data["tendency_profile"]), width="stretch")
-
-            lwr = data.get("lineup_weighted_read", {})
-            if lwr.get("usable"):
-                st.metric(
-                    "Real, PA-weighted share of tonight's lineup that qualifies",
-                    f"{lwr['weighted_qualifying_share']*100:.1f}%",
-                    help="Weighted by real expected plate appearances per batting-order slot - "
-                         "the top of the order counts for more, since he genuinely faces them "
-                         "more often in a real game. This is the real signal for pitcher props "
-                         "(Ks/Outs/Hits-Walks-ERs Allowed/Fantasy) specifically - a whole-game "
-                         "outcome should reflect the WHOLE real lineup, weighted correctly, not "
-                         "just a simple headcount of qualifying hitters.",
-                )
-                with st.expander("Per-hitter real PA weighting detail"):
-                    st.dataframe(pd.DataFrame(lwr["per_hitter"]), width="stretch", hide_index=True)
-
-            st.markdown("**Real, per-prop signature-pitch vulnerability:**")
-            PROP_DISPLAY_LABELS = {
-                "strikeouts": "Strikeouts", "outs": "Outs", "hits_allowed": "Hits Allowed",
-                "walks_allowed": "Walks Allowed", "pitcher_earned_runs": "Earned Runs Allowed",
-            }
-            prop_reads = data.get("prop_reads", {})
-            prop_cols = st.columns(len(PROP_DISPLAY_LABELS))
-            for col, (prop_type, label) in zip(prop_cols, PROP_DISPLAY_LABELS.items()):
-                pr = prop_reads.get(prop_type, {})
-                with col:
-                    if pr.get("usable"):
-                        st.metric(label, f"{pr['weighted_vulnerable_share']*100:.1f}%")
-                    else:
-                        st.metric(label, "—")
-            with st.expander("Per-prop real detail (signature pitch used + per-hitter breakdown)"):
-                for prop_type, label in PROP_DISPLAY_LABELS.items():
-                    pr = prop_reads.get(prop_type, {})
-                    if not pr.get("usable"):
-                        continue
-                    st.markdown(f"**{label}** — {pr['read']}")
-                    for hand, primary in pr.get("primary_pitches_by_hand", {}).items():
-                        if primary.get("usable"):
-                            st.caption(f"Real signature pitch vs {hand}HH: **{primary['primary_pitch'].pitch_type}**")
-                    st.dataframe(pd.DataFrame(pr["per_hitter"]), width="stretch", hide_index=True)
-                    st.divider()
-
-            pf = data.get("pf_read", {})
-            if pf.get("usable"):
-                st.metric(
-                    "Real Pitcher Fantasy net favorability (Outs/K/ER components, real point values)",
-                    f"{pf['net_favorability']:+.2f}",
-                    help=f"Outs share: {pf['outs_share']*100:.1f}% | K share: {pf['k_share']*100:.1f}% | "
-                         f"ER-vulnerable share: {pf['er_vulnerable_share']*100:.1f}%. {pf['excludes']}",
-                )
-                st.caption(f"Excludes: {pf['excludes']}")
-
-            if data["real_matches"]:
-                st.success(f"{len(data['real_matches'])} real hitter(s) clear your Original Method bar:")
-                st.dataframe(pd.DataFrame(data["real_matches"]), width="stretch", hide_index=True)
-            else:
-                st.info("No real hitter in this lineup clears a real majority of the pitcher's "
-                        "meaningfully-used pitches at these thresholds.")
 
 st.divider()
 st.header("🎮 Full Matchup Simulation")
@@ -1016,8 +534,17 @@ else:
             combined_lineup_coverage = {}
             combined_crosswalks = {}
             combined_arsenals = {}
-            combined_crosswalks = {}
-            combined_arsenals = {}
+            # REAL FIX (per direct request) - added to wire the same real,
+            # underlying-metric grading already proven in the Whole-Slate
+            # Stage 1 scan into this Full Matchup Simulation tab too,
+            # reusing the exact same real data this tab already builds for
+            # its own simulation (pitcher_arsenal, each hitter's real
+            # profile, real batting-order slots) rather than the older
+            # field-relative z-score this tab used before.
+            combined_pitcher_hand = {}
+            combined_hitter_profiles_by_pitcher = {}
+            combined_hitter_hand_by_pitcher = {}
+            combined_real_lineup_by_pitcher = {}
 
             # Real, deliberate change - runs BOTH sides automatically
             # instead of making the user pick one. A real game always has
@@ -1075,6 +602,10 @@ else:
                 if not pitcher_arsenal:
                     continue
                 combined_arsenals[opposing_pitcher["name"]] = pitcher_arsenal
+                combined_pitcher_hand[opposing_pitcher["name"]] = pitcher_hand
+                combined_real_lineup_by_pitcher[opposing_pitcher["name"]] = real_lineup
+                combined_hitter_profiles_by_pitcher[opposing_pitcher["name"]] = {}
+                combined_hitter_hand_by_pitcher[opposing_pitcher["name"]] = {}
 
                 lineup_crosswalks = {}
                 progress = st.progress(0.0, text=f"Building real crosswalks for the {hitting_side} lineup...")
@@ -1095,6 +626,8 @@ else:
                             pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
                         lineup_crosswalks[hitter["name"]] = crosswalk
                         combined_crosswalks[hitter["name"]] = crosswalk
+                        combined_hitter_profiles_by_pitcher[opposing_pitcher["name"]][hitter.get("order_slot")] = h_profile
+                        combined_hitter_hand_by_pitcher[opposing_pitcher["name"]][hitter.get("order_slot")] = batter_hand
                         sim_lineup_teams[hitter["name"]] = hitting_side
                         # Real, new check - what real % of the PITCHER'S
                         # actual, usage-weighted arsenal does this hitter
@@ -1145,6 +678,10 @@ else:
                 st.session_state["sim_lineup_coverage"] = combined_lineup_coverage
                 st.session_state["sim_crosswalks"] = combined_crosswalks
                 st.session_state["sim_arsenals"] = combined_arsenals
+                st.session_state["sim_pitcher_hand"] = combined_pitcher_hand
+                st.session_state["sim_hitter_profiles_by_pitcher"] = combined_hitter_profiles_by_pitcher
+                st.session_state["sim_hitter_hand_by_pitcher"] = combined_hitter_hand_by_pitcher
+                st.session_state["sim_real_lineup_by_pitcher"] = combined_real_lineup_by_pitcher
 
     if st.session_state.get("sim_crosswalks") or st.session_state.get("sim_arsenals"):
         st.divider()
@@ -1244,79 +781,18 @@ else:
                 "(not just a few simulated outlier games carrying the number)."
             )
             st.caption(
-                "Real, reasoned adjustment - hitters are compared against their own real "
-                "9-man lineup (a genuinely harder bar - only the top few can ever clear a "
-                "positive z-score), while pitchers compare against a fixed league baseline "
-                "(an easier bar). Separate, looser defaults for hitters below address this "
-                "real, structural asymmetry - not verified against live data (no network "
-                "access in this environment), so watch the first real day closely."
+                "Graded against a FIXED, real bar built from each pitcher's own real signature "
+                "pitch vs tonight's real, specific lineup (or each hitter's own real metrics vs "
+                "tonight's real, specific pitcher) - the same real, underlying-metric mechanism "
+                "already proven in the Whole-Slate Stage 1 scan. Not a comparison to any other "
+                "player, game, or the rest of the slate - a genuinely strong matchup grades the "
+                "same whether it's a single game or a full 15-game night."
             )
             fcol1, fcol2 = st.columns(2)
             with fcol1:
-                # REAL FIX - raised from 0.5, based on real, direct
-                # evidence from an actual run (2026-09-06/07): comparing
-                # two real pitchers in the same game, one at z=0.96
-                # REAL FIX (per direct request, confirmed via live
-                # testing tonight) - 0.8 was originally raised from 0.5
-                # after one specific case where a weak pitcher barely
-                # cleared 0.5. But tested live against a real 14-pitcher
-                # slate: ZERO cleared 0.8 (real max was 0.71), while
-                # zero cleared 0.5 the OLD way either at the time - the
-                # real, structural issue is that pitcher stats spread
-                # out less night to night than hitters do, not that 0.8
-                # was correctly calibrated. Lowered back to 0.5, now
-                # matching the already-established strikeouts/outs/
-                # earned_runs-specific threshold below, so the general
-                # and specific pitcher bars are internally consistent
-                # instead of the general one being stricter than the
-                # specific one.
-                pitcher_min_zscore = st.slider("Pitcher minimum edge (real std devs above league baseline)",
-                                        0.0, 2.0, 0.5, step=0.1, key="sim_pitcher_min_zscore")
-                # REAL FIX (confirmed mathematically, per direct request -
-                # traced why strikeouts/outs/earned_runs never survived
-                # Stage 1 regardless of the actual pitcher). The shared
-                # 0.80 threshold, combined with these props' real,
-                # established league baselines, requires: 7.26+ real
-                # strikeouts, 20.1+ real outs (6.7 IP), or 1.46-or-fewer
-                # real earned runs just to clear the bar - all three are
-                # genuinely near-ace-level performance, not a normal good
-                # start. That's not a data problem, it's a real math
-                # problem with applying the SAME threshold (tuned
-                # specifically for hits_allowed via the Wrobleski/Alvarez
-                # comparison) to these structurally different, wider-
-                # variance counting stats. Lowered specifically for these
-                # three back toward the original, pre-tuning 0.5 default,
-                # which was never shown to be wrong for THESE props -
-                # only hits_allowed/pitcher_fantasy had real evidence it
-                # needed raising.
-                pitcher_min_zscore_counting = st.slider(
-                    "Pitcher minimum edge - strikeouts/outs/earned_runs specifically",
-                    0.0, 2.0, 0.5, step=0.1, key="sim_pitcher_min_zscore_counting",
-                    help="Separate, lower bar for these three specific props - confirmed "
-                         "mathematically that the shared 0.80 above requires near-ace-level "
-                         "real performance (7.26+ Ks, 20+ outs, sub-1.5 ERs) to ever clear, "
-                         "which is why these never survived regardless of the real pitcher.",
-                )
-                hitter_min_zscore = st.slider("Hitter minimum edge (real std devs above tonight's own 9-man field)",
-                                        0.0, 2.0, 0.3, step=0.1, key="sim_hitter_min_zscore")
+                sim_min_tier = st.select_slider("Minimum real tier to show", options=["Poor", "Average", "Strong", "Elite"],
+                                                value="Strong", key="sim_min_tier")
             with fcol2:
-                # REAL FIX - recalibrated using real, live data from an
-                # actual run (2026-09-06). Confirmed directly: real hitter
-                # CVs for these low-count stats (total_bases, hits_runs_rbi)
-                # cluster 0.93-1.53 even for genuinely strong hitters - the
-                # earlier 0.7 guess was still far too strict, not just
-                # slightly off. Real pitcher CVs ran 0.26-1.02 in the same
-                # data, with a real, strong edge (z=0.86) failing only
-                # because it barely missed the old 0.6 cap - raised
-                # slightly to give real, strong edges room.
-                # REAL FIX (per direct request) - the comment above
-                # already documents real pitcher CVs from an actual live
-                # run ranging 0.26-1.02, but the cap was still set at
-                # 0.75 - cutting off the entire upper quarter of that
-                # CONFIRMED real range even after the z-score fix.
-                # Raised to 1.05 to genuinely cover what real pitcher
-                # starts actually look like, rather than an arbitrary
-                # point partway through the documented real data.
                 pitcher_max_cv = st.slider("Pitcher maximum coefficient of variation",
                                     0.1, 1.5, 1.05, step=0.05, key="sim_pitcher_max_cv")
                 hitter_max_cv = st.slider("Hitter maximum coefficient of variation",
@@ -1338,6 +814,21 @@ else:
                           for name in st.session_state["sim_lineup_names"]]
             all_props += [("pitcher", name, "pitchers", sim_pitcher_props_wanted)
                            for name in st.session_state.get("sim_pitcher_names", [])]
+            # REAL FIX (per direct request) - same real, underlying-metric
+            # grading already proven in Whole-Slate Stage 1, reusing the
+            # exact real data this tab already builds for its own real
+            # simulation. hitter_vuln_cache/pitcher_vuln_cache below are
+            # local to this one render, same real caching pattern as
+            # Stage 1 (one real calc_prop_lineup_vulnerability call per
+            # pitcher per real signature-pitch type, not per prop row).
+            hitter_vuln_cache_sim = {}
+            pitcher_vuln_cache_sim = {}
+            sim_crosswalks_map = st.session_state.get("sim_crosswalks", {})
+            sim_pitcher_hand_map = st.session_state.get("sim_pitcher_hand", {})
+            sim_hitter_profiles_map = st.session_state.get("sim_hitter_profiles_by_pitcher", {})
+            sim_hitter_hand_map = st.session_state.get("sim_hitter_hand_by_pitcher", {})
+            sim_real_lineup_map = st.session_state.get("sim_real_lineup_by_pitcher", {})
+
             for side, name, source, props in all_props:
                 team = (st.session_state.get("sim_lineup_teams", {}) if side == "hitter"
                         else st.session_state.get("sim_pitcher_teams", {})).get(name, "?")
@@ -1348,84 +839,78 @@ else:
                     avg = sum(series) / len(series)
                     std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
                     cv = round(std / avg, 3) if avg else None
-                    stage1_rows.append({"side": side, "player": name, "team": team, "prop": prop,
-                                         "real_avg": round(avg, 2), "cv": cv})
+                    row = {"side": side, "player": name, "team": team, "prop": prop,
+                          "real_avg": round(avg, 2), "cv": cv}
+                    if side == "hitter":
+                        vuln_type = HITTER_PROP_TO_VULN_TYPE.get(prop)
+                        crosswalk = sim_crosswalks_map.get(name)
+                        if vuln_type and crosswalk is not None:
+                            cache_key = (name, vuln_type)
+                            if cache_key not in hitter_vuln_cache_sim:
+                                try:
+                                    hitter_vuln_cache_sim[cache_key] = hitter_prop_vulnerability_score(crosswalk, vuln_type)
+                                except Exception as e:
+                                    hitter_vuln_cache_sim[cache_key] = {"score": None, "label": f"NOT GRADED - {e}"}
+                            vuln = hitter_vuln_cache_sim[cache_key]
+                            raw_score = vuln.get("score")
+                            row["metric_score"] = -raw_score if raw_score is not None else None
+                            row["metric_note"] = vuln.get("label")
+                        elif vuln_type:
+                            row["metric_note"] = "NOT GRADED - no real crosswalk found for this hitter"
+                    else:
+                        sig_type = PITCHER_PROP_TO_SIGNATURE_TYPE.get(prop)
+                        if sig_type and name in sim_hitter_profiles_map:
+                            cache_key = (name, sig_type)
+                            if cache_key not in pitcher_vuln_cache_sim:
+                                try:
+                                    pitcher_vuln_cache_sim[cache_key] = calc_prop_lineup_vulnerability(
+                                        st.session_state.get("sim_arsenals", {}).get(name, []),
+                                        sim_real_lineup_map.get(name, []),
+                                        sim_hitter_profiles_map.get(name, {}),
+                                        sim_hitter_hand_map.get(name, {}),
+                                        sig_type, sim_pitcher_hand_map.get(name, "R"))
+                                except Exception as e:
+                                    pitcher_vuln_cache_sim[cache_key] = {"usable": False, "reason": str(e)}
+                            vuln = pitcher_vuln_cache_sim[cache_key]
+                            if vuln.get("usable"):
+                                row["metric_score"] = vuln["weighted_vulnerable_share"]
+                                row["metric_note"] = vuln["read"]
+                            else:
+                                row["metric_note"] = f"NOT GRADED - {vuln.get('reason', 'unknown reason')}"
+                        elif prop in ("pitcher_fantasy", "pitcher_fantasy_prizepicks") and name in sim_hitter_profiles_map:
+                            comp_scores = {}
+                            for comp in ("strikeouts", "outs", "pitcher_earned_runs"):
+                                ck = (name, comp)
+                                if ck not in pitcher_vuln_cache_sim:
+                                    try:
+                                        pitcher_vuln_cache_sim[ck] = calc_prop_lineup_vulnerability(
+                                            st.session_state.get("sim_arsenals", {}).get(name, []),
+                                            sim_real_lineup_map.get(name, []),
+                                            sim_hitter_profiles_map.get(name, {}),
+                                            sim_hitter_hand_map.get(name, {}),
+                                            comp, sim_pitcher_hand_map.get(name, "R"))
+                                    except Exception as e:
+                                        pitcher_vuln_cache_sim[ck] = {"usable": False, "reason": str(e)}
+                                comp_scores[comp] = pitcher_vuln_cache_sim[ck]
+                            if all(v.get("usable") for v in comp_scores.values()):
+                                row["metric_score"] = round(
+                                    (comp_scores["strikeouts"]["weighted_vulnerable_share"] * 3
+                                     + comp_scores["outs"]["weighted_vulnerable_share"] * 1
+                                     + (1 - comp_scores["pitcher_earned_runs"]["weighted_vulnerable_share"]) * 3) / 7, 3)
+                                row["metric_note"] = ("Blended from his real strikeout/outs signature-pitch "
+                                                      "vulnerability shares and his real (inverted) earned-run "
+                                                      "vulnerability share, weighted by Underdog's real "
+                                                      "out1/K3/ER-3 point values.")
+                    stage1_rows.append(row)
             stage1_df = pd.DataFrame(stage1_rows)
+            if "metric_score" not in stage1_df.columns:
+                stage1_df["metric_score"] = None
+            stage1_df["tier"] = stage1_df.apply(
+                lambda r: _metric_tier(r["metric_score"], r["side"] == "pitcher"), axis=1)
 
             if stage1_df.empty:
                 st.warning("No real data to rank yet.")
             else:
-                # Real, within-prop z-score - "how many real std devs above
-                # tonight's own field average is this specific player, for
-                # this specific prop" - a fair, direct comparison since
-                # different props sit on completely different real scales
-                # (hits averages ~1-2, fantasy averages ~5-10).
-                # REAL BUG FIX - grouping by "prop" alone would mix a
-                # hitter's "strikeouts" (~1-2 per game, times he struck
-                # out) with a pitcher's "strikeouts" (~5-7 per start, his
-                # own real Ks) into the same comparison group, since both
-                # share the literal prop name. Must group by (side, prop)
-                # together - hitter props only compare against other
-                # hitters, pitcher props only against other pitchers.
-                stage1_df["field_mean"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("mean")
-                stage1_df["field_std"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("std").fillna(0.01)
-                # REAL FIX (per direct clarification) - removed the fixed
-                # league-baseline branch entirely. The original "only 2
-                # pitchers per game" problem this was meant to solve only
-                # happens when the scan is restricted to a single game -
-                # on a real, full-slate scan, groupby(["side","prop"])
-                # above already pools EVERY pitcher scanned that night
-                # across every real game, a genuine, meaningful field the
-                # same way hitters already get one. No fixed/hardcoded
-                # number is used anywhere now - purely each pitcher's own
-                # real, simulated average compared against that night's
-                # real field of other simulated pitchers.
-                # Props where a LOWER real number is actually better for
-                # the pitcher (fewer hits/walks/runs allowed is good) -
-                # z-score sign needs flipping so "high z-score" still
-                # consistently means "genuinely good" on both sides.
-                LOWER_IS_BETTER_PITCHER_PROPS = {"hits_allowed", "walks_allowed", "earned_runs"}
-
-                def _real_zscore(row):
-                    field_std = row.get("field_std")
-                    if field_std is None or pd.isna(field_std) or field_std == 0:
-                        return float("nan")
-                    z = (row["real_avg"] - row["field_mean"]) / field_std
-                    if row["side"] == "pitcher" and row["prop"] in LOWER_IS_BETTER_PITCHER_PROPS:
-                        z = -z
-                    return round(z, 2)
-
-                # REAL, HONEST GUARD - if fewer than 3 real pitchers are
-                # in tonight's scanned field for a given prop (e.g. a
-                # single-game scan), the field-relative comparison isn't
-                # meaningful yet - flags this directly instead of
-                # silently returning a misleading number.
-                pitcher_field_counts = stage1_df[stage1_df["side"] == "pitcher"].groupby("prop")["real_avg"].transform("count")
-                stage1_df["_thin_pitcher_field"] = (stage1_df["side"] == "pitcher") & (pitcher_field_counts < 3)
-
-                # Real, fixed, absolute-baseline z-score for hitters,
-                # added ALONGSIDE the field-relative one above - per
-                # direct request after a real, direct audit. Confirmed:
-                # the relative version can score a genuinely solid
-                # matchup lower purely because the whole field that
-                # night was unusually strong. This fixed version checks
-                # against a stable, real league baseline instead, so
-                # both numbers together give more real signal than
-                # either alone.
-                HITTER_LEAGUE_BASELINES = {
-                    "hits_runs_rbi": (LEAGUE_AVG_HITTER_HRR_PER_GAME, LEAGUE_STD_HITTER_HRR_PER_GAME),
-                    "fantasy": (LEAGUE_AVG_HITTER_FANTASY_UD_PER_GAME, LEAGUE_STD_HITTER_FANTASY_UD_PER_GAME),
-                    "fantasy_prizepicks": (LEAGUE_AVG_HITTER_FANTASY_PP_PER_GAME, LEAGUE_STD_HITTER_FANTASY_PP_PER_GAME),
-                }
-
-                def _real_zscore_fixed(row):
-                    if row["side"] != "hitter" or row["prop"] not in HITTER_LEAGUE_BASELINES:
-                        return float("nan")
-                    base_mean, base_std = HITTER_LEAGUE_BASELINES[row["prop"]]
-                    return round((row["real_avg"] - base_mean) / base_std, 2)
-
-                stage1_df["zscore"] = stage1_df.apply(_real_zscore, axis=1)
-                stage1_df["zscore_fixed_baseline"] = stage1_df.apply(_real_zscore_fixed, axis=1)
                 # Real coverage check - only meaningful for hitters (a
                 # hitter's real sample against the pitcher's arsenal).
                 # Pitchers default to 100 here so this check never
@@ -1435,31 +920,20 @@ else:
                 stage1_df["coverage"] = stage1_df.apply(
                     lambda r: coverage_map.get(r["player"], 100.0) if r["side"] == "hitter" else 100.0, axis=1)
 
-                # REAL FIX - pitcher counting-stat props (strikeouts,
-                # outs, earned_runs) now use their own, separate, lower
-                # z-score floor - confirmed mathematically these were
-                # structurally unable to survive the shared 0.80 bar
-                # regardless of the real pitcher.
-                PITCHER_COUNTING_STAT_PROPS = {"strikeouts", "outs", "earned_runs"}
-                stage1_df["_pitcher_min_zscore_for_prop"] = stage1_df["prop"].apply(
-                    lambda p: pitcher_min_zscore_counting if p in PITCHER_COUNTING_STAT_PROPS else pitcher_min_zscore)
-
-                survivors = stage1_df[
-                    (
-                        ((stage1_df["side"] == "hitter") & (stage1_df["zscore"] >= hitter_min_zscore) & (stage1_df["cv"].fillna(99) <= hitter_max_cv))
-                        | ((stage1_df["side"] != "hitter") & (stage1_df["zscore"] >= stage1_df["_pitcher_min_zscore_for_prop"]) & (stage1_df["cv"].fillna(99) <= pitcher_max_cv))
-                    )
-                    & (stage1_df["coverage"] >= min_coverage)
-                    & (~stage1_df["_thin_pitcher_field"])
-                ].sort_values("zscore", ascending=False)
-                thin_field_count = int(stage1_df["_thin_pitcher_field"].sum())
-                if thin_field_count > 0:
-                    st.caption(
-                        f"⚠️ {thin_field_count} real pitcher row(s) excluded from survivors - fewer than 3 "
-                        "real pitchers were in tonight's scanned field for that specific prop, so a field-"
-                        "relative comparison isn't meaningful yet (this happens on a single-game or very "
-                        "small scan - scan more real games at once to get a real, usable pitcher field)."
-                    )
+                TIER_RANK_SIM = {"Poor": 0, "Average": 1, "Strong": 2, "Elite": 3}
+                min_rank_sim = TIER_RANK_SIM[sim_min_tier]
+                stage1_df["_max_cv_for_row"] = stage1_df["side"].map(
+                    {"hitter": hitter_max_cv, "pitcher": pitcher_max_cv})
+                graded_sim_rows = stage1_df[stage1_df["tier"].notna()]
+                survivors = graded_sim_rows[
+                    (graded_sim_rows["tier"].map(TIER_RANK_SIM) >= min_rank_sim)
+                    & (graded_sim_rows["cv"].fillna(99) <= graded_sim_rows["_max_cv_for_row"])
+                    & (graded_sim_rows["coverage"] >= min_coverage)
+                ].sort_values("metric_score", ascending=False)
+                ungraded_props = sorted(stage1_df.loc[stage1_df["tier"].isna(), "prop"].unique().tolist())
+                if ungraded_props:
+                    st.caption(f"No real, underlying-metric mechanism built yet for: {', '.join(ungraded_props)} "
+                              "- those rows show real_avg only, honestly ungraded.")
                 real_survivor_count = len(survivors)
                 # Purely additive - lets a separate, new cross-reference
                 # section read this later, without touching any of the
@@ -1481,10 +955,10 @@ else:
                 )
                 survivors = survivors.head(top_n_survivors)
 
-                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "zscore_fixed_baseline", "coverage"]],
+                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "metric_score", "tier", "metric_note", "coverage"]],
                               width='stretch')
                 st.caption(f"{real_survivor_count} of {len(stage1_df)} real (player, prop) combinations "
-                           f"cleared all three real bars above - showing the top {len(survivors)}.")
+                           f"cleared the real, underlying-metric bar above - showing the top {len(survivors)}.")
 
                 # Real, genuine gap closed - until now there was no way to
                 # see the raw, UNFILTERED numbers for every real player/
@@ -1497,8 +971,8 @@ else:
                 # itself against the real, complete picture.
                 with st.expander(f"See all {len(stage1_df)} real (player, prop) combinations, unfiltered"):
                     st.dataframe(
-                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "zscore_fixed_baseline", "coverage"]]
-                        .sort_values("zscore", ascending=False),
+                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "metric_score", "tier", "metric_note", "coverage"]]
+                        .sort_values("metric_score", ascending=False),
                         width='stretch')
 
                 if survivors.empty:
@@ -1826,293 +1300,3 @@ else:
 # evidence from completed games, instead of a reasoned-but-unvalidated
 # guess like the current 65/15 default.
 # ---------------------------------------------------------------------------
-st.header("📈 Real Backtest - does the simulation's gap actually predict real outcomes?")
-st.caption(
-    "For a real, COMPLETED game, builds the exact same simulation the live tool "
-    "uses (crosswalks from real data available BEFORE that game only - no "
-    "looking into the future), then checks the real, actual outcome against it. "
-    "Run this across several real historical games to build up real, accumulated "
-    "evidence for what gap-pct/rate genuinely separates real edges from noise."
-)
-
-bt_col1, bt_col2 = st.columns(2)
-with bt_col1:
-    bt_start_date = st.text_input("Real start date (YYYY-MM-DD)", key="bt_start_date")
-with bt_col2:
-    bt_end_date = st.text_input("Real end date (YYYY-MM-DD)", key="bt_end_date")
-st.caption(
-    "Pulls every real, COMPLETED game in this range automatically - no need to "
-    "look up and type in individual game_pk values one at a time. A real, "
-    "trustworthy sample needs genuine variety (different pitchers, different "
-    "days), so aim for roughly 10-15+ real games for a statistically solid read."
-)
-
-# Real, deliberate speed/rigor tradeoff - added under real time pressure
-# (games starting soon, no time for a full 10-15+ game run). Quick mode
-# caps to the first few real games found and uses fewer simulations per
-# game - genuinely faster, but the tradeoff is real too: a 3-game sample
-# is nowhere near as statistically solid as a 10-15+ game one. This is
-# "get SOME real signal fast," not a replacement for the full run when
-# there's actually time for it.
-bt_quick_mode = st.checkbox(
-    "⚡ Quick mode - fewer games, fewer sims per game, much faster (less statistically solid)",
-    value=False, key="bt_quick_mode",
-)
-if bt_quick_mode:
-    bt_quick_max_games = st.slider("Max real games to backtest", 1, 10, 3, key="bt_quick_max_games")
-    bt_quick_n_sims = st.select_slider("Simulations per game side", options=[50, 100, 200, 300, 500],
-                                        value=100, key="bt_quick_n_sims")
-    st.caption(
-        f"Quick mode: will stop after {bt_quick_max_games} real game(s), "
-        f"{bt_quick_n_sims} simulations per side instead of 500. Real signal, "
-        f"just a much smaller, noisier real sample than a full run."
-    )
-
-BT_RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bt_accumulated_results.csv")
-
-if "bt_accumulated" not in st.session_state:
-    if os.path.exists(BT_RESULTS_FILE):
-        try:
-            st.session_state.bt_accumulated = pd.read_csv(BT_RESULTS_FILE)
-        except Exception:
-            st.session_state.bt_accumulated = pd.DataFrame()
-    else:
-        st.session_state.bt_accumulated = pd.DataFrame()
-
-st.caption(
-    "Results save to disk after every single game - if the app restarts mid-run "
-    "(this platform's free tier can do that under memory pressure on long runs), "
-    "just click Run again with the same dates and it'll pick up only the games "
-    "not already saved. A hung network call on any one game is also abandoned "
-    f"automatically after {BT_PER_GAME_TIMEOUT_SECONDS}s instead of freezing the "
-    "whole run."
-)
-
-if st.button("Run real backtest for every game in this range", key="bt_run_button"):
-    if not bt_start_date or not bt_end_date:
-        st.warning("Enter both a real start and end date.")
-    else:
-        try:
-            games_df = pull_historical_games_in_range(bt_start_date, bt_end_date)
-        except Exception as e:
-            games_df = None
-            st.error(f"Real error pulling the real schedule: {e}")
-
-        total_rows_this_run = 0
-        if games_df is None or games_df.empty:
-            st.warning("No real, completed games found in that range.")
-        else:
-            already_done_pks = set()
-            if not st.session_state.bt_accumulated.empty and "game_pk" in st.session_state.bt_accumulated.columns:
-                already_done_pks = set(st.session_state.bt_accumulated["game_pk"].dropna().astype(int).tolist())
-            games_to_run = games_df[~games_df["game_id"].astype(int).isin(already_done_pks)] if already_done_pks else games_df
-            skipped_count = len(games_df) - len(games_to_run)
-
-            # Real quick-mode cap - only take the first N games not already
-            # done, and use fewer simulations per side. Genuinely faster,
-            # genuinely noisier - see the checkbox's own caption above.
-            n_sims_to_use = 500
-            if bt_quick_mode:
-                games_to_run = games_to_run.head(bt_quick_max_games)
-                n_sims_to_use = bt_quick_n_sims
-
-            if games_to_run.empty:
-                st.info(f"All {len(games_df)} real games in this range are already saved from a prior run - "
-                        f"nothing new to process. Clear the accumulated data below if you want to re-run them.")
-            else:
-                if skipped_count:
-                    st.info(f"Skipping {skipped_count} real game(s) already saved from a prior run - "
-                            f"processing the remaining {len(games_to_run)}.")
-                progress = st.progress(0.0, text="Starting...")
-                timed_out_games = []
-                for i, (_, game) in enumerate(games_to_run.iterrows()):
-                    game_pk = game.get("game_id")
-                    game_date = str(game.get("game_date"))
-                    game_rows = []
-                    for hitting_side, pitching_side in [("home", "away"), ("away", "home")]:
-                        try:
-                            result, timed_out = _run_with_timeout(
-                                backtest_simulation_for_historical_game,
-                                (int(game_pk), game_date, hitting_side, pitching_side, n_sims_to_use),
-                                BT_PER_GAME_TIMEOUT_SECONDS,
-                            )
-                        except Exception:
-                            continue
-                        if timed_out:
-                            timed_out_games.append(f"{game_pk} ({hitting_side} lineup)")
-                            continue
-                        if result is None or "error" in result:
-                            continue
-                        game_rows.extend(backtest_comparison_rows(result))
-
-                    if game_rows:
-                        game_df = pd.DataFrame(game_rows)
-                        if st.session_state.bt_accumulated.empty:
-                            st.session_state.bt_accumulated = game_df
-                        else:
-                            st.session_state.bt_accumulated = pd.concat(
-                                [st.session_state.bt_accumulated, game_df], ignore_index=True)
-                        file_exists = os.path.exists(BT_RESULTS_FILE)
-                        game_df.to_csv(BT_RESULTS_FILE, mode="a", header=not file_exists, index=False)
-                        total_rows_this_run += len(game_rows)
-
-                    progress.progress((i + 1) / len(games_to_run),
-                                       text=f"Backtested {i+1}/{len(games_to_run)} real games "
-                                            f"({total_rows_this_run} real rows saved so far"
-                                            + (f", {len(timed_out_games)} timed out" if timed_out_games else "")
-                                            + ")...")
-                progress.empty()
-
-                if timed_out_games:
-                    st.warning(f"{len(timed_out_games)} real (game, side) pair(s) took longer than "
-                               f"{BT_PER_GAME_TIMEOUT_SECONDS}s and were skipped instead of freezing "
-                               f"the whole run: {', '.join(timed_out_games)}")
-
-                if total_rows_this_run == 0:
-                    st.warning("No real, comparable rows came back for the games processed this run.")
-                else:
-                    st.success(f"Added {total_rows_this_run} real comparison rows - "
-                               f"{len(st.session_state.bt_accumulated)} total accumulated so far "
-                               f"(saved to disk, survives an app restart).")
-
-if st.session_state.get("bt_accumulated") is not None and not st.session_state.bt_accumulated.empty:
-    acc = st.session_state.bt_accumulated
-    st.subheader("Real, accumulated evidence")
-    st.dataframe(acc, width='stretch')
-
-    # Real, honest bucketing - groups every real row by BOTH its side
-    # (hitter/pitcher) and its gap_pct range, and shows the REAL rate at
-    # which the actual outcome cleared the hypothetical line in each
-    # bucket. Real bug fix - this used to group by gap_bucket alone,
-    # mixing hitters and pitchers together, exactly the kind of mixing
-    # already caught and fixed for Stage 1's own z-score earlier - hitter
-    # props (fantasy, total_bases) and pitcher props (outs, earned runs)
-    # showed real, different gap behavior once actually compared
-    # side-by-side, so lumping them into one shared recommendation would
-    # have quietly hidden that real difference.
-    bins = [0, 5, 10, 15, 20, 30, 1000]
-    labels = ["0-5%", "5-10%", "10-15%", "15-20%", "20-30%", "30%+"]
-    acc_binned = acc.copy()
-    acc_binned["gap_bucket"] = pd.cut(acc_binned["gap_pct"], bins=bins, labels=labels, right=False)
-    # Real, new split by lean direction - per direct request. The old,
-    # pooled real_hit_rate blended real over-leaning and under-leaning
-    # results together, which quietly hid a real, important distinction:
-    # a hitter can keep batting all game against relievers after the
-    # starter's gone, so an under-lean is genuinely riskier to trust than
-    # an over-lean for hitters specifically - a pooled number can look
-    # weak even when a genuine, real over-specific edge exists (or
-    # doesn't), since unders were dragging the pooled average down.
-    group_cols = ["side", "lean", "gap_bucket"] if "lean" in acc_binned.columns else ["side", "gap_bucket"]
-    summary = acc_binned.groupby(group_cols, observed=True).agg(
-        n=("real_cleared_line", "size"),
-        real_hit_rate=("real_cleared_line", "mean"),
-    ).reset_index()
-    summary["real_hit_rate"] = round(summary["real_hit_rate"] * 100, 1)
-    st.subheader("Real hit-rate by gap-pct bucket, hitters/pitchers AND lean direction separated")
-    st.dataframe(summary, width='stretch')
-    st.caption("If real_hit_rate climbs meaningfully as the bucket rises, that's real, "
-               "direct evidence a bigger gap genuinely predicts a real outcome - and "
-               "roughly where it levels off is the real, evidence-based threshold, not "
-               "a guessed one. Needs a real, decent sample per bucket before trusting it - "
-               "a bucket with only 2-3 rows isn't enough yet. Split by lean now too - check "
-               "the OVER rows specifically if you only want to trust over plays; a pooled "
-               "over+under number can look weak even when a real, genuine over-specific "
-               "edge exists, since under results were dragging the blended average down.")
-
-    # Real, direct recommendation - now computed SEPARATELY for each real
-    # (side, lean) combination, not just side - per direct request, since
-    # a hitter's real over-specific edge and his real under-specific edge
-    # may need genuinely different thresholds, and blending them together
-    # was hiding a real over-specific signal under a weaker, pooled number.
-    MIN_SAMPLE_PER_BUCKET = 10
-    MEANINGFUL_HIT_RATE = 60.0
-    if "lean" in summary.columns:
-        combos = summary[["side", "lean"]].drop_duplicates().sort_values(["side", "lean"]).values.tolist()
-    else:
-        combos = [[s, None] for s in ["hitter", "pitcher"]]
-    for side_label, lean_label in combos:
-        if lean_label == "COIN FLIP":
-            continue  # real, genuine noise - never worth a recommendation
-        mask = summary["side"] == side_label
-        if lean_label is not None:
-            mask &= summary["lean"] == lean_label
-        side_summary = summary[mask]
-        reliable = side_summary[side_summary["n"] >= MIN_SAMPLE_PER_BUCKET]
-        label = f"{side_label.capitalize()}" + (f" ({lean_label})" if lean_label else "")
-        st.markdown(f"**{label} recommendation:**")
-        if reliable.empty:
-            st.info(f"Not enough real, accumulated {label} data yet - every bucket needs "
-                    f"at least {MIN_SAMPLE_PER_BUCKET} real rows. Run the backtest on a few more "
-                    f"real games.")
-        else:
-            qualifying = reliable[reliable["real_hit_rate"] >= MEANINGFUL_HIT_RATE]
-            if qualifying.empty:
-                st.warning(f"Real, accumulated {label} evidence so far doesn't show any "
-                           f"bucket clearing a real {MEANINGFUL_HIT_RATE}% hit-rate yet - the "
-                           f"current threshold may genuinely need to be higher than what's been "
-                           f"tested, or more real games are needed before this settles.")
-            else:
-                best_bucket = qualifying.iloc[0]
-                st.success(f"Based on {int(reliable['n'].sum())} accumulated real {label} rows, "
-                           f"the **{best_bucket['gap_bucket']}** gap range is the lowest one showing "
-                           f"a real, meaningful hit-rate ({best_bucket['real_hit_rate']}% across "
-                           f"{int(best_bucket['n'])} real rows) - real, direct evidence for where "
-                           f"the actual {label} gap-pct threshold should sit.")
-
-    if st.button("Clear accumulated backtest data", key="bt_clear_button"):
-        st.session_state.bt_accumulated = pd.DataFrame()
-        if os.path.exists(BT_RESULTS_FILE):
-            os.remove(BT_RESULTS_FILE)
-        st.rerun()
-
-
-
-
-
-
-
-st.divider()
-st.header("🔗 Combined Verdict — Sim Stage 1 vs Original Method")
-st.caption(
-    "Real, low-risk cross-reference - reads what BOTH sections above already "
-    "computed for the same real game, without touching either one's own "
-    "internal math. Run both sections above first for the same real game, "
-    "then check here for any hitter that shows up in both."
-)
-
-_stage1_survivors = st.session_state.get("stage1_survivors")
-_omm_results = st.session_state.get("omm_results")
-
-if _stage1_survivors is None or _stage1_survivors.empty:
-    st.info("Run the Full Matchup Simulation's Stage 1 above first (for this real game).")
-elif not _omm_results:
-    st.info("Run the Original Method Matcher above first (for this real game).")
-else:
-    # Real, direct cross-reference by player name - both sections show
-    # the same real game's players, so a name match is a genuine match,
-    # not a coincidence.
-    _sim_hitter_names = set(_stage1_survivors[_stage1_survivors["side"] == "hitter"]["player"])
-    combined_rows = []
-    for pitcher_name, data in _omm_results.items():
-        for match in data.get("real_matches", []):
-            hitter_name = match["hitter"]
-            sim_cleared = hitter_name in _sim_hitter_names
-            om_result = {"usable": True, "real_majority_match": True}  # already filtered to real_matches only
-            sim_result = {"cleared_stage1": sim_cleared}
-            blend = calc_doubly_confirmed_hitter_signal(sim_result, om_result)
-            combined_rows.append({
-                "hitter": hitter_name, "vs_pitcher": pitcher_name,
-                "sim_stage1_cleared": sim_cleared, "original_method_cleared": True,
-                "verdict": blend["verdict"],
-            })
-
-    if not combined_rows:
-        st.info("No real hitter cleared the Original Method bar yet for this game - nothing to cross-reference.")
-    else:
-        combined_df = pd.DataFrame(combined_rows)
-        doubly = combined_df[combined_df["verdict"].str.startswith("DOUBLY")]
-        if not doubly.empty:
-            st.success(f"{len(doubly)} real hitter(s) doubly confirmed by both signals:")
-            st.dataframe(doubly, width="stretch", hide_index=True)
-        st.dataframe(combined_df, width="stretch", hide_index=True)
-        
