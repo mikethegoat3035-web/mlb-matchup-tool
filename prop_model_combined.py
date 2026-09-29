@@ -4851,6 +4851,32 @@ PITCHER_PROP_SIGNATURE_CONFIG = {
 }
 PITCHER_PROP_SIGNATURE_CONFIG["pitcher_fantasy"] = None  # blended from the above, per the real scoring formula - no separate mechanism
 
+# REAL FIX (found via direct testing - these were only ever defined as
+# LOCAL variables inside scan_whole_slate_stage1, so any other real
+# caller, like the Full Matchup Simulation tab in streamlit_app.py,
+# couldn't actually reach them - a real NameError at runtime that
+# py_compile can't catch, since it only checks syntax, not whether a
+# name exists when the line actually executes). Moved to module level
+# so both real callers share the exact same real mapping.
+HITTER_PROP_TO_VULN_TYPE = {
+    "hits": "hits", "singles": "singles", "total_bases": "total_bases",
+    "home_runs": "home_runs", "strikeouts": "strikeouts", "walks": "walks",
+    "hits_runs_rbi": "hitter_hits_runs_rbi", "fantasy": "hitter_fantasy",
+    # PrizePicks' hitter fantasy scoring uses slightly different point
+    # weights than Underdog's (see HITTER_FANTASY_WEIGHTS_PRIZEPICKS -
+    # double=5 not 6, walk=2 not 3), but the underlying REAL SKILL that
+    # makes a matchup good for either one is identical (contact quality,
+    # power, RBI opportunity, discipline) - reuses the exact same real,
+    # already-proven "hitter_fantasy" blend rather than building a
+    # second, near-duplicate mechanism for a few cents of weight
+    # difference that doesn't change which metrics actually matter.
+    "fantasy_prizepicks": "hitter_fantasy",
+}
+PITCHER_PROP_TO_SIGNATURE_TYPE = {
+    "strikeouts": "strikeouts", "outs": "outs", "hits_allowed": "hits_allowed",
+    "earned_runs": "pitcher_earned_runs", "walks_allowed": "walks_allowed",
+}
+
 
 def identify_signature_pitch_for_prop(pitcher_arsenal: list, vs_hand: str, prop_type: str,
                                         min_usage_pct: float = 10.0) -> dict:
@@ -4874,14 +4900,28 @@ def identify_signature_pitch_for_prop(pitcher_arsenal: list, vs_hand: str, prop_
 def calc_prop_lineup_vulnerability(pitcher_arsenal: list, real_lineup: list,
                                      hitter_profiles_by_order_slot: dict,
                                      hitter_hand_by_order_slot: dict, prop_type: str,
-                                     min_pitch_usage_pct: float = 10.0) -> dict:
+                                     pitcher_hand: str, min_pitch_usage_pct: float = 10.0) -> dict:
     """
     Real, generalized version of calc_k_prop_lineup_vulnerability - same
     real architecture (identify the pitcher's real signature pitch for
-    THIS prop, per hand; check whether each real hitter is individually
-    vulnerable on it, using THIS prop's real, relevant hitter metrics;
-    weight by real expected plate appearances per batting-order slot),
-    reused across every pitcher prop rather than duplicated per prop.
+    THIS prop, per real batter-hand he's facing; check whether each real
+    hitter is individually vulnerable on it, using THIS prop's real,
+    relevant hitter metrics; weight by real expected plate appearances
+    per batting-order slot), reused across every pitcher prop rather
+    than duplicated per prop.
+
+    REAL BUG FIX (found via direct request, after a live run showed
+    metric_score empty for every real row) - hitter_hand_by_order_slot
+    is each hitter's OWN real batting stance (used correctly below to
+    find the pitcher's real signature pitch AGAINST that stance). But
+    checking whether a hitter is vulnerable requires his real stats
+    against tonight's REAL, ACTUAL OPPOSING PITCHER'S throwing hand -
+    a single, fixed value for the whole real lineup, since every hitter
+    faces the same real pitcher tonight - not his own batting stance,
+    which is a completely different thing. Confirmed live: comparing a
+    hitter's real vs-pitcher-hand stats against his own batting stance
+    (instead of the real pitcher's hand) meant that match almost never
+    succeeded, silently leaving every row ungraded.
     """
     if prop_type not in PITCHER_PROP_SIGNATURE_CONFIG or PITCHER_PROP_SIGNATURE_CONFIG[prop_type] is None:
         return {"usable": False, "reason": f"'{prop_type}' has no separate signature-pitch mechanism (blended prop)"}
@@ -4910,7 +4950,7 @@ def calc_prop_lineup_vulnerability(pitcher_arsenal: list, real_lineup: list,
         primary_pitch_type = primary["primary_pitch"].pitch_type
 
         h_match = next((h for h in hitter_profile
-                        if h.pitch_type == primary_pitch_type and h.vs_pitcher_hand == hand), None)
+                        if h.pitch_type == primary_pitch_type and h.vs_pitcher_hand == pitcher_hand), None)
         is_vulnerable = None
         if h_match is not None and h_match.n_pitches >= 20:
             is_vulnerable = config["hitter_vulnerable"](h_match)
@@ -4979,7 +5019,7 @@ def calc_doubly_confirmed_hitter_signal(sim_stage1_result: dict, original_method
 
 def calc_pitcher_fantasy_lineup_read(pitcher_arsenal: list, real_lineup: list,
                                        hitter_profiles_by_order_slot: dict,
-                                       hitter_hand_by_order_slot: dict,
+                                       hitter_hand_by_order_slot: dict, pitcher_hand: str,
                                        min_pitch_usage_pct: float = 10.0,
                                        outs_pts: float = 1.0, k_pts: float = 3.0,
                                        er_pts: float = -3.0) -> dict:
@@ -5007,11 +5047,11 @@ def calc_pitcher_fantasy_lineup_read(pitcher_arsenal: list, real_lineup: list,
     is favorable for him).
     """
     outs_read = calc_prop_lineup_vulnerability(pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
-                                                 hitter_hand_by_order_slot, "outs", min_pitch_usage_pct)
+                                                 hitter_hand_by_order_slot, "outs", pitcher_hand, min_pitch_usage_pct)
     k_read = calc_prop_lineup_vulnerability(pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
-                                              hitter_hand_by_order_slot, "strikeouts", min_pitch_usage_pct)
+                                              hitter_hand_by_order_slot, "strikeouts", pitcher_hand, min_pitch_usage_pct)
     er_read = calc_prop_lineup_vulnerability(pitcher_arsenal, real_lineup, hitter_profiles_by_order_slot,
-                                               hitter_hand_by_order_slot, "pitcher_earned_runs", min_pitch_usage_pct)
+                                               hitter_hand_by_order_slot, "pitcher_earned_runs", pitcher_hand, min_pitch_usage_pct)
 
     if not (outs_read.get("usable") and k_read.get("usable") and er_read.get("usable")):
         return {"usable": False, "reason": "one or more real component reads unavailable",
@@ -11843,7 +11883,7 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                 "crosswalks": lineup_crosswalks, "starter_avg_outs": starter_avg_outs,
                 "pitcher_name": opposing_pitcher["name"], "pitcher_arsenal": pitcher_arsenal,
                 "real_lineup": real_lineup, "hitter_profiles_by_order_slot": hitter_profiles_by_order_slot,
-                "hitter_hand_by_order_slot": hitter_hand_by_order_slot,
+                "hitter_hand_by_order_slot": hitter_hand_by_order_slot, "pitcher_hand": pitcher_hand,
             }
 
         if skip_game or "home" not in side_data or "away" not in side_data:
@@ -11878,26 +11918,10 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
         # score) already used elsewhere in this file for exactly this,
         # computed ONCE per pitcher/hitter here (not once per row - a
         # real, meaningful cost saving, since the underlying metrics
-        # don't change across a player's different props).
-        HITTER_PROP_TO_VULN_TYPE = {
-            "hits": "hits", "singles": "singles", "total_bases": "total_bases",
-            "home_runs": "home_runs", "strikeouts": "strikeouts", "walks": "walks",
-            "hits_runs_rbi": "hitter_hits_runs_rbi", "fantasy": "hitter_fantasy",
-            # REAL FIX (per direct request) - PrizePicks' hitter fantasy
-            # scoring uses slightly different point weights than Underdog's
-            # (see HITTER_FANTASY_WEIGHTS_PRIZEPICKS - double=5 not 6, walk=2
-            # not 3), but the underlying REAL SKILL that makes a matchup good
-            # for either one is identical (contact quality, power, RBI
-            # opportunity, discipline) - reuses the exact same real,
-            # already-proven "hitter_fantasy" blend rather than building a
-            # second, near-duplicate mechanism for a few cents of weight
-            # difference that doesn't change which metrics actually matter.
-            "fantasy_prizepicks": "hitter_fantasy",
-        }
-        PITCHER_PROP_TO_SIGNATURE_TYPE = {
-            "strikeouts": "strikeouts", "outs": "outs", "hits_allowed": "hits_allowed",
-            "earned_runs": "pitcher_earned_runs", "walks_allowed": "walks_allowed",
-        }
+        # don't change across a player's different props). Both mapping
+        # dicts now live at module level (see near PITCHER_PROP_
+        # SIGNATURE_CONFIG above) so this function and any other real
+        # caller share the exact same real mapping.
 
         for hitting_side, hitters_key, starter_key in [("home", "home_hitters", "away_starter"),
                                                           ("away", "away_hitters", "home_starter")]:
@@ -11919,8 +11943,12 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                         if cache_key not in hitter_vuln_cache:
                             try:
                                 hitter_vuln_cache[cache_key] = hitter_prop_vulnerability_score(crosswalk, vuln_type)
-                            except Exception:
-                                hitter_vuln_cache[cache_key] = {"score": None}
+                            except Exception as e:
+                                # REAL FIX (same diagnostic visibility fix
+                                # as the pitcher side) - the real
+                                # exception reason was being silently
+                                # discarded entirely.
+                                hitter_vuln_cache[cache_key] = {"score": None, "label": f"NOT GRADED - {e}"}
                         vuln = hitter_vuln_cache[cache_key]
                         # REAL BUG FIX (found via direct testing) -
                         # hitter_prop_vulnerability_score's real sign
@@ -11938,6 +11966,12 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                         raw_score = vuln.get("score")
                         row["metric_score"] = -raw_score if raw_score is not None else None
                         row["metric_note"] = vuln.get("label")
+                    elif vuln_type and crosswalk is None:
+                        # REAL FIX (found via direct request, real gap) -
+                        # previously left row with NO metric_score AND no
+                        # explanation at all when the crosswalk itself
+                        # was missing - now says so directly.
+                        row["metric_note"] = "NOT GRADED - no real crosswalk found for this hitter"
                     hitter_rows.append(row)
 
             # REAL FIX (same confirmed bug) - the pitcher who faced this
@@ -11975,7 +12009,8 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                             side_data[hitting_side]["real_lineup"],
                             side_data[hitting_side]["hitter_profiles_by_order_slot"],
                             side_data[hitting_side]["hitter_hand_by_order_slot"],
-                            fantasy_component)
+                            fantasy_component,
+                            side_data[hitting_side]["pitcher_hand"])
                     except Exception as e:
                         pitcher_vuln_cache[fantasy_component] = {"usable": False, "reason": str(e)}
             _k_v = pitcher_vuln_cache["strikeouts"]
@@ -11992,7 +12027,12 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                     f"pitch drives them).")
             else:
                 fantasy_blend_score = None
-                fantasy_blend_note = None
+                # REAL FIX (same diagnostic visibility fix as above) -
+                # surfaces WHICH of the 3 real components actually failed,
+                # rather than a silent, unexplained blank.
+                fails = [f"{name}: {v.get('reason', 'unknown')}" for name, v in
+                        [("strikeouts", _k_v), ("outs", _o_v), ("earned_runs", _er_v)] if not v.get("usable")]
+                fantasy_blend_note = "NOT GRADED - " + "; ".join(fails)
 
             for prop, series in sim_results.get(starter_key, {}).items():
                 if not series:
@@ -12016,13 +12056,22 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                                 side_data[hitting_side]["real_lineup"],
                                 side_data[hitting_side]["hitter_profiles_by_order_slot"],
                                 side_data[hitting_side]["hitter_hand_by_order_slot"],
-                                sig_type)
+                                sig_type,
+                                side_data[hitting_side]["pitcher_hand"])
                         except Exception as e:
                             pitcher_vuln_cache[sig_type] = {"usable": False, "reason": str(e)}
                     vuln = pitcher_vuln_cache[sig_type]
                     if vuln.get("usable"):
                         row["metric_score"] = vuln["weighted_vulnerable_share"]
                         row["metric_note"] = vuln["read"]
+                    else:
+                        # REAL FIX (found via direct request, after a real
+                        # live run showed metric_score empty for every
+                        # single row) - the failure reason was being
+                        # silently swallowed, with no way to actually
+                        # diagnose why. Surfaced directly so the real
+                        # cause is visible instead of guessed at blind.
+                        row["metric_note"] = f"NOT GRADED - {vuln.get('reason', 'unknown reason')}"
                 pitcher_rows.append(row)
 
 
