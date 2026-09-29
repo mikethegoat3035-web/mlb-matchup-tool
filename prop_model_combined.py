@@ -2721,7 +2721,20 @@ def build_hitter_profile(pitches: pd.DataFrame, min_pitches: int = 20,
             z_swing_pct=round((swings & in_zone).sum() / max(in_zone.sum(), 1) * 100, 1),
             contact_pct=round(contact.sum() / swings_n * 100, 1),
             z_contact_pct=round((contact & in_zone).sum() / z_swings_n * 100, 1),
-            whiff_pct=round(whiffs.mean() * 100, 1),
+            # REAL BUG FIX (found via direct request, confirmed via a real
+            # hitter's data - Kyle Schwarber, a genuine ~25-31% real career
+            # strikeout hitter, showed a 7-16% "whiff_pct" here, which is
+            # only plausible if this were computed per PITCH SEEN rather
+            # than per SWING). whiffs.mean() divides by every real pitch in
+            # the group - most of which are real TAKES, not swings - so this
+            # was always understating a real, standard "Whiff%" number by
+            # roughly half, for every hitter, not just this one. The correct,
+            # standard definition (and the one LEAGUE_AVG_HITTER_WHIFF = 24.0
+            # a few lines away was already fixed to assume, per its own
+            # comment) is whiffs per real SWING - matching the same "whiffs /
+            # swings_n" denominator already used correctly for z_whiff_pct
+            # and chase_whiff_pct right below this.
+            whiff_pct=round(whiffs.sum() / swings_n * 100, 1),
             z_whiff_pct=round((whiffs & in_zone).sum() / z_swings_n * 100, 1),
             chase_whiff_pct=round((whiffs & ~in_zone).sum() / oz_swings_n * 100, 1),
             ba=round(ba, 3) if pd.notna(ba) else float("nan"),
