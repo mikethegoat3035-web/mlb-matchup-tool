@@ -272,14 +272,110 @@ st.caption(
 
 whole_slate_n_sims = st.number_input("Simulations per matchup", min_value=100, max_value=1000,
                                        value=500, step=100, key="whole_slate_n_sims")
-ws_col1, ws_col2, ws_col3, ws_col4 = st.columns(4)
+
+# REAL FIX (per direct request, a genuine change to how a matchup is judged,
+# not just a UI tweak) - grading now comes from the REAL, underlying pitch-
+# by-pitch metrics that already drive the simulation (his real signature
+# pitch for this exact prop, checked against whether tonight's specific
+# real opposing hitters are individually vulnerable to it - see
+# calc_prop_lineup_vulnerability / hitter_prop_vulnerability_score, both
+# already proven, existing functions used elsewhere in this file, now
+# wired into this whole-slate loop too), NOT by checking the simulation's
+# final output number against any line - a fixed one I'd invented, or a
+# live sportsbook one. A real playoff line can run high or low depending
+# on who's pitching; the real metrics behind the matchup don't move just
+# because a line does, so that's what decides Elite/Poor here, never a line.
+#
+# real_avg (from scan_whole_slate_stage1) is still shown alongside this as
+# real, informational context - it is NOT what decides the grade anymore.
+#
+# metric_score's scale differs by side, since the two real, underlying
+# functions measure genuinely different things:
+#   - Pitcher props (strikeouts/outs/hits_allowed/earned_runs/walks_allowed):
+#     calc_prop_lineup_vulnerability's real, PA-weighted share (0-1) of
+#     tonight's actual lineup that is individually vulnerable to his real
+#     signature pitch for that exact prop.
+#   - Hitter props (hits/singles/total_bases/home_runs/strikeouts/walks/
+#     hits_runs_rbi/fantasy): hitter_prop_vulnerability_score's real,
+#     roughly -3..+3 read of how heavily the pitcher's actual usage leans
+#     into this hitter's real weak spot for that exact prop.
+# Some props (doubles, triples, runs, fantasy_prizepicks on the hitter
+# side; quality_start, win, batters_faced, pitches_thrown, strikes_thrown,
+# pitcher_fantasy/pitcher_fantasy_prizepicks on the pitcher side) have no
+# real, existing signature-metric mechanism built for them yet - those
+# rows show real_avg/cv only, honestly ungraded, rather than force a
+# guess.
+PITCHER_METRIC_TIERS = [(0.50, "Elite"), (0.30, "Strong"), (0.15, "Average")]  # else Poor
+HITTER_METRIC_TIERS = [(1.5, "Elite"), (0.5, "Strong"), (-0.5, "Average")]     # else Poor
+TIER_ORDER = {"Poor": 0, "Average": 1, "Strong": 2, "Elite": 3}
+
+
+def _metric_tier(score, is_pitcher):
+    # REAL BUG FIX (found via direct testing) - a row with no real metric
+    # mechanism has metric_score as NaN (pandas' missing-value marker) once
+    # it's sitting in a DataFrame alongside graded rows, not Python's None -
+    # `pd.isna(nan)` is True but `nan is None` is False, so the original
+    # `is None` check silently fell through every real cutoff below (since
+    # `nan >= x` is always False) and mis-labeled every genuinely ungraded
+    # row "Poor" - a real, misleading judgment where none should exist.
+    if pd.isna(score):
+        return None
+    for cutoff, label in (PITCHER_METRIC_TIERS if is_pitcher else HITTER_METRIC_TIERS):
+        if score >= cutoff:
+            return label
+    return "Poor"
+
+
+WHOLE_SLATE_HITTER_PROPS_WANTED = {"singles", "home_runs", "hits_runs_rbi", "fantasy", "fantasy_prizepicks"}
+WHOLE_SLATE_PITCHER_PROPS_WANTED = {"strikeouts", "outs", "hits_allowed", "walks_allowed",
+                                     "earned_runs", "pitcher_fantasy", "pitcher_fantasy_prizepicks"}
+
+
+def _render_whole_slate_table(df: pd.DataFrame, max_cv: float, min_tier: str, label: str, is_pitcher: bool):
+    """Grades every real row by its real, underlying-metric matchup score, then filters by that tier + CV."""
+    df = df.copy()
+    # REAL FIX (per direct request) - narrowed to exactly the real props
+    # asked for, dropping everything else from this specific display:
+    # hitter singles/home_runs/hits_runs_rbi/fantasy(Underdog)/
+    # fantasy_prizepicks(PrizePicks), and all 7 real pitcher props
+    # (strikeouts/outs/hits_allowed/walks_allowed/earned_runs/
+    # pitcher_fantasy/pitcher_fantasy_prizepicks). This is a display
+    # filter only - scan_whole_slate_stage1 itself still computes every
+    # real prop and every real metric_score exactly as before.
+    wanted_props = (WHOLE_SLATE_PITCHER_PROPS_WANTED if is_pitcher else WHOLE_SLATE_HITTER_PROPS_WANTED)
+    df = df[df["prop"].isin(wanted_props)]
+    if df.empty:
+        st.subheader(f"{label} - 0 real rows")
+        return
+    if "metric_score" not in df.columns:
+        df["metric_score"] = None
+    df["tier"] = df["metric_score"].apply(lambda s: _metric_tier(s, is_pitcher))
+    min_rank = TIER_ORDER[min_tier]
+    graded_rows = df[df["tier"].notna()]
+    survivors = graded_rows[(graded_rows["tier"].map(TIER_ORDER) >= min_rank) & (graded_rows["cv"] <= max_cv)]
+    show_cols = [c for c in df.columns if c != "series"]
+    st.subheader(f"{label} - {len(survivors)} of {len(df)} real rows are {min_tier}+ on their real, "
+                 f"underlying-metric matchup score (not a line)")
+    ungraded = sorted(df.loc[df["tier"].isna(), "prop"].unique().tolist())
+    if ungraded:
+        st.caption(f"No real, underlying-metric mechanism built yet for: {', '.join(ungraded)} - those "
+                   f"rows show real_avg only, honestly ungraded, rather than a forced guess.")
+    st.dataframe(survivors[show_cols].sort_values("metric_score", ascending=False), width='stretch', hide_index=True)
+    with st.expander(f"See every real {label.lower()} row and its real tier, including ones below {min_tier}"):
+        st.dataframe(df[show_cols].sort_values("metric_score", ascending=False), width='stretch', hide_index=True)
+
+
+ws_col1, ws_col2, ws_col3 = st.columns(3)
 with ws_col1:
-    ws_pitcher_min_z = st.slider("Pitcher min z-score", 0.0, 2.0, 0.5, step=0.1, key="ws_pitcher_min_z")
+    ws_min_tier = st.select_slider("Minimum real matchup tier to show", options=["Poor", "Average", "Strong", "Elite"],
+                                   value="Strong", key="ws_min_tier",
+                                   help="Graded from the real, underlying pitch-by-pitch metrics behind the "
+                                        "matchup (his real signature pitch for this prop vs tonight's real, "
+                                        "specific opposing hitters) - never from a betting line, fixed or live.")
 with ws_col2:
-    ws_pitcher_max_cv = st.slider("Pitcher max CV", 0.1, 1.5, 1.05, step=0.05, key="ws_pitcher_max_cv")
+    ws_pitcher_max_cv = st.slider("Pitcher max CV", 0.1, 1.5, 1.05, step=0.05, key="ws_pitcher_max_cv",
+                                  help="How much the simulation's OWN outcomes varied for this real matchup.")
 with ws_col3:
-    ws_hitter_min_z = st.slider("Hitter min z-score", 0.0, 2.0, 0.3, step=0.1, key="ws_hitter_min_z")
-with ws_col4:
     ws_hitter_max_cv = st.slider("Hitter max CV", 0.1, 2.0, 1.2, step=0.05, key="ws_hitter_max_cv")
 
 if st.button("Scan the whole real slate now", key="whole_slate_scan_btn"):
@@ -302,68 +398,12 @@ if st.button("Scan the whole real slate now", key="whole_slate_scan_btn"):
                 for s in whole_slate_result["games_skipped"]:
                     st.write(s)
 
-ws_min_reliable_field = st.slider(
-    "Minimum field size for the z-score cutoff to apply", 10, 100, 40, step=5,
-    key="ws_min_reliable_field",
-    help="On a small slate (playoffs, a few games), comparing a player only to the handful of "
-         "others scanned that same run makes the z-score noisy - it can miss a real standout "
-         "just because too few players are in the comparison group. Below this many real rows "
-         "for a given prop, the z-score filter is skipped for that prop and every real row is "
-         "shown instead, ranked, so you can judge it yourself rather than have an unreliable "
-         "number silently hide it.")
-
-
-def _render_whole_slate_table(df: pd.DataFrame, min_z: float, max_cv: float, label: str, min_field: int):
-    """
-    Shared real logic for both the pitcher and hitter whole-slate tables.
-    REAL FIX (found via direct request after a playoff slate returned zero
-    survivors) - the z-score here is only ever relative to the OTHER real
-    rows scanned in this same run (grouped by prop), never against a fixed
-    outside baseline. That comparison group shrinks hard on a small slate
-    (a handful of games instead of a full ~15-game day), so the mean/std
-    behind the z-score gets genuinely unstable - it can fail to flag a real
-    standout purely because too few players are in the field, not because
-    the matchup itself is weak. Below min_field real rows for a given prop,
-    this now skips the z/cv filter for that prop entirely and shows every
-    real row instead, ranked by z-score, with a visible flag - so a small
-    slate is judged by eye against real numbers instead of being silently
-    emptied by a filter that was never reliable at that size to begin with.
-    """
-    df = df.copy()
-    field_mean = df.groupby("prop")["real_avg"].transform("mean")
-    field_std = df.groupby("prop")["real_avg"].transform("std").fillna(0.01)
-    df["zscore"] = ((df["real_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
-    df["field_n"] = df.groupby("prop")["real_avg"].transform("count")
-
-    small_field_props = sorted(df.loc[df["field_n"] < min_field, "prop"].unique().tolist())
-    reliable = df[df["field_n"] >= min_field]
-    unreliable = df[df["field_n"] < min_field]
-
-    survivors = reliable[(reliable["zscore"] >= min_z) & (reliable["cv"] <= max_cv)]
-    survivors = pd.concat([survivors, unreliable], ignore_index=True) if not unreliable.empty else survivors
-
-    st.subheader(f"{label} - {len(survivors)} of {len(df)} real rows shown "
-                 f"(z>={min_z}, cv<={max_cv} where the field is large enough; "
-                 f"every row shown, unfiltered, where it isn't)")
-    if small_field_props:
-        st.warning(
-            f"Real field too small for a reliable z-score cutoff on: {', '.join(small_field_props)} "
-            f"(fewer than {min_field} real rows scanned tonight for that prop). Every real row for "
-            f"those props is included above regardless of z-score - judge them by the real_avg "
-            f"column yourself rather than trust the cutoff here."
-        )
-    st.dataframe(survivors.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
-    with st.expander(f"See every real {label.lower()} row, including ones the filter would drop"):
-        st.dataframe(df.sort_values("zscore", ascending=False), width='stretch', hide_index=True)
-
-
 if st.session_state.get("whole_slate_pitchers_df") is not None and not st.session_state.whole_slate_pitchers_df.empty:
-    _render_whole_slate_table(st.session_state.whole_slate_pitchers_df, ws_pitcher_min_z, ws_pitcher_max_cv,
-                              "Pitchers", ws_min_reliable_field)
+    _render_whole_slate_table(st.session_state.whole_slate_pitchers_df, ws_pitcher_max_cv, ws_min_tier, "Pitchers", is_pitcher=True)
 
 if st.session_state.get("whole_slate_hitters_df") is not None and not st.session_state.whole_slate_hitters_df.empty:
-    _render_whole_slate_table(st.session_state.whole_slate_hitters_df, ws_hitter_min_z, ws_hitter_max_cv,
-                              "Hitters", ws_min_reliable_field)
+    _render_whole_slate_table(st.session_state.whole_slate_hitters_df, ws_hitter_max_cv, ws_min_tier, "Hitters", is_pitcher=False)
+
 
 
 st.header("🎯 Original Method Matcher")
