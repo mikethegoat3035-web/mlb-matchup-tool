@@ -1597,6 +1597,12 @@ TIER_BENCHMARKS = {
     "hardhit_pct":       {"elite": 50.0,  "poor": 30.0,  "direction": "high"},  # hitter's OWN contact quality — high is good
     "slg":               {"elite": 0.480, "poor": 0.370, "direction": "high"},
     "xwoba":             {"elite": 0.370, "poor": 0.290, "direction": "high"},
+    # REAL FIX (per direct request, confirmed gap) - woba (his REAL, actual
+    # outcome-based production) was ungraded even though xwoba (its EXPECTED
+    # counterpart, same real scale) already was - same real benchmark numbers,
+    # since woba and xwoba sit on the identical real scale, just one reflects
+    # what actually happened and the other what should have, given contact quality.
+    "woba":              {"elite": 0.370, "poor": 0.290, "direction": "high"},
     "xwobacon":          {"elite": 0.430, "poor": 0.340, "direction": "high"},  # hitter's own contact-only quality - matches the real benchmark established for tonight's side-system, distinct from xwobacon_against (pitcher-allowed) below
     "whiff_pct":         {"elite": 15.0,  "poor": 8.0,   "direction": "high"},  # pitcher SwStr%
     "chase_whiff_pct":   {"elite": 45.0,  "poor": 28.0,  "direction": "high"},
@@ -1632,6 +1638,12 @@ TIER_BENCHMARKS = {
     "iso":               {"elite": 0.200, "poor": 0.120, "direction": "high"},  # isolated power - real, standard MLB-wide thresholds
     "ba":                {"elite": 0.280, "poor": 0.230, "direction": "high"},
     "avg_exit_velo":     {"elite": 91.0,  "poor": 86.0,  "direction": "high"},  # real, standard Statcast EV benchmarks (mph)
+    # REAL FIX (per direct request, confirmed gap) - avg_exit_velo_allowed
+    # (the pitcher's OWN real allowed exit velo) was ungraded even though the
+    # hitter's own avg_exit_velo (identical real scale) already was. Same
+    # real mph benchmark numbers, direction flipped - LOW is good for a
+    # pitcher (weaker real contact allowed), same as xwobacon_against below.
+    "avg_exit_velo_allowed": {"elite": 86.0, "poor": 91.0, "direction": "low"},
     "z_contact_pct":     {"elite": 90.0,  "poor": 80.0,  "direction": "high"},  # hitter's OWN in-zone contact ability - opposite direction from the pitcher-side z_contact_pct_against entry above (same underlying stat, different side of the matchup)
     "contact_pct":       {"elite": 82.0,  "poor": 72.0,  "direction": "high"},
 }
@@ -1683,7 +1695,12 @@ def crucial_hitter_metrics(hitter_recent: list, pitcher_hand: str, usage_thresho
            # entries orphaned).
            "xwobacon": wavg("xwobacon"), "barrel_pct": wavg("barrel_pct"),
            "iso": wavg("iso"), "ba": wavg("ba"), "avg_exit_velo": wavg("avg_exit_velo"),
-           "z_contact_pct": wavg("z_contact_pct"), "contact_pct": wavg("contact_pct")}
+           "z_contact_pct": wavg("z_contact_pct"), "contact_pct": wavg("contact_pct"),
+           # REAL FIX (found via direct request tonight - same confirmed
+           # gap pattern as above) - woba was just added to TIER_BENCHMARKS
+           # but was still missing from this function's actual graded
+           # output, leaving that new entry orphaned too.
+           "woba": wavg("woba")}
 
     graded = {}
     for k, v in raw.items():
@@ -1735,7 +1752,12 @@ def crucial_pitcher_metrics(pitcher_recent: list, usage_threshold: float = 15.0)
                # it) - wavg() pulls the real attribute, the dict key
                # below matches it to its real TIER_BENCHMARKS entry.
                "chase_pct_induced": wavg("chase_pct"),
-               "z_contact_pct_against": wavg("z_contact_pct")}
+               "z_contact_pct_against": wavg("z_contact_pct"),
+               # REAL FIX (found via direct request tonight - same confirmed
+               # gap pattern as above) - avg_exit_velo_allowed was just
+               # added to TIER_BENCHMARKS but was still missing from this
+               # function's actual graded output, leaving it orphaned too.
+               "avg_exit_velo_allowed": wavg("avg_exit_velo_allowed")}
 
         graded = {}
         for k, v in raw.items():
@@ -11790,6 +11812,17 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                 break
 
             lineup_crosswalks = {}
+            # REAL FIX (per direct request - grading should come from the
+            # underlying, real pitch-by-pitch metrics that already drive
+            # the simulation, not from a flat number checked against the
+            # simulation's final output). These two, plus lineup_crosswalks
+            # already built below, are exactly what the existing, proven
+            # calc_prop_lineup_vulnerability() / hitter_prop_vulnerability_
+            # score() functions need - real infrastructure already built
+            # and used elsewhere in this file, just never wired into this
+            # specific whole-slate loop before now.
+            hitter_profiles_by_order_slot = {}
+            hitter_hand_by_order_slot = {}
             for hitter in real_lineup:
                 try:
                     h_pitches = pull_batter_pitches(hitter["player_id"], season_start, today_str)
@@ -11798,6 +11831,8 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
                     h_profile = build_hitter_profile(h_pitches, batter_hand=batter_hand)
                     crosswalk = build_pitch_crosswalk(pitcher_arsenal, h_profile, batter_hand, pitcher_hand)
                     lineup_crosswalks[hitter["name"]] = crosswalk
+                    hitter_profiles_by_order_slot[hitter.get("order_slot")] = h_profile
+                    hitter_hand_by_order_slot[hitter.get("order_slot")] = batter_hand
                 except Exception:
                     continue
             if not lineup_crosswalks:
@@ -11806,7 +11841,9 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
 
             side_data[hitting_side] = {
                 "crosswalks": lineup_crosswalks, "starter_avg_outs": starter_avg_outs,
-                "pitcher_name": opposing_pitcher["name"],
+                "pitcher_name": opposing_pitcher["name"], "pitcher_arsenal": pitcher_arsenal,
+                "real_lineup": real_lineup, "hitter_profiles_by_order_slot": hitter_profiles_by_order_slot,
+                "hitter_hand_by_order_slot": hitter_hand_by_order_slot,
             }
 
         if skip_game or "home" not in side_data or "away" not in side_data:
@@ -11830,18 +11867,78 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
             games_skipped.append(f"{g.get('away_name','?')} @ {g.get('home_name','?')} - connected sim failed: {e}")
             continue
 
+        # REAL FIX (per direct request) - "is this matchup good" should
+        # come from the real, underlying pitch-by-pitch metrics that
+        # already drive the simulation (his real signature pitch for this
+        # exact prop, checked against whether tonight's real, specific
+        # opposing hitters are individually vulnerable to it) - not from
+        # checking the simulation's final output number against a flat,
+        # invented line. Uses the SAME real, already-proven functions
+        # (calc_prop_lineup_vulnerability / hitter_prop_vulnerability_
+        # score) already used elsewhere in this file for exactly this,
+        # computed ONCE per pitcher/hitter here (not once per row - a
+        # real, meaningful cost saving, since the underlying metrics
+        # don't change across a player's different props).
+        HITTER_PROP_TO_VULN_TYPE = {
+            "hits": "hits", "singles": "singles", "total_bases": "total_bases",
+            "home_runs": "home_runs", "strikeouts": "strikeouts", "walks": "walks",
+            "hits_runs_rbi": "hitter_hits_runs_rbi", "fantasy": "hitter_fantasy",
+            # REAL FIX (per direct request) - PrizePicks' hitter fantasy
+            # scoring uses slightly different point weights than Underdog's
+            # (see HITTER_FANTASY_WEIGHTS_PRIZEPICKS - double=5 not 6, walk=2
+            # not 3), but the underlying REAL SKILL that makes a matchup good
+            # for either one is identical (contact quality, power, RBI
+            # opportunity, discipline) - reuses the exact same real,
+            # already-proven "hitter_fantasy" blend rather than building a
+            # second, near-duplicate mechanism for a few cents of weight
+            # difference that doesn't change which metrics actually matter.
+            "fantasy_prizepicks": "hitter_fantasy",
+        }
+        PITCHER_PROP_TO_SIGNATURE_TYPE = {
+            "strikeouts": "strikeouts", "outs": "outs", "hits_allowed": "hits_allowed",
+            "earned_runs": "pitcher_earned_runs", "walks_allowed": "walks_allowed",
+        }
+
         for hitting_side, hitters_key, starter_key in [("home", "home_hitters", "away_starter"),
                                                           ("away", "away_hitters", "home_starter")]:
             team_label = g.get(f"{hitting_side}_name", "?")
+            hitter_vuln_cache = {}
             for hitter_name, props_dict in sim_results.get(hitters_key, {}).items():
+                crosswalk = side_data[hitting_side]["crosswalks"].get(hitter_name)
                 for prop, series in props_dict.items():
                     if prop in _EXCLUDED_HITTER_PROPS or not series:
                         continue
                     avg = sum(series) / len(series)
                     std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
                     cv = round(std / avg, 3) if avg else None
-                    hitter_rows.append({"player": hitter_name, "team": team_label, "prop": prop,
-                                          "real_avg": round(avg, 2), "cv": cv})
+                    row = {"player": hitter_name, "team": team_label, "prop": prop,
+                          "real_avg": round(avg, 2), "cv": cv, "series": list(series)}
+                    vuln_type = HITTER_PROP_TO_VULN_TYPE.get(prop)
+                    if vuln_type and crosswalk is not None:
+                        cache_key = (hitter_name, vuln_type)
+                        if cache_key not in hitter_vuln_cache:
+                            try:
+                                hitter_vuln_cache[cache_key] = hitter_prop_vulnerability_score(crosswalk, vuln_type)
+                            except Exception:
+                                hitter_vuln_cache[cache_key] = {"score": None}
+                        vuln = hitter_vuln_cache[cache_key]
+                        # REAL BUG FIX (found via direct testing) -
+                        # hitter_prop_vulnerability_score's real sign
+                        # convention is NEGATIVE = good for the hitter
+                        # (it's framed as "the PITCHER's real usage leans
+                        # toward the hitter's strength" - confirmed with a
+                        # direct test: a genuinely strong hitter matchup
+                        # scored -11.38, a genuinely weak one scored
+                        # +13.36). The pitcher side's weighted_vulnerable_
+                        # share is already HIGH=good, so negating here
+                        # makes "high metric_score = good for this row's
+                        # own prop" consistent on both sides - without
+                        # this, a genuinely elite hitter matchup would
+                        # have shown up graded as Poor.
+                        raw_score = vuln.get("score")
+                        row["metric_score"] = -raw_score if raw_score is not None else None
+                        row["metric_note"] = vuln.get("label")
+                    hitter_rows.append(row)
 
             # REAL FIX (same confirmed bug) - the pitcher who faced this
             # hitting_side's lineup is exactly the one whose info is
@@ -11851,14 +11948,83 @@ def scan_whole_slate_stage1(season_start: str, n_simulations: int = 500) -> dict
             pitching_side = "away" if hitting_side == "home" else "home"
             pitcher_team_label = g.get(f"{pitching_side}_name", "?")
             pitcher_name = side_data[hitting_side]["pitcher_name"]
+            pitcher_vuln_cache = {}
+            # REAL FIX (per direct request) - pitcher_fantasy/pitcher_
+            # fantasy_prizepicks were left with "no separate mechanism"
+            # (see PITCHER_PROP_SIGNATURE_CONFIG's own comment on this),
+            # but a real, direct blend of the 3 components that actually
+            # exist here is straightforward: fantasy = outs*1 + K*3 - ER*3
+            # (+win*5 + QS*5, which have no real per-pitch mechanism -
+            # they're whole-game outcomes, not tied to one specific pitch -
+            # so this blend is necessarily partial, using only the 3 real
+            # components that DO have one). Computed upfront, once per
+            # pitcher, regardless of which prop happens to iterate first
+            # below. ER's real share gets INVERTED (1 - share) since a HIGH
+            # earned_runs vulnerability share means hitters are vulnerable
+            # to his weakest pitch's power-damage potential - genuinely BAD
+            # for him, and bad for fantasy (the -3 weight), the opposite
+            # direction from strikeouts/outs' shares. Same real blended
+            # score used for both platforms, since the exact win/QS point
+            # difference between them doesn't change which of his pitches
+            # or which of tonight's real hitters actually matter here.
+            for fantasy_component in ("strikeouts", "outs", "pitcher_earned_runs"):
+                if fantasy_component not in pitcher_vuln_cache:
+                    try:
+                        pitcher_vuln_cache[fantasy_component] = calc_prop_lineup_vulnerability(
+                            side_data[hitting_side]["pitcher_arsenal"],
+                            side_data[hitting_side]["real_lineup"],
+                            side_data[hitting_side]["hitter_profiles_by_order_slot"],
+                            side_data[hitting_side]["hitter_hand_by_order_slot"],
+                            fantasy_component)
+                    except Exception as e:
+                        pitcher_vuln_cache[fantasy_component] = {"usable": False, "reason": str(e)}
+            _k_v = pitcher_vuln_cache["strikeouts"]
+            _o_v = pitcher_vuln_cache["outs"]
+            _er_v = pitcher_vuln_cache["pitcher_earned_runs"]
+            if _k_v.get("usable") and _o_v.get("usable") and _er_v.get("usable"):
+                fantasy_blend_score = round(
+                    (_k_v["weighted_vulnerable_share"] * 3 + _o_v["weighted_vulnerable_share"] * 1
+                     + (1 - _er_v["weighted_vulnerable_share"]) * 3) / 7, 3)
+                fantasy_blend_note = (
+                    f"Blended from his real strikeout/outs signature-pitch vulnerability shares and his "
+                    f"real (inverted) earned-run vulnerability share, weighted by Underdog's real out1/K3/ER-3 "
+                    f"point values - win/quality-start bonuses excluded (whole-game outcomes, no single real "
+                    f"pitch drives them).")
+            else:
+                fantasy_blend_score = None
+                fantasy_blend_note = None
+
             for prop, series in sim_results.get(starter_key, {}).items():
                 if not series:
                     continue
                 avg = sum(series) / len(series)
                 std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
                 cv = round(std / avg, 3) if avg else None
-                pitcher_rows.append({"player": pitcher_name, "team": pitcher_team_label,
-                                       "prop": prop, "real_avg": round(avg, 2), "cv": cv})
+                row = {"player": pitcher_name, "team": pitcher_team_label,
+                      "prop": prop, "real_avg": round(avg, 2), "cv": cv, "series": list(series)}
+                if prop in ("pitcher_fantasy", "pitcher_fantasy_prizepicks"):
+                    row["metric_score"] = fantasy_blend_score
+                    row["metric_note"] = fantasy_blend_note
+                    pitcher_rows.append(row)
+                    continue
+                sig_type = PITCHER_PROP_TO_SIGNATURE_TYPE.get(prop)
+                if sig_type:
+                    if sig_type not in pitcher_vuln_cache:
+                        try:
+                            pitcher_vuln_cache[sig_type] = calc_prop_lineup_vulnerability(
+                                side_data[hitting_side]["pitcher_arsenal"],
+                                side_data[hitting_side]["real_lineup"],
+                                side_data[hitting_side]["hitter_profiles_by_order_slot"],
+                                side_data[hitting_side]["hitter_hand_by_order_slot"],
+                                sig_type)
+                        except Exception as e:
+                            pitcher_vuln_cache[sig_type] = {"usable": False, "reason": str(e)}
+                    vuln = pitcher_vuln_cache[sig_type]
+                    if vuln.get("usable"):
+                        row["metric_score"] = vuln["weighted_vulnerable_share"]
+                        row["metric_note"] = vuln["read"]
+                pitcher_rows.append(row)
+
 
     return {
         "usable": True,
