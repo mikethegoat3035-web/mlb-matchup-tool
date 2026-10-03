@@ -792,6 +792,19 @@ else:
             with fcol1:
                 sim_min_tier = st.select_slider("Minimum real tier to show", options=["Poor", "Average", "Strong", "Elite"],
                                                 value="Strong", key="sim_min_tier")
+                # Field z-score restored per direct request (it had been
+                # dropped when Stage 1 switched to the tier grade, which
+                # left the zscore column blank in Stage 2 exports). It is
+                # the same real calculation used before: how many std devs
+                # a player's simulated average sits above the other
+                # players scanned in this run, same prop and same side.
+                # 0 turns it off for that side. The Strong+ tier and the
+                # z-score are two different signals, so both are shown and
+                # an alignment panel below compares them.
+                hitter_min_z = st.slider("Hitter minimum field z-score (0 = off)",
+                                         0.0, 3.0, 1.2, step=0.1, key="sim_min_z_hitter")
+                pitcher_min_z = st.slider("Pitcher minimum field z-score (0 = off)",
+                                          0.0, 3.0, 0.0, step=0.1, key="sim_min_z_pitcher")
             with fcol2:
                 pitcher_max_cv = st.slider("Pitcher maximum coefficient of variation",
                                     0.1, 1.5, 1.05, step=0.05, key="sim_pitcher_max_cv")
@@ -920,16 +933,76 @@ else:
                 stage1_df["coverage"] = stage1_df.apply(
                     lambda r: coverage_map.get(r["player"], 100.0) if r["side"] == "hitter" else 100.0, axis=1)
 
+                # Field z-score, same calculation as the earlier version:
+                # grouped by (side, prop) so a hitter's "strikeouts" is
+                # never compared with a pitcher's. For pitcher props where
+                # a LOWER number is better (hits/walks/earned runs
+                # allowed) the sign is flipped so a high z always means
+                # "good for the player" on both sides.
+                stage1_df["field_mean"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("mean")
+                stage1_df["field_std"] = stage1_df.groupby(["side", "prop"])["real_avg"].transform("std")
+                LOWER_IS_BETTER_PITCHER_PROPS = {"hits_allowed", "walks_allowed", "earned_runs"}
+
+                def _field_zscore(r):
+                    fs = r["field_std"]
+                    if pd.isna(fs) or fs == 0:
+                        return float("nan")
+                    z = (r["real_avg"] - r["field_mean"]) / fs
+                    if r["side"] == "pitcher" and r["prop"] in LOWER_IS_BETTER_PITCHER_PROPS:
+                        z = -z
+                    return round(z, 2)
+
+                stage1_df["zscore"] = stage1_df.apply(_field_zscore, axis=1)
+                # With fewer than 3 pitchers in the scanned field for a
+                # prop (a single-game scan has only 2), a field comparison
+                # isn't meaningful, so a pitcher z-score is only trusted
+                # when the field is big enough.
+                _pitcher_field_n = stage1_df.groupby(["side", "prop"])["real_avg"].transform("count")
+                stage1_df.loc[(stage1_df["side"] == "pitcher") & (_pitcher_field_n < 3), "zscore"] = float("nan")
+
                 TIER_RANK_SIM = {"Poor": 0, "Average": 1, "Strong": 2, "Elite": 3}
                 min_rank_sim = TIER_RANK_SIM[sim_min_tier]
                 stage1_df["_max_cv_for_row"] = stage1_df["side"].map(
                     {"hitter": hitter_max_cv, "pitcher": pitcher_max_cv})
-                graded_sim_rows = stage1_df[stage1_df["tier"].notna()]
+                graded_sim_rows = stage1_df[stage1_df["tier"].notna()].copy()
+                graded_sim_rows["_min_z_for_row"] = graded_sim_rows["side"].map(
+                    {"hitter": hitter_min_z, "pitcher": pitcher_min_z})
+                # A min z of 0 means "off" for that side. A missing z
+                # (field too small to compare) fails any real z bar.
+                z_ok = (graded_sim_rows["_min_z_for_row"] <= 0) | (
+                    graded_sim_rows["zscore"] >= graded_sim_rows["_min_z_for_row"])
                 survivors = graded_sim_rows[
                     (graded_sim_rows["tier"].map(TIER_RANK_SIM) >= min_rank_sim)
                     & (graded_sim_rows["cv"].fillna(99) <= graded_sim_rows["_max_cv_for_row"])
                     & (graded_sim_rows["coverage"] >= min_coverage)
+                    & z_ok
                 ].sort_values("metric_score", ascending=False)
+
+                # Alignment check - do the two signals pick the same
+                # rows? Same pool for both (cv and coverage caps applied),
+                # so the only difference is tier vs z-score.
+                with st.expander("Does the field z-score line up with the tier?"):
+                    z_bar = hitter_min_z if hitter_min_z > 0 else 1.2
+                    st.caption(f"Compares Strong+ (or whatever minimum tier is set above) against "
+                               f"z >= {z_bar}, on hitters that pass the CV and coverage caps.")
+                    pool = graded_sim_rows[
+                        (graded_sim_rows["side"] == "hitter")
+                        & (graded_sim_rows["cv"].fillna(99) <= hitter_max_cv)
+                        & (graded_sim_rows["coverage"] >= min_coverage)
+                    ].copy()
+                    pool["tier_ok"] = pool["tier"].map(TIER_RANK_SIM) >= min_rank_sim
+                    pool["z_pass"] = pool["zscore"] >= z_bar
+                    both = pool[pool["tier_ok"] & pool["z_pass"]]
+                    tier_only = pool[pool["tier_ok"] & ~pool["z_pass"]]
+                    z_only = pool[~pool["tier_ok"] & pool["z_pass"]]
+                    st.write(f"Both agree: **{len(both)}** | Tier only (z below {z_bar}): "
+                             f"**{len(tier_only)}** | z only (tier below {sim_min_tier}): **{len(z_only)}**")
+                    show_cols = ["player", "prop", "real_avg", "zscore", "tier", "metric_score"]
+                    for label, frame in (("Both agree", both), ("Tier only", tier_only), ("z-score only", z_only)):
+                        if not frame.empty:
+                            st.write(label)
+                            st.dataframe(frame[show_cols].sort_values("zscore", ascending=False),
+                                         width='stretch', hide_index=True)
                 ungraded_props = sorted(stage1_df.loc[stage1_df["tier"].isna(), "prop"].unique().tolist())
                 if ungraded_props:
                     st.caption(f"No real, underlying-metric mechanism built yet for: {', '.join(ungraded_props)} "
@@ -955,7 +1028,7 @@ else:
                 )
                 survivors = survivors.head(top_n_survivors)
 
-                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "metric_score", "tier", "metric_note", "coverage"]],
+                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "metric_score", "tier", "metric_note", "coverage"]],
                               width='stretch')
                 st.caption(f"{real_survivor_count} of {len(stage1_df)} real (player, prop) combinations "
                            f"cleared the real, underlying-metric bar above - showing the top {len(survivors)}.")
@@ -971,7 +1044,7 @@ else:
                 # itself against the real, complete picture.
                 with st.expander(f"See all {len(stage1_df)} real (player, prop) combinations, unfiltered"):
                     st.dataframe(
-                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "metric_score", "tier", "metric_note", "coverage"]]
+                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "metric_score", "tier", "metric_note", "coverage"]]
                         .sort_values("metric_score", ascending=False),
                         width='stretch')
 
@@ -1008,12 +1081,13 @@ else:
                                 "side": srow["side"], "player": srow["player"], "team": srow["team"],
                                 "prop": srow["prop"], "your_line": _round_half(srow["real_avg"]),
                                 "zscore": srow.get("zscore"), "cv": srow.get("cv"), "coverage": srow.get("coverage"),
+                                "tier": srow.get("tier"), "metric_score": srow.get("metric_score"),
                             })
                         df = pd.DataFrame(rows)
                         st.write(label)
                         return st.data_editor(
                             df, key=f"sim_lines_editor_{key_suffix}", width='stretch', hide_index=True,
-                            disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage"],
+                            disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage", "tier", "metric_score"],
                             column_config={"your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5)},
                         )
 
@@ -1030,7 +1104,7 @@ else:
                         [df for df in (edited_pp, edited_ud, edited_shared) if not df.empty],
                         ignore_index=True,
                     ) if any(not df.empty for df in (edited_pp, edited_ud, edited_shared)) else pd.DataFrame(
-                        columns=["side", "player", "team", "prop", "your_line", "zscore", "cv", "coverage"])
+                        columns=["side", "player", "team", "prop", "your_line", "zscore", "cv", "coverage", "tier", "metric_score"])
 
                     result_rows = []
                     for _, row in edited_lines.iterrows():
@@ -1040,6 +1114,7 @@ else:
                         result_rows.append({"side": row["side"], "player": row["player"], "team": row["team"],
                                              "prop": row["prop"], "line": row["your_line"],
                                              "zscore": row.get("zscore"), "cv": row.get("cv"), "coverage": row.get("coverage"),
+                                             "tier": row.get("tier"), "metric_score": row.get("metric_score"),
                                              **r})
                     result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
                     # Real, new additions - explicit lean + under_rate, so
@@ -1132,7 +1207,7 @@ else:
                     else:
                         st.dataframe(
                             best_of_best[["side", "player", "team", "prop", "line", "avg",
-                                          "over_rate", "under_rate", "lean", "avg_gap_pct"]],
+                                          "over_rate", "under_rate", "lean", "avg_gap_pct", "zscore", "tier"]],
                             width='stretch')
 
                     def _lean_color(row):
