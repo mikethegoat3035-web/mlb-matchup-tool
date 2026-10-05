@@ -224,6 +224,34 @@ def _render_preview_banner(lineup_data, cache_key, key_prefix):
 # outside either section, so both real graded tables (if more are ever
 # added) can reach them.
 PITCHER_METRIC_TIERS = [(0.50, "Elite"), (0.30, "Strong"), (0.15, "Average")]  # else Poor
+
+# Per-prop over/under read for pitcher scores. The Poor/Average/Strong/Elite
+# labels above use one set of cutoffs for every pitcher prop, but each prop has
+# a very different NORMAL level (strikeouts scores have run around 0.75, walks
+# around 0.1), so a 0.33 strikeouts score is labeled "Strong" while actually
+# being the lowest seen. These cutoffs read each score against its own prop:
+# at or below the first number favors the UNDER, at or above the second favors
+# the OVER, in between is neutral. PROVISIONAL - drawn from only 9 pitchers'
+# scores (5-9 per prop), placed at the natural gaps in what has been seen, and
+# meant to be adjusted as more results come in.
+PITCHER_PROP_SIDE_CUTS = {
+    "strikeouts": (0.45, 0.60),
+    "outs": (0.35, 0.50),
+    "hits_allowed": (0.50, 0.55),
+    "earned_runs": (0.30, 0.50),
+    "walks_allowed": (0.15, 0.30),
+}
+
+
+def _pitcher_side(prop, score):
+    cuts = PITCHER_PROP_SIDE_CUTS.get(prop)
+    if cuts is None or score is None or pd.isna(score):
+        return None
+    if score <= cuts[0]:
+        return "UNDER"
+    if score >= cuts[1]:
+        return "OVER"
+    return "NEUTRAL"
 HITTER_METRIC_TIERS = [(1.5, "Elite"), (0.5, "Strong"), (-0.5, "Average")]     # else Poor
 TIER_ORDER = {"Poor": 0, "Average": 1, "Strong": 2, "Elite": 3}
 
@@ -887,7 +915,15 @@ else:
                             vuln = pitcher_vuln_cache_sim[cache_key]
                             if vuln.get("usable"):
                                 row["metric_score"] = vuln["weighted_vulnerable_share"]
-                                row["metric_note"] = vuln["read"]
+                                flagged = [h for h in vuln.get("per_hitter", []) if h.get("real_vulnerable")]
+                                row["flagged_n"] = len(flagged)
+                                row["flagged_top3"] = sum(1 for h in flagged if (h.get("order_slot") or 99) <= 3)
+                                row["flagged_hitters"] = ", ".join(
+                                    f"{h.get('order_slot')}:{h.get('name')}" for h in flagged)
+                                row["score_side"] = _pitcher_side(prop, row["metric_score"])
+                                side_txt = row["score_side"] or "not read per prop"
+                                row["metric_note"] = (vuln["read"] + f" Read against this prop's normal range, "
+                                                      f"that favors the {side_txt}." if row["score_side"] else vuln["read"])
                             else:
                                 row["metric_note"] = f"NOT GRADED - {vuln.get('reason', 'unknown reason')}"
                         elif prop in ("pitcher_fantasy", "pitcher_fantasy_prizepicks") and name in sim_hitter_profiles_map:
@@ -918,6 +954,9 @@ else:
             stage1_df = pd.DataFrame(stage1_rows)
             if "metric_score" not in stage1_df.columns:
                 stage1_df["metric_score"] = None
+            for _c in ("score_side", "flagged_n", "flagged_top3", "flagged_hitters"):
+                if _c not in stage1_df.columns:
+                    stage1_df[_c] = None
             stage1_df["tier"] = stage1_df.apply(
                 lambda r: _metric_tier(r["metric_score"], r["side"] == "pitcher"), axis=1)
 
@@ -1021,14 +1060,20 @@ else:
                 # real lines for, without needing to keep re-tuning three
                 # sliders every single game.
                 top_n_survivors = st.slider(
-                    "Show only the top N survivors (by real edge)",
+                    "Show only the top N survivors per side (by real edge)",
                     3, 40, 12, key="sim_top_n_survivors",
-                    help="Applied after the three sliders above - this doesn't change who "
-                         "qualifies, just how many of the best ones you actually see.",
+                    help="Applied after the sliders above - this doesn't change who "
+                         "qualifies, just how many of the best ones you actually see. "
+                         "Counted separately for hitters and pitchers.",
                 )
-                survivors = survivors.head(top_n_survivors)
+                # REAL FIX (found while testing) - this used to cut the list to the
+                # top N overall, sorted by metric_score. Hitter scores run roughly
+                # 0 to 11 and pitcher scores 0 to 1, so on any slate with more than
+                # N qualifying hitters, every pitcher row was cut first, no matter
+                # how good it was. The cap now applies to each side separately.
+                survivors = survivors.groupby("side", group_keys=False).head(top_n_survivors)
 
-                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "metric_score", "tier", "metric_note", "coverage"]],
+                st.dataframe(survivors[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "metric_score", "tier", "score_side", "flagged_top3", "flagged_hitters", "metric_note", "coverage"]],
                               width='stretch')
                 st.caption(f"{real_survivor_count} of {len(stage1_df)} real (player, prop) combinations "
                            f"cleared the real, underlying-metric bar above - showing the top {len(survivors)}.")
@@ -1044,7 +1089,7 @@ else:
                 # itself against the real, complete picture.
                 with st.expander(f"See all {len(stage1_df)} real (player, prop) combinations, unfiltered"):
                     st.dataframe(
-                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "metric_score", "tier", "metric_note", "coverage"]]
+                        stage1_df[["side", "player", "team", "prop", "real_avg", "cv", "zscore", "metric_score", "tier", "score_side", "flagged_top3", "flagged_hitters", "metric_note", "coverage"]]
                         .sort_values("metric_score", ascending=False),
                         width='stretch')
 
@@ -1082,12 +1127,13 @@ else:
                                 "prop": srow["prop"], "your_line": _round_half(srow["real_avg"]),
                                 "zscore": srow.get("zscore"), "cv": srow.get("cv"), "coverage": srow.get("coverage"),
                                 "tier": srow.get("tier"), "metric_score": srow.get("metric_score"),
+                                "score_side": srow.get("score_side"), "flagged_top3": srow.get("flagged_top3"),
                             })
                         df = pd.DataFrame(rows)
                         st.write(label)
                         return st.data_editor(
                             df, key=f"sim_lines_editor_{key_suffix}", width='stretch', hide_index=True,
-                            disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage", "tier", "metric_score"],
+                            disabled=["side", "player", "team", "prop", "zscore", "cv", "coverage", "tier", "metric_score", "score_side", "flagged_top3"],
                             column_config={"your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5)},
                         )
 
@@ -1104,7 +1150,7 @@ else:
                         [df for df in (edited_pp, edited_ud, edited_shared) if not df.empty],
                         ignore_index=True,
                     ) if any(not df.empty for df in (edited_pp, edited_ud, edited_shared)) else pd.DataFrame(
-                        columns=["side", "player", "team", "prop", "your_line", "zscore", "cv", "coverage", "tier", "metric_score"])
+                        columns=["side", "player", "team", "prop", "your_line", "zscore", "cv", "coverage", "tier", "metric_score", "score_side", "flagged_top3"])
 
                     result_rows = []
                     for _, row in edited_lines.iterrows():
@@ -1115,6 +1161,7 @@ else:
                                              "prop": row["prop"], "line": row["your_line"],
                                              "zscore": row.get("zscore"), "cv": row.get("cv"), "coverage": row.get("coverage"),
                                              "tier": row.get("tier"), "metric_score": row.get("metric_score"),
+                                             "score_side": row.get("score_side"), "flagged_top3": row.get("flagged_top3"),
                                              **r})
                     result_df = pd.DataFrame(result_rows).sort_values("over_rate", ascending=False, na_position="last")
                     # Real, new additions - explicit lean + under_rate, so
@@ -1142,7 +1189,43 @@ else:
                         | ((result_df["lean"] == "OVER") & (result_df["avg"] > result_df["line"]))
                     )
 
+                    # Tier-vs-lean check, per direct request. For every prop
+                    # here a HIGH tier means the matchup favors the OVER
+                    # (hitters weak to his best pitch for strikeouts/outs,
+                    # hitters who handle his weakest pitch for hits/walks/
+                    # earned runs allowed, a good hitter matchup for hitter
+                    # props, and the fantasy blend). So Strong/Elite with an
+                    # UNDER lean is a conflict, and Poor with an OVER lean is
+                    # too. Average, or no tier, has nothing to contradict.
+                    def _tier_confirms(r):
+                        # Pitcher props with a per-prop read: the score must
+                        # actively favor the SAME side the simulation leans
+                        # (neutral doesn't count), and an UNDER is dropped if
+                        # any flagged hitter bats in the top three of the
+                        # order, since those hitters get the most plate
+                        # appearances against him.
+                        side = r.get("score_side")
+                        if side in ("OVER", "UNDER", "NEUTRAL"):
+                            if side != r["lean"]:
+                                return False
+                            top3 = r.get("flagged_top3")
+                            if r["lean"] == "UNDER" and pd.notna(top3) and top3 >= 1:
+                                return False
+                            return True
+                        t = r.get("tier")
+                        if t in ("Strong", "Elite"):
+                            return r["lean"] == "OVER"
+                        if t == "Poor":
+                            return r["lean"] == "UNDER"
+                        return True
+                    result_df["tier_confirms_lean"] = result_df.apply(_tier_confirms, axis=1)
+
                     st.subheader("Best of the best - both signals genuinely agreeing")
+                    st.caption("A row shows only if the rate and gap clear the bars below, the average sits on the "
+                               "same side of the line as the lean, and the score agrees with the lean "
+                               "(Strong/Elite with an under lean, or Poor with an over lean, is dropped; "
+                               "for pitcher props the score is read against that prop's own normal range and "
+                               "an under is also dropped if a flagged hitter bats in the top three).")
                     bcol1, bcol2, bcol3 = st.columns(3)
                     with bcol1:
                         # REAL FIX - recalibrated using real, live data from
@@ -1200,6 +1283,7 @@ else:
                         ((result_df["over_rate"] >= result_df["min_rate_gap_for_side"]) | (result_df["under_rate"] >= result_df["min_rate_gap_for_side"]))
                         & (result_df["avg_gap_pct"] >= result_df["min_avg_gap_for_side"])
                         & (result_df["gap_confirms_lean"])
+                        & (result_df["tier_confirms_lean"])
                     ].sort_values("avg_gap_pct", ascending=False)
                     if best_of_best.empty:
                         st.info("Nothing clears both real bars right now - lower the sliders above "
@@ -1207,7 +1291,7 @@ else:
                     else:
                         st.dataframe(
                             best_of_best[["side", "player", "team", "prop", "line", "avg",
-                                          "over_rate", "under_rate", "lean", "avg_gap_pct", "zscore", "tier"]],
+                                          "over_rate", "under_rate", "lean", "avg_gap_pct", "zscore", "tier", "score_side", "flagged_top3"]],
                             width='stretch')
 
                     def _lean_color(row):
